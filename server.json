@@ -1,0 +1,29 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.tallyfy/mcp-server",
+  "title": "Tallyfy Workflow Automation",
+  "description": "Automate tasks, processes, and approvals with AI.",
+  "version": "1.0.0",
+  "websiteUrl": "https://tallyfy.com/products/pro/integrations/mcp-server/",
+  "repository": {
+    "url": "https://github.com/tallyfy/mcp-public",
+    "source": "github"
+  },
+  "icons": [
+    {
+      "src": "https://tallyfy.com/tallyfy-logo-icon.svg",
+      "mimeType": "image/svg+xml",
+      "sizes": ["any"]
+    },
+    {
+      "src": "https://tallyfy.com/images/press/tallyfy-logo.png",
+      "mimeType": "image/png"
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://mcp.tallyfy.com/"
+    }
+  ]
+}

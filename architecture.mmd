@@ -1,0 +1,76 @@
+---
+config:
+  look: neo
+  theme: mc
+  layout: dagre
+---
+flowchart TB
+ subgraph subGraph0["🔌 WebSocket Host (:9001)"]
+        WSServer["⚡ WebSocket Server<br>host/websocket/server.py"]
+        SessionMgr["🔐 Session Manager<br>User sessions &amp; auth"]
+        MCPClientHost["📡 MCP Client<br>host/client/mcp_client.py"]
+        ConversationMgr["💬 Conversation Manager<br>Chat history tracking"]
+  end
+ subgraph subGraph1["🎯 Tool Categories"]
+        UserTools["👥 User Management<br>Members, guests, invitations"]
+        TaskTools["✅ Task Management<br>Tasks, processes, creation"]
+        TemplateTools["📝 Template Management<br>Templates, steps, health"]
+        FormTools["📋 Form Fields<br>Add/manage form fields"]
+        SearchTools["🔍 Search Engine<br>Tasks, processes, templates"]
+        AutoTools["⚙️ Automation<br>If-then rules, analysis"]
+        ProcessTools["🔄 Process Management<br>Runs, workflows"]
+  end
+ subgraph subGraph2["🛠️ MCP Server (:9000)"]
+        ToolRegistry["📋 Tool Registry<br>40+ Tallyfy tools"]
+        MCPServerCore["🚀 MCP Server Core<br>server/server.py<br>FastMCP Framework"]
+        subGraph1
+  end
+ subgraph subGraph3["📦 Tallyfy SDK"]
+        SDKCore["🔧 TallyfySDK + HTTP Client"]
+  end
+    WebClients["🌐 Web Clients"] == 🔌 WebSocket Connection ===> WSServer
+    WSServer == Session Control ==> SessionMgr
+    WSServer == Message Routing ==> MCPClientHost
+    MCPClientHost == History Tracking ==> ConversationMgr
+    SessionMgr -. 🔑 Auth Verification .-> SDKCore
+    SDKCore -. 🛡️ Secure Auth .-> TallyfyAPI["🏢 Tallyfy API"]
+    MCPClientHost <== 🧠 AI Queries & Responses ===> Claude["🤖 Claude AI<br>Anthropic GPT"]
+    MCPClientHost == 📨 MCP Protocol ==> MCPServerCore
+    MCPServerCore == Tool Dispatch ==> ToolRegistry
+    ToolRegistry -. Route to Tools .-> UserTools & TaskTools & TemplateTools & FormTools & SearchTools & AutoTools & ProcessTools
+    UserTools == API Calls ==> SDKCore
+    TaskTools == API Calls ==> SDKCore
+    TemplateTools == API Calls ==> SDKCore
+    FormTools == API Calls ==> SDKCore
+    ProcessTools == API Calls ==> SDKCore
+    SearchTools == API Calls ==> SDKCore
+    AutoTools == API Calls ==> SDKCore
+    SDKCore == 🌐 REST API Calls ===> TallyfyAPI
+    TallyfyAPI -. 📊 JSON Response ..-> SDKCore
+    SDKCore -. Data Processing ..-> ToolRegistry
+    ToolRegistry -. Tool Results ..-> MCPServerCore
+    MCPServerCore -. 🔄 Processed Results ..-> MCPClientHost
+    MCPClientHost -. 📤 Response Delivery ..-> WSServer
+     WSServer:::host
+     SessionMgr:::host
+     MCPClientHost:::host
+     ConversationMgr:::host
+     UserTools:::tools
+     TaskTools:::tools
+     TemplateTools:::tools
+     FormTools:::tools
+     SearchTools:::tools
+     AutoTools:::tools
+     ProcessTools:::tools
+     ToolRegistry:::server
+     MCPServerCore:::server
+     SDKCore:::sdk
+     WebClients:::client
+     TallyfyAPI:::api
+     Claude:::api
+    classDef client fill:#e3f2fd,stroke:#1565c0,stroke-width:3px,color:#000
+    classDef host fill:#f3e5f5,stroke:#7b1fa2,stroke-width:3px,color:#000
+    classDef server fill:#e8f5e8,stroke:#2e7d32,stroke-width:3px,color:#000
+    classDef sdk fill:#fff8e1,stroke:#f57c00,stroke-width:3px,color:#000
+    classDef api fill:#fce4ec,stroke:#c2185b,stroke-width:3px,color:#000
+    classDef tools fill:#f1f8e9,stroke:#558b2f,stroke-width:2px,color:#000
