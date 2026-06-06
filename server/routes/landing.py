@@ -58,7 +58,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tallyfy MCP Server — Workflow Automation for AI Assistants</title>
-    <meta name="description" content="Run your operations from your AI assistant. The Tallyfy MCP server exposes 107 tools for workflow automation across Claude, ChatGPT, Cursor, and more.">
+    <meta name="description" content="Run your operations from your AI assistant. The Tallyfy MCP server exposes 108 tools for workflow automation across Claude, ChatGPT, Cursor, and more.">
     <meta property="og:title" content="Tallyfy MCP Server">
     <meta property="og:description" content="Workflow automation for AI assistants. Connect Tallyfy to Claude, ChatGPT, Cursor, and any MCP-compatible client.">
     <meta property="og:image" content="https://tallyfy.com/images/press/tallyfy-logo.png">
@@ -297,7 +297,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <div class="badges">
         <span class="badge"><span class="dot"></span>Production &middot; live now</span>
         <a class="badge" href="https://registry.modelcontextprotocol.io/?q=tallyfy" target="_blank" rel="noopener">Listed on the Official MCP Registry</a>
-        <span class="badge">107 tools across 12 categories</span>
+        <span class="badge">108 tools across 12 categories</span>
         <span class="badge">OAuth 2.1 + DCR</span>
     </div>
 

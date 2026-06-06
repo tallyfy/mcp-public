@@ -27,6 +27,7 @@ from tools.tag_management import register_tag_management_tools
 from tools.folder_management import register_folder_management_tools
 from tools.user_interaction import register_user_interaction_tools
 from tools.api_fallback import register_api_fallback_tool
+from tools.template_mapping_validation import register_template_mapping_validation_tools
 from utils.org_id_middleware import OrgIdMiddleware
 from utils.tallyfy_spec_cache import SPEC_CACHE
 from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ENFORCE_AUDIENCE
@@ -219,6 +220,7 @@ register_tag_management_tools(mcp)
 register_folder_management_tools(mcp)
 register_user_interaction_tools(mcp)
 register_api_fallback_tool(mcp)
+register_template_mapping_validation_tools(mcp)
 
 # Register all routes and resources
 register_all_routes(mcp)
