@@ -415,6 +415,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         is_sse_404 = path == "/sse" and status == 404
         is_delete_400 = method == "DELETE" and status == 400
         is_metrics_200 = path == "/metrics" and status == 200
+        is_health_200 = path == "/health" and status == 200
         is_favicon = path == "/favicon.ico"
         is_oauth_discovery = (
             is_mcp_root and status == 401 and not mcp_method
@@ -433,6 +434,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             logging.debug(f"{Colors.GRAY}{method:6} {path:20} │ {status} │ {duration*1000:6.1f}ms │ session_cleanup{Colors.RESET}")
         elif is_metrics_200:
             # Completely suppress successful /metrics requests - high frequency monitoring traffic
+            pass
+        elif is_health_200:
             pass
         elif is_favicon:
             pass

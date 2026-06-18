@@ -14,6 +14,7 @@ from routes.landing import register_landing_routes
 from routes.openai_apps_challenge import register_openai_apps_challenge_routes
 from routes.server_card import register_server_card_routes
 from routes.glama_card import register_glama_card_routes
+from routes.favicon import register_favicon_routes
 
 
 def register_all_routes(mcp):
@@ -28,6 +29,7 @@ def register_all_routes(mcp):
     register_openai_apps_challenge_routes(mcp)
     register_server_card_routes(mcp)
     register_glama_card_routes(mcp)
+    register_favicon_routes(mcp)
 
 
 __all__ = [
@@ -42,4 +44,5 @@ __all__ = [
     "register_openai_apps_challenge_routes",
     "register_server_card_routes",
     "register_glama_card_routes",
+    "register_favicon_routes",
 ]
