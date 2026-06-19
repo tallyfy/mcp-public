@@ -14,7 +14,7 @@ while still giving humans a real page to land on.
 Closes #433.
 """
 
-from starlette.responses import HTMLResponse
+from starlette.responses import HTMLResponse, RedirectResponse
 
 
 def register_landing_routes(mcp):
@@ -34,6 +34,13 @@ def register_landing_routes(mcp):
     async def landing_about(request):
         host = request.headers.get("host", "")
         return HTMLResponse(_render_landing_for_host(host))
+
+    @mcp.custom_route("/favicon.ico", methods=["GET"])
+    async def favicon(request):
+        # Browsers, Claude's connector UI, and Google show a generic globe for
+        # mcp.tallyfy.com unless /favicon.ico resolves. Redirect to the canonical
+        # Tallyfy icon so the server shows the Tallyfy logo in directory listings.
+        return RedirectResponse("https://tallyfy.com/favicon.ico", status_code=301)
 
 
 _GCP_BANNER = """
@@ -58,7 +65,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tallyfy MCP Server — Workflow Automation for AI Assistants</title>
-    <meta name="description" content="Run your operations from your AI assistant. The Tallyfy MCP server exposes 108 tools for workflow automation across Claude, ChatGPT, Cursor, and more.">
+    <meta name="description" content="Run your operations from your AI assistant. The Tallyfy MCP server exposes 100+ tools for workflow automation across Claude, ChatGPT, Cursor, and more.">
     <meta property="og:title" content="Tallyfy MCP Server">
     <meta property="og:description" content="Workflow automation for AI assistants. Connect Tallyfy to Claude, ChatGPT, Cursor, and any MCP-compatible client.">
     <meta property="og:image" content="https://tallyfy.com/images/press/tallyfy-logo.png">
@@ -125,6 +132,8 @@ _LANDING_HTML = """<!DOCTYPE html>
         }
         .badge:hover { border-color: var(--tallyfy-blue); color: var(--tallyfy-blue); }
         .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tallyfy-green); }
+        .prompts { list-style: none; margin: 4px 0 8px; display: grid; gap: 8px; max-width: 640px; }
+        .prompts li { background: var(--code-bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; font-size: 15px; color: var(--ink); }
         .clients {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
@@ -294,11 +303,20 @@ _LANDING_HTML = """<!DOCTYPE html>
         with Claude, ChatGPT, Cursor, or any MCP-compatible AI client.
     </p>
 
+    <h2 style="margin-top: 12px;">Try these once connected</h2>
+    <ul class="prompts">
+        <li>&ldquo;Launch the Employee Onboarding workflow for Jane Doe&rdquo;</li>
+        <li>&ldquo;Show me my open tasks&rdquo; &middot; &ldquo;What is Sarah working on?&rdquo;</li>
+        <li>&ldquo;What templates do we have for customer onboarding?&rdquo;</li>
+        <li>&ldquo;Create an approval workflow for vendor onboarding&rdquo;</li>
+        <li>&ldquo;Complete the &lsquo;Send welcome email&rsquo; task&rdquo;</li>
+    </ul>
+
     <div class="badges">
         <span class="badge"><span class="dot"></span>Production &middot; live now</span>
         <a class="badge" href="https://registry.modelcontextprotocol.io/?q=tallyfy" target="_blank" rel="noopener">Listed on the Official MCP Registry</a>
-        <span class="badge">108 tools across 12 categories</span>
-        <span class="badge">OAuth 2.1 + DCR</span>
+        <span class="badge">100+ tools</span>
+        <span class="badge">Secure OAuth sign-in</span>
     </div>
 
     <h2>Endpoint</h2>

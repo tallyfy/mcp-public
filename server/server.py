@@ -135,36 +135,20 @@ auth_handler = TallyfyAuthProvider(
 # Create MCP server with explicit capability declaration and server metadata
 # This ensures standards compliance with Anthropic Claude Connectors Directory
 # and OpenAI ChatGPT App submission requirements
-_INSTRUCTIONS_TEMPLATE = """# Tallyfy MCP Server
+_INSTRUCTIONS_TEMPLATE = """# Tallyfy Workflow Automation
 
-A production-ready MCP server exposing {tool_count} Tallyfy workflow automation tools with OAuth 2.1 authentication.
+Connect Tallyfy and run your operations right from chat: launch and track
+workflows, complete and assign tasks, manage approvals, search across your
+organization, and build or edit templates, all in your own authenticated
+Tallyfy account.
 
-## Server Capabilities
+## Try these to start
 
-This server implements the following capabilities:
-
-- **Tools**: SUPPORTED ({tool_count} tools, list does not change dynamically)
-- **Resources**: SUPPORTED (static resource list)
-- **Prompts**: NOT SUPPORTED
-- **Logging**: NOT SUPPORTED
-- **Completions**: NOT SUPPORTED
-- **Tasks**: NOT SUPPORTED
-
-## Authentication
-
-All requests must include a valid JWT token from Tallyfy's OAuth 2.1 authorization server.
-The token must be valid, non-expired, and signed with Tallyfy's RS256 public key.
-
-## Rate Limiting
-
-Unauthenticated requests are subject to IP-based rate limiting (10 requests/minute).
-Authenticated requests have higher limits.
-
-## Response Constraints
-
-- Maximum response size: 25KB (auto-compacted)
-- Streaming: Supported via HTTP chunked transfer
-- Error handling: Graceful with detailed error messages
+- "Launch the Employee Onboarding workflow for Jane Doe"
+- "Show me my open tasks" (or "what is Sarah working on?")
+- "What templates do we have for customer onboarding?"
+- "Create an approval workflow for vendor onboarding"
+- "Complete the 'Send welcome email' task"
 
 ## Template Creation Best Practices
 
@@ -186,9 +170,16 @@ When building a template from a user's description, document, or image:
 
 Tallyfy steps are sequential. To model parallel paths from a flowchart, use visibility automations to show/hide steps based on conditions rather than expecting simultaneous execution.
 
+## Technical details
+
+- **Tools**: {tool_count} tools (static list). Resources: supported. Prompts, logging, completions, and tasks are not supported.
+- **Authentication**: OAuth 2.1 with a Tallyfy-issued JWT (RS256) on every request, so the assistant only ever sees what the signed-in user can see.
+- **Responses**: capped at 25KB (auto-compacted); HTTP streaming supported; graceful error messages.
+- **Rate limiting**: unauthenticated requests are IP-limited; authenticated requests have higher limits.
+
 ## Support
 
-For issues, documentation, or support: https://tallyfy.com/products/pro/integrations/mcp-server/
+For docs or help: https://tallyfy.com/products/pro/integrations/mcp-server/
 """
 
 mcp = FastMCP(

@@ -160,6 +160,10 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
 
     @mcp.tool(
         name="launch_process",
+        meta={
+            "openai/toolInvocation/invoking": "Launching your process...",
+            "openai/toolInvocation/invoked": "Process launched",
+        },
         description="""Launch a new workflow process (run) from a template.
 
 REQUIRED: 'template_id' (32-char hex) and 'name' (process name string). For the name, generate a short descriptive instance name based on the template name and context (e.g. "Onboarding - Jane Doe", "Q1 Budget Review - Marketing"). Do not ask the user for a name unless they want to specify one.

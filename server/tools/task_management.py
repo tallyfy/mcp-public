@@ -213,6 +213,10 @@ def register_task_management_tools(mcp):
 
     @mcp.tool(
         name="get_my_tasks",
+        meta={
+            "openai/toolInvocation/invoking": "Fetching your tasks...",
+            "openai/toolInvocation/invoked": "Tasks loaded",
+        },
         description="""Get tasks assigned to the current user. No parameters required.
 
 USE THIS TOOL when user asks:
@@ -577,6 +581,10 @@ If the user doesn't specify a deadline or assignee, ASK them before calling the 
 
     @mcp.tool(
         name="complete_task",
+        meta={
+            "openai/toolInvocation/invoking": "Completing the task...",
+            "openai/toolInvocation/invoked": "Task completed",
+        },
         description="""Mark a task as complete.
 
 REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex).

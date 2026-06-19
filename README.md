@@ -34,7 +34,7 @@ Transport is streamable HTTP and authentication is OAuth against your Tallyfy ac
 
 ## What it can do
 
-107 tools across the Tallyfy domain, grouped by area:
+108 tools across the Tallyfy domain, grouped by area:
 
 | Area | Examples |
 |------|----------|

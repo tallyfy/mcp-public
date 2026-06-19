@@ -747,6 +747,10 @@ Never call this without both required parameters.""",
 
     @mcp.tool(
         name="create_template",
+        meta={
+            "openai/toolInvocation/invoking": "Building your template...",
+            "openai/toolInvocation/invoked": "Template created",
+        },
         description="""Create a new template (checklist/blueprint). This is the first step when building a workflow from a user's description, uploaded document, or image — create the template shell here, then call add_step_to_template for each step, add_form_field_to_step for form fields, add_kickoff_field for pre-launch fields, and create_automation_rule for if-then logic.
 
 REQUIRED: 'title' (template name). Optional: 'type' ('procedure' for multi-step workflows, 'form' for data collection, 'document' for reference docs), 'summary', 'guidance', 'starred'. Never call this without title.""",

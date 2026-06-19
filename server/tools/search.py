@@ -355,6 +355,10 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
 
     @mcp.tool(
         name="search_all",
+        meta={
+            "openai/toolInvocation/invoking": "Searching Tallyfy...",
+            "openai/toolInvocation/invoked": "Search complete",
+        },
         description="""Search across multiple entity types in one request. Returns results grouped by type.
 
 MANDATORY: You MUST provide a 'query' parameter. Calling with empty/missing query WILL FAIL.

@@ -19,7 +19,7 @@ Deliberately not published (kept private): hosting/WebSocket layer, monitoring a
 
 - Hosted endpoint: `https://mcp.tallyfy.com/` (streamable HTTP, OAuth against a Tallyfy account).
 - Run locally: see `README.md` (Docker, or Python 3.11 + `server/requirements.txt`).
-- Tools: 107, scoped to the authenticated user; all call the public Tallyfy API.
+- Tools: 108, scoped to the authenticated user; all call the public Tallyfy API.
 
 ## Reporting issues
 
