@@ -32,7 +32,7 @@ def register_capabilities(mcp):
     """Register explicit server capabilities endpoint."""
 
     @mcp.resource("tallyfy://capabilities")
-    def get_server_capabilities() -> str:
+    async def get_server_capabilities() -> str:
         """Get explicit declaration of server capabilities for standards compliance"""
         capabilities = ServerCapabilities(
             tools=ToolsCapability(listChanged=False),
@@ -43,7 +43,7 @@ def register_capabilities(mcp):
             tasks=None,
         )
 
-        tool_count = len(mcp._tool_manager._tools)
+        tool_count = len(await mcp.list_tools())
         num_categories = len(CATEGORY_DESCRIPTIONS)
 
         cat_lines = []

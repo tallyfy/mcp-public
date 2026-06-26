@@ -4,7 +4,7 @@ import sys
 import logging
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
-from sentry_sdk.integrations.fastapi import FastApiIntegration
+from sentry_sdk.integrations.starlette import StarletteIntegration
 from constants import SENTRY_ENABLED, SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_RELEASE, SENTRY_TRACES_SAMPLE_RATE, SENTRY_PROFILES_SAMPLE_RATE
 
 logger = logging.getLogger(__name__)
@@ -46,6 +46,16 @@ def init_sentry_server():
         logger.warning("Sentry DSN not configured for mcp-server, skipping initialization")
         return
 
+    # A 0 rate must reach the SDK as None, not 0.0. With 0.0 the SDK leaves
+    # performance tracing *enabled* at 0% sampling: the Starlette/FastMCP
+    # integration still opens a transaction on every request, then drops it
+    # client-side (an unbilled `client_discard`) — wasted CPU and millions of
+    # phantom spans cluttering Sentry's "Usage" view. None disables tracing
+    # outright so no transaction is ever created. Errors are unaffected: they
+    # ride LoggingIntegration / `sample_rate`, independent of traces_sample_rate.
+    traces_sample_rate = SENTRY_TRACES_SAMPLE_RATE or None
+    profiles_sample_rate = SENTRY_PROFILES_SAMPLE_RATE or None
+
     sentry_sdk.init(
         dsn=SENTRY_DSN,
         environment=SENTRY_ENVIRONMENT,
@@ -55,10 +65,10 @@ def init_sentry_server():
                 level=logging.INFO,
                 event_level=logging.ERROR
             ),
-            FastApiIntegration(),
+            StarletteIntegration(),
         ],
-        traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
-        profiles_sample_rate=SENTRY_PROFILES_SAMPLE_RATE,
+        traces_sample_rate=traces_sample_rate,
+        profiles_sample_rate=profiles_sample_rate,
         send_default_pii=False,
         before_send=scrub_tool_arguments,
         before_send_transaction=filter_metrics_transactions,
@@ -73,7 +83,7 @@ def init_sentry_server():
     sentry_sdk.set_tag("component", "mcp-server")
     sentry_sdk.set_tag("python_version", f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
-    logger.info(f"✓ Sentry initialized for mcp-server (env={SENTRY_ENVIRONMENT}, release={SENTRY_RELEASE}, traces={SENTRY_TRACES_SAMPLE_RATE}, profiles={SENTRY_PROFILES_SAMPLE_RATE})")
+    logger.info(f"✓ Sentry initialized for mcp-server (env={SENTRY_ENVIRONMENT}, release={SENTRY_RELEASE}, traces={traces_sample_rate}, profiles={profiles_sample_rate})")
 
 
 def scrub_tool_arguments(event, hint):

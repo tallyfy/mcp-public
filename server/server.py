@@ -6,6 +6,9 @@ Exposes Tallyfy SDK functions as MCP tools for use with LLM applications
 import os
 import logging
 import secrets
+import asyncio
+import concurrent.futures
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
@@ -217,7 +220,10 @@ register_template_mapping_validation_tools(mcp)
 register_all_routes(mcp)
 
 # Set instructions with actual tool count now that all tools are registered
-tool_count = len(mcp._tool_manager._tools)
+# list_tools() is async in fastmcp 3.x; run it in a worker thread so the count
+# works at import time even when the importer (uvicorn) has a running event loop.
+with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+    tool_count = _ex.submit(lambda: len(asyncio.run(mcp.list_tools()))).result()
 mcp.instructions = _INSTRUCTIONS_TEMPLATE.format(tool_count=tool_count)
 logging.info(f"   Registered tools: {tool_count}")
 
@@ -234,7 +240,20 @@ async def _start_spec_cache():
         logging.warning("tallyfy spec cache failed to start: %s", e)
 
 
-app.add_event_handler("startup", _start_spec_cache)
+# starlette 1.x (pulled by fastmcp 3.x) removed add_event_handler("startup", ...).
+# Compose the spec-cache startup into FastMCP's existing lifespan, which runs the
+# MCP streamable-http session manager.
+_mcp_lifespan = app.router.lifespan_context
+
+
+@asynccontextmanager
+async def _combined_lifespan(scope_app):
+    await _start_spec_cache()
+    async with _mcp_lifespan(scope_app):
+        yield
+
+
+app.router.lifespan_context = _combined_lifespan
 
 # Tool display names endpoint — returns {tool_name: title} for the UI.
 # Internal only: requires X-Internal-Key header matching INTERNAL_API_KEY env var.
@@ -249,9 +268,10 @@ async def tool_display_names(request):
     if not secrets.compare_digest(provided, _internal_api_key):
         return JSONResponse({"error": "unauthorized"}, status_code=403)
 
-    tools = await mcp.get_tools()
+    tools = await mcp.list_tools()
     names = {}
-    for name, tool in tools.items():
+    for tool in tools:
+        name = tool.name
         title = None
         if hasattr(tool, 'annotations') and tool.annotations:
             title = tool.annotations.title
