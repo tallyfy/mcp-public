@@ -106,6 +106,17 @@ def scrub_tool_arguments(event, hint):
         if "No response message received before stream closed" in msg:
             return None
 
+    # Drop FastMCP's "Error calling tool 'X'" noise. Our @handle_tallyfy_errors
+    # decorator already handles Sentry reporting: 400/401/403/404/422 are demoted
+    # to WARNING (never reach Sentry), and real errors (5xx/unexpected) are logged
+    # at ERROR with proper tags (operation, error_type, http_status). FastMCP then
+    # catches the ToolError we raise and re-logs a generic message at ERROR level
+    # via its own logger — no status code, no context, not actionable.
+    if event.get("logger") == "fastmcp.server.server":
+        msg = (event.get("logentry") or {}).get("message") or event.get("message", "")
+        if "Error calling tool" in msg:
+            return None
+
     # Drop ClosedResourceError — raised by anyio when a client closes the
     # browser tab or loses the connection mid-stream. This is expected noise
     # in an SSE server; there are no DB/Redis clients in this codebase that

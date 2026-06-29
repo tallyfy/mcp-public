@@ -154,6 +154,15 @@ def handle_tallyfy_errors(operation_name: str):
                     sentry_sdk.set_tag("error_type", "tallyfy_api")
                     if status:
                         sentry_sdk.set_tag("http_status", str(status))
+                    # Attach the API response body so it's visible in Sentry
+                    # (the HTTP breadcrumb's `reason` field gets server-side
+                    # scrubbed to [Filtered]; this context survives scrubbing)
+                    response_data = getattr(e, "response_data", None)
+                    sentry_sdk.set_context("api_response", {
+                        "status_code": status,
+                        "message": _extract_api_message(e),
+                        "response_body": str(response_data)[:2000] if response_data else None,
+                    })
                     # logger.error triggers Sentry via LoggingIntegration — no explicit capture needed
                     logger.error(f"Tallyfy API error in {operation_name}: {e}")
 
