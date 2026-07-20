@@ -48,6 +48,8 @@ Transport is streamable HTTP and authentication is OAuth against your Tallyfy ac
 
 Every tool calls the public Tallyfy API on behalf of the authenticated user. There are no write operations the signed-in user could not perform in the Tallyfy app directly.
 
+**Doing bulk or scripted work?** This server is tuned for interactive, conversational use and limits how much one request can do at once. For high-volume or headless automation (launching processes from a CSV, exporting every template to disk, multi-org loops, CI/CD approval gates), reach for the first-party [`tallyfy` CLI](https://github.com/tallyfy/cli) instead. It is built for deterministic, scriptable batch operations. Install with `brew install tallyfy/tap/tallyfy` or grab a binary from the [releases page](https://github.com/tallyfy/cli/releases).
+
 ## Run it yourself
 
 You can build and run the server from this mirror with Docker:

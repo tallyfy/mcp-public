@@ -343,6 +343,11 @@ Never call this without all three parameters.""",
         name="edit_description_on_step",
         description="""Edit the description/summary of a specific step in a template. The description supports HTML — use this to add rich instructions, checklists, or converted document content to a step. When a user wants to convert a document to step instructions, read the document content yourself and write the HTML here.
 
+Only the description changes: this tool reads the step first and re-sends its
+existing title and assignees (members, guests and groups), which the API would
+otherwise clear on an update that omits them. To change who a step is assigned to,
+use add_assignees_to_step instead.
+
 REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'description' (new text, HTML allowed). Never call this without all three parameters.""",
         tags=["templates", "workflow", "write", "management", "editing"],
         annotations=ToolAnnotations(
@@ -372,10 +377,53 @@ REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'description
         Returns:
             Dictionary containing updated step information
         """
+        if not isinstance(description, str) or not description.strip():
+            raise ToolError("description cannot be empty")
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.templates.edit_description_on_step(org_id, template_id, step_id, description)
-            return ToolResult(content=result, structured_content=None)
+            # READ-MODIFY-WRITE — the SDK's edit_description_on_step() sends only
+            # {title, summary}, and StepBuilder::build (app/Step/StepBuilder.php:37)
+            # unconditionally calls
+            #   saveAssignees(Assignees::newFromArray(Arr::only($data, ['assignees','guests','groups'])))
+            # AssignableTrait::saveAssignees (app/Models/Concerns/AssignableTrait.php:101-124)
+            # diffs against the payload with NO empty-set guard, so an omitted key
+            # means "detach everything". Editing a description therefore wiped every
+            # assignee off the step. Re-send the current sets: the diff comes out
+            # empty and saveAssignees returns before touching the pivot tables.
+            endpoint = f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}"
+            current = sdk._make_request("GET", endpoint)
+            step = current.get("data", current) if isinstance(current, dict) else {}
+
+            title = step.get("title") or ""
+            if not title:
+                raise ToolError(
+                    "Could not read the step's current title, which the API requires "
+                    "on every step update. Verify template_id and step_id are correct."
+                )
+
+            # StepTransformer emits assignees as member IDs, guests as emails and
+            # groups as group IDs — the same key names UpdateStepRequest validates.
+            # UpdateStepRequest treats an omitted bucket as "detach everything", so a
+            # missing or malformed bucket here must abort rather than send []. An empty
+            # list is legitimate (the step genuinely has nobody) and passes through.
+            payload = {
+                "title": title,
+                "summary": description,
+            }
+            for field in ("assignees", "guests", "groups"):
+                value = step.get(field)
+                if not isinstance(value, list):
+                    raise ToolError(
+                        f"Step {step_id} did not return its current '{field}', so "
+                        f"changing only the description would detach every assignee. "
+                        f"Nothing was sent."
+                    )
+                payload[field] = list(value)
+
+            response = sdk._make_request("PUT", endpoint, data=payload)
+            result = response.get("data", response) if isinstance(response, dict) else response
+            return ToolResult(content=serialize_dataclass(result) if result else {}, structured_content=None)
 
     @mcp.tool(
         name="add_step_to_template",
@@ -644,9 +692,16 @@ Updatable fields: title, summary, guidance, icon, alias, webhook, is_public, is_
 auto_naming, folderize_process, allow_launcher_change_name, is_pinned, default_folder,
 kickoff_title, kickoff_description.
 
+Safe to call with only the fields you want to change — this tool reads the template
+first and re-sends its existing permissions ('users' and 'groups'), which the API
+would otherwise clear on any update that omits them.
+
+To CHANGE who can access the template, pass the FULL replacement list, e.g.
+users=[20059, 20033] or groups=[] — these replace, they do not append.
+
 CORRECT usage:
-  update_template(template_id="abc123...", title="New Template Name")
-  update_template(template_id="abc123...", summary="Updated description", is_public=True)
+  update_template(template_id="abc123...", template_data={"title": "New Template Name"})
+  update_template(template_id="abc123...", template_data={"summary": "Updated", "is_public": True})
 
 Never call this without template_id.""",
         tags=["templates", "blueprints", "write", "management", "configuration"],
@@ -670,7 +725,7 @@ Never call this without template_id.""",
             template_data: Dict of fields to update. Allowed keys: title, summary, guidance,
                 icon, alias, webhook, is_public, is_featured, auto_naming, folderize_process,
                 allow_launcher_change_name, is_pinned, default_folder, kickoff_title,
-                kickoff_description (REQUIRED - must contain at least one field)
+                kickoff_description, users, groups (REQUIRED - must contain at least one field)
 
         Returns:
             Updated template object
@@ -680,12 +735,54 @@ Never call this without template_id.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # Tallyfy API requires 'title' on every update request;
-            # fetch the current title when the caller doesn't supply one.
-            if "title" not in template_data:
+            # READ-MODIFY-WRITE. Two independent reasons the current state must be
+            # merged in before sending:
+            #   1. The API requires 'title' on every update request.
+            #   2. ChecklistService::update (app/Services/ChecklistService.php:209)
+            #      unconditionally calls
+            #      saveAssignees(Assignees::newFromArray(Arr::only($data, ['users','groups'])))
+            #      and AssignableTrait::saveAssignees (app/Models/Concerns/AssignableTrait.php:101-124)
+            #      has NO empty-set guard — it detaches whatever is not in the payload.
+            #      So a partial PUT that omits users/groups WIPES the template's
+            #      permissions. Re-sending the current sets makes the diff empty,
+            #      which short-circuits before any detach.
+            template_data = dict(template_data)
+            needs_current = (
+                "title" not in template_data
+                or "users" not in template_data
+                or "groups" not in template_data
+            )
+            if needs_current:
                 current = sdk.templates.get_template(org_id, template_id=template_id)
-                if current and getattr(current, "title", None):
+                if not current:
+                    raise ToolError(
+                        f"Could not read template {template_id} to preserve its existing "
+                        f"permissions, so this partial update was not sent. Retry, or pass "
+                        f"title, users and groups explicitly to set them outright."
+                    )
+                if "title" not in template_data and getattr(current, "title", None):
                     template_data["title"] = current.title
+
+                # Re-send the CURRENT permissions so the server-side diff is empty.
+                #
+                # Only a positively-read list counts. `getattr(current, "users", None)
+                # or []` would collapse "unknown" and "genuinely empty" into the same
+                # [], and an explicit [] is NOT a safe default here: api-v2 treats a
+                # present key as authoritative, so sending [] CLEARS every permission —
+                # exactly the wipe this block exists to prevent. If we cannot read the
+                # current value we must not guess; fail loudly instead of silently
+                # destroying data.
+                for field in ("users", "groups"):
+                    if field in template_data:
+                        continue  # caller is setting it explicitly; respect that
+                    value = getattr(current, field, None)
+                    if not isinstance(value, list):
+                        raise ToolError(
+                            f"Template {template_id} did not return its current "
+                            f"'{field}', so a partial update would wipe them. Nothing "
+                            f"was sent. Pass '{field}' explicitly to set it outright."
+                        )
+                    template_data[field] = list(value)
 
             result = sdk.templates.update_template_metadata(org_id, template_id, **template_data)
             return ToolResult(

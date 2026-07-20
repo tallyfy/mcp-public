@@ -4,7 +4,7 @@ Tools for managing processes and runs
 """
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
@@ -23,6 +23,7 @@ from utils.fastmcp_types import (
     GenericList,
 )
 from utils.sdk_serializer import serialize_dataclass
+from utils.kickoff_encoding import normalize_keyed_payload
 from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
 
@@ -170,38 +171,34 @@ REQUIRED: 'template_id' (32-char hex) and 'name' (process name string). For the 
 
 PRERUN vs STEP-FORM-FIELDS — TWO DIFFERENT FORM SURFACES:
 
-  - `prerun` (optional list): KICKOFF FORM fields — initialization data collected
-    BEFORE the workflow starts. These are the form fields the user fills in on
-    the launch screen (e.g. "Customer name", "Project ID", "Department").
-    Defined at the TEMPLATE level (not on a specific step). Use
-    `get_kickoff_fields(template_id)` to discover available kickoff field IDs.
+  - `prerun` (optional object): KICKOFF FORM fields, collected BEFORE the workflow
+    starts (e.g. "Customer name"). Defined at TEMPLATE level. Call
+    `get_kickoff_fields(template_id)` first for field IDs, types and options.
 
-    Format: list of {"<kickoff_field_id>": "<value>"} entries.
-    Example: prerun=[{"abc123def456...": "Acme Corp"}, {"xyz789abc...": "2026-01-15"}]
+    A single OBJECT keyed by each field's `timeline_id` — NOT a list, NOT labels:
+      prerun={"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6": "Acme Corp"}
 
-  - Step-level form fields (NOT set here — set later via `update_task`):
-    Filled in DURING workflow execution as steps run. To set a step's form-field
-    values, complete or update the relevant task with `update_task` and pass
-    `taskdata={field_id: value, ...}`. These are NOT prerun fields.
+    Value shape follows the field's type. Bare scalar for text/textarea/date/email,
+    and for radio use the option's TEXT. dropdown needs {"id":..,"text":..} (both
+    keys, text matching that option exactly); multiselect a list of those objects;
+    table a list with one entry per column; assignees_form
+    {"users":[id],"guests":["email"],"groups":[id]}. dropdown and radio are
+    asymmetric: object vs bare text.
 
-  Rule of thumb: If the user provides data BEFORE launching the workflow,
-  it goes in `prerun`. If they provide data WHILE doing tasks, it goes in
-  `update_task.taskdata`.
+  - Step-level form fields (NOT set here): filled DURING execution, via
+    `update_task` with `taskdata={field_id: value}`. These are NOT prerun fields.
 
 CORRECT usage:
   launch_process(template_id="abc123...", name="Onboarding - Jane Doe")
-  launch_process(template_id="abc123...", name="Q1 Review", tags=["tag_id"], folders=["folder_id"])
-  launch_process(
-    template_id="abc123...",
-    name="Onboarding - Acme",
-    prerun=[{"<customer_name_field_id>": "Acme Corp"}, {"<start_date_field_id>": "2026-01-15"}],
-    owner_id=12345,
-    folders=["<folder_id>"]
-  )
+  launch_process(template_id="abc123...", name="Q1 Review", tags=["tag_id"])
+  launch_process(template_id="abc123...", name="Onboarding - Acme",
+    prerun={"<customer_name_field_id>": "Acme Corp"}, owner_id=12345)
 
 WRONG usage (will fail):
   launch_process(template_id="abc123...")  ← MISSING name
-  launch_process(name="Review")  ← MISSING template_id""",
+  launch_process(name="Review")  ← MISSING template_id
+  launch_process(..., prerun=[{"<field_id>": "Acme Corp"}])  ← LIST, must be one object
+  launch_process(..., prerun={"Customer name": "Acme"})  ← LABEL, must be timeline_id""",
         tags={"processes", "workflow", "runs", "write", "create", "launch"},
         annotations=ToolAnnotations(
             title="Launch process",
@@ -219,14 +216,20 @@ WRONG usage (will fail):
         name: str,
         summary: OptionalString = None,
         owner_id: OptionalInt = None,
-        prerun: Optional[List[Any]] = None,
+        # Union, not bare Dict: FastMCP validates this signature with Pydantic
+        # BEFORE the function body runs, so a bare Dict makes a legacy list
+        # payload fail at the schema layer and the normalizer below never
+        # executes. Callers built against the old list schema would stay broken.
+        # The description steers callers to the object; this only stops a list
+        # from being rejected before it can be converted.
+        prerun: Optional[Union[Dict[str, Any], List[Any]]] = None,
         tags: Optional[List[str]] = None,
         folders: Optional[List[str]] = None,
         users: Optional[List[int]] = None,
         groups: Optional[List[str]] = None,
         is_public: OptionalBool = None,
         tasks: Optional[Dict[str, Any]] = None,
-        roles: Optional[List[str]] = None,
+        roles: Optional[Union[Dict[str, Any], List[Any]]] = None,
         parent_id: OptionalString = None,
     ) -> GenericDict:
         """
@@ -237,14 +240,17 @@ WRONG usage (will fail):
             name: Name for the new process run (REQUIRED)
             summary: Optional process description
             owner_id: Optional numeric user ID to set as process owner
-            prerun: Optional list of kickoff field values, e.g. [{"<field_id>": "value"}]
+            prerun: Optional kickoff field values as ONE object keyed by the field's
+                    timeline_id, e.g. {"<timeline_id>": "value"}. A legacy list of
+                    single-key objects is accepted and folded into that object.
             tags: Optional list of tag IDs to attach
             folders: Optional list of folder IDs to place the process in
             users: Optional list of user IDs to assign to the process
             groups: Optional list of group IDs to assign to the process
             is_public: Whether the process is publicly accessible (optional)
             tasks: Task assignment overrides dict (optional)
-            roles: List of role IDs to assign (optional)
+            roles: Optional role assignments as an object keyed by org role ID,
+                   e.g. {"<role_id>": {"users": [12345], "guests": [], "groups": []}}
             parent_id: Parent process ID for sub-processes (optional)
 
         Returns:
@@ -252,6 +258,10 @@ WRONG usage (will fail):
         """
         if not name or not name.strip():
             raise ToolError("name cannot be empty")
+
+        # POST /runs keys both of these by ID; a list silently loses every value.
+        prerun = normalize_keyed_payload(prerun, "prerun")
+        roles = normalize_keyed_payload(roles, "roles")
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:

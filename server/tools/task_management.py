@@ -31,6 +31,38 @@ from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
 
 
+# ---------------------------------------------------------------------------
+# taskdata value shapes
+# ---------------------------------------------------------------------------
+#
+# `taskdata` is a flat dict keyed by the form field's `id` (the API returns the
+# capture's timeline_id under that name — CaptureTransformer.php:12), whose
+# value is passed STRAIGHT into validation with no unwrapping:
+# TaskRequestValidator::validateFormFieldsValues (app/Http/Requests/Tasks/
+# TaskRequestValidator.php:31-38) iterates `$taskdata as $captureTimelineId =>
+# $values` and hands `$values` to validateFormField. There is therefore NO
+# {"value": ...} envelope — a wrapper fails validation for EVERY field type
+# (a dict is not a scalar for text/date, and lacks the id+text keys a dropdown
+# requires).
+#
+# The per-type shapes below are the switch arms of
+# app/Http/Requests/Captures/FormValuesValidator.php:20-119. Note dropdown and
+# radio are deliberately asymmetric: dropdown validates {id,text} as a pair,
+# radio only checks the submitted scalar is one of the option texts. `file` and
+# `email` have no case in the switch at all, so they are unvalidated.
+_TASKDATA_SHAPE_HELP = """FORM FIELD VALUES ('taskdata') — a dict keyed by the form field's id. The value
+shape depends on the field's type. Send the value ITSELF; there is NO {"value": ...} wrapper.
+  text, textarea, date, email, file -> bare scalar          e.g. "Acme Corp", "2026-03-01 09:00:00"
+  radio        -> the chosen option's TEXT, as a bare scalar  e.g. "Approved"
+  dropdown     -> {"id": "<option_id>", "text": "<option label>"}  BOTH keys; text must match that option
+  multiselect  -> [{"id": "<option_id>", "text": "<option label>"}, ...]
+                  add "selected": true per entry when the field requires every choice checked
+  table        -> a list with EXACTLY one entry per configured column
+  assignees_form -> {"users": [20059], "guests": ["a@b.com"], "groups": ["<group_id>"]}
+Check a field's type (and its option ids) before writing to it — dropdown/multiselect
+ids and texts must match an existing option or the API rejects the whole update."""
+
+
 def _search_process_by_name(sdk, org_id: str, process_name: str) -> str:
     """
     Resolve a process name to its run_id using the SDK search endpoint.
@@ -731,10 +763,13 @@ Never call this without all three required parameters. Always ask the user to pr
 REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex).
 Plus at least ONE optional field to update.
 
+""" + _TASKDATA_SHAPE_HELP + """
+
 CORRECT usage:
   update_task(run_id="abc...", task_id="def...", deadline="2026-03-01 17:00:00")
   update_task(run_id="abc...", task_id="def...", title="New title", summary="Updated description")
   update_task(run_id="abc...", task_id="def...", owners={"users": [123], "guests": []})
+  update_task(run_id="abc...", task_id="def...", taskdata={"a1b2c3d4e5f6789012345678901234ef": "Acme Corp"})
 
 Never call this without run_id and task_id.""",
         tags={"tasks", "workflow", "write", "update"},
@@ -776,7 +811,12 @@ Never call this without run_id and task_id.""",
             summary: New task description
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}
-            taskdata: Form field values for the task
+            taskdata: Form field values, keyed by form field id. The value is shaped by
+                the field's type and is sent verbatim — there is no {"value": ...}
+                wrapper. text/textarea/date/email/file take a bare scalar; radio takes
+                the option's text as a bare scalar; dropdown takes {"id","text"};
+                multiselect a list of {"id","text"}; table a list with one entry per
+                column; assignees_form {"users","guests","groups"}.
             status: Task status string
             position: Task position (1-based)
             max_assignable: Maximum number of assignees who must complete the task
@@ -888,11 +928,14 @@ Use update_task instead when the task belongs to a workflow process run.
 
 REQUIRED: 'task_id' (32-char hex) plus at least ONE field to update.
 
+""" + _TASKDATA_SHAPE_HELP + """
+
 CORRECT usage:
   update_standalone_task(task_id="abc...", deadline="2026-06-01 17:00:00")
   update_standalone_task(task_id="abc...", title="New title", summary="Updated description")
   update_standalone_task(task_id="abc...", owners={"users": [123], "guests": [], "groups": []})
-  update_standalone_task(task_id="abc...", taskdata={"field_timeline_id": {"value": "new value"}})
+  update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": "new value"})
+  update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": {"id": "b7", "text": "Approved"}})
 
 Never call this without task_id. Do NOT pass a run_id — standalone tasks don't use one.""",
         tags={"tasks", "workflow", "write", "standalone", "update"},
@@ -931,7 +974,12 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
             summary: New task description
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}
-            taskdata: Form field values keyed by field timeline_id, e.g. {"field_id": {"value": "x"}}
+            taskdata: Form field values, keyed by form field id. The value is shaped by
+                the field's type and is sent verbatim — there is no {"value": ...}
+                wrapper. text/textarea/date/email/file take a bare scalar; radio takes
+                the option's text as a bare scalar; dropdown takes {"id","text"};
+                multiselect a list of {"id","text"}; table a list with one entry per
+                column; assignees_form {"users","guests","groups"}.
             status: Task status string
             max_assignable: Maximum number of assignees who must complete the task
             top_secret: Hide task from non-assignees (only assignees and admins can see it)

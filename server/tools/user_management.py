@@ -3,9 +3,10 @@ User Management Tools
 Tools for managing organization users
 """
 
-from typing import Optional
+from typing import List, Optional
 
 from fastmcp.tools.tool import ToolResult
+from fastmcp.exceptions import ToolError
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
 
@@ -245,7 +246,23 @@ If user doesn't provide all required info, ASK them before calling this tool."""
 
     @mcp.tool(
         name="create_guest",
-        description="Create a new guest in the organization. REQUIRED: 'email' (valid email), 'first_name', 'last_name'. Optional: 'phone', 'company_name'. Never call this without the three required parameters.",
+        description="""Create a new guest (external collaborator) in the organization.
+
+REQUIRED: 'email' (valid email), 'first_name', 'last_name'.
+
+Optional: 'phone_1' (primary phone, max 20 chars), 'phone_2' (secondary phone,
+max 20 chars), 'company_name' (max 200 chars).
+
+NOTE the phone parameter names: the API stores two numbered phone fields,
+'phone_1' and 'phone_2'. There is no plain 'phone' field — a value sent as
+'phone' is silently discarded and the guest is created without it.
+
+CORRECT usage:
+  create_guest(email="alice@vendor.com", first_name="Alice", last_name="Smith")
+  create_guest(email="bob@vendor.com", first_name="Bob", last_name="Jones",
+               phone_1="+1 314 555 0100", company_name="Vendor Inc")
+
+Never call this without the three required parameters.""",
         tags={"users", "guests", "write"},
         annotations=ToolAnnotations(
             title="Create guest",
@@ -262,7 +279,8 @@ If user doesn't provide all required info, ASK them before calling this tool."""
         email: UserEmail,
         first_name: UserName,
         last_name: UserName,
-        phone: OptionalString = None,
+        phone_1: OptionalString = None,
+        phone_2: OptionalString = None,
         company_name: OptionalString = None,
     ) -> GenericDict:
         """
@@ -272,18 +290,34 @@ If user doesn't provide all required info, ASK them before calling this tool."""
             email: Guest's email address (REQUIRED)
             first_name: Guest's first name (REQUIRED)
             last_name: Guest's last name (REQUIRED)
-            phone: Guest's phone number (optional)
-            company_name: Guest's company name (optional)
+            phone_1: Guest's primary phone number (optional, max 20 chars)
+            phone_2: Guest's secondary phone number (optional, max 20 chars)
+            company_name: Guest's company name (optional, max 200 chars)
 
         Returns:
             Created guest object
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            guest = sdk.users.create_guest(
-                org_id, email, first_name, last_name,
-                phone=phone, company_name=company_name,
-            )
+            # The SDK's create_guest() sends a singular "phone" key, which is not in
+            # CreateGuestRequest::rules() (app/Http/Requests/Guests/CreateGuestRequest.php
+            # declares phone_1 and phone_2) — so onlyValidatedFields() dropped it and the
+            # guest was created phone-less at HTTP 201. Post the correct body directly.
+            endpoint = f"organizations/{org_id}/guests"
+            body = {
+                "email": email,
+                "first_name": first_name.strip(),
+                "last_name": last_name.strip(),
+            }
+            if phone_1 is not None:
+                body["phone_1"] = phone_1
+            if phone_2 is not None:
+                body["phone_2"] = phone_2
+            if company_name is not None:
+                body["company_name"] = company_name
+
+            response = sdk._make_request("POST", endpoint, data=body)
+            guest = response.get("data", response) if isinstance(response, dict) else response
             return ToolResult(
                 content=serialize_dataclass(guest) if guest else {},
                 structured_content=None
@@ -291,10 +325,29 @@ If user doesn't provide all required info, ASK them before calling this tool."""
 
     @mcp.tool(
         name="update_guest",
-        description="Update guest details. REQUIRED: 'email' (valid email). Plus at least one optional field to update: 'first_name', 'last_name', 'phone', 'company_name'. Never call this without email.",
+        description="""Set which organization members a guest is associated with.
+
+REQUIRED: 'email' (the guest to update) and 'associated_members' (list of numeric
+member user IDs — pass [] to clear). 'associated_members' REPLACES the whole list,
+it does not append.
+
+THIS TOOL CANNOT EDIT A GUEST'S PROFILE. The update-guest endpoint accepts only the
+guest's email (to identify them) and associated_members; the API validates nothing
+else, so first_name, last_name, phone and company_name CANNOT be changed here — a
+request carrying them is accepted with a success status and those values are
+silently discarded. Do not tell the user a name or phone was updated.
+
+To change a guest's name/phone/company today: delete the guest and re-create them
+with create_guest, or edit the guest in the Tallyfy web UI.
+
+CORRECT usage:
+  update_guest(email="alice@vendor.com", associated_members=[20059, 20033])
+  update_guest(email="alice@vendor.com", associated_members=[])   # clear
+
+Use get_guest(email=...) to read a guest's current profile.""",
         tags={"users", "guests", "write"},
         annotations=ToolAnnotations(
-            title="Update guest",
+            title="Set guest's associated members",
             readOnlyHint=False,
             destructiveHint=False,
             idempotentHint=True,
@@ -306,33 +359,46 @@ If user doesn't provide all required info, ASK them before calling this tool."""
     @handle_tallyfy_errors("update guest")
     def update_guest(
         email: UserEmail,
-        first_name: OptionalString = None,
-        last_name: OptionalString = None,
-        phone: OptionalString = None,
-        company_name: OptionalString = None,
+        associated_members: Optional[List[int]] = None,
     ) -> GenericDict:
         """
-        Update guest details.
+        Set the organization members associated with a guest.
+
+        Only ``associated_members`` is editable. api-v2's UpdateGuestRequest
+        (app/Http/Requests/Guests/UpdateGuestRequest.php) declares just
+        ``email`` (required|exists) and ``associated_members``; the controller
+        passes ``$request->onlyValidatedFields()`` — i.e. ``validator->validated()``
+        (BaseRequest.php:139-141) — into the service, which strips every key the
+        rules do not mention. Profile fields sent here would be dropped without
+        an error, so this tool does not advertise them.
 
         Args:
             email: Guest's email address (REQUIRED)
-            first_name: Updated first name (optional)
-            last_name: Updated last name (optional)
-            phone: Updated phone number (optional)
-            company_name: Updated company name (optional)
+            associated_members: Full replacement list of numeric member user IDs
+                (REQUIRED — pass [] to clear the association)
 
         Returns:
             Updated guest object
         """
+        if associated_members is None:
+            raise ToolError(
+                "associated_members is required — it is the only field this endpoint "
+                "can change. Pass a list of numeric member user IDs, or [] to clear. "
+                "A guest's first_name / last_name / phone / company_name cannot be "
+                "updated through the API; re-create the guest or edit them in the "
+                "Tallyfy web UI instead."
+            )
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            guest = sdk.users.update_guest(
-                org_id, email,
-                first_name=first_name,
-                last_name=last_name,
-                phone=phone,
-                company_name=company_name,
+            # The SDK's update_guest() only knows how to send profile fields, all of
+            # which the API discards. Send the one field that is actually validated.
+            endpoint = f"organizations/{org_id}/guests/{email}"
+            response = sdk._make_request(
+                "PUT", endpoint,
+                data={"email": email, "associated_members": associated_members},
             )
+            guest = response.get("data", response) if isinstance(response, dict) else response
             return ToolResult(
                 content=serialize_dataclass(guest) if guest else {},
                 structured_content=None

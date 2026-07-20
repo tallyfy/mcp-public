@@ -16,11 +16,13 @@ References:
 
 from starlette.responses import JSONResponse
 
+from constants import SERVER_VERSION
+
 
 _SERVER_CARD = {
     "serverInfo": {
         "name": "Tallyfy Workflow Automation",
-        "version": "1.0.0",
+        "version": SERVER_VERSION,
     },
     "displayName": "Tallyfy Workflow Automation",
     "description": (

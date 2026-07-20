@@ -5,6 +5,7 @@ Standardized error handling patterns for MCP tools
 
 import re
 from functools import wraps
+from typing import Any
 from fastmcp.exceptions import ToolError
 from tallyfy import TallyfyError
 import logging
@@ -69,6 +70,70 @@ def _sanitize_api_error(message: str) -> str:
     return message
 
 
+_MAX_FIELD_ERRORS = 12
+_MAX_FIELD_ERROR_CHARS = 900
+
+
+def _flatten_detail(detail: Any) -> list:
+    """
+    Flatten one ``errors`` value into a list of plain strings.
+
+    Laravel nests unpredictably here: a plain string, a list of strings, or —
+    for keyed payloads such as ``tasks`` and ``prerun`` — a list of dicts whose
+    values are themselves lists. Recursing keeps Python list reprs out of the
+    message the caller reads.
+    """
+    if isinstance(detail, str):
+        return [detail]
+    if isinstance(detail, dict):
+        out = []
+        for key, value in detail.items():
+            out.extend(f"{key}: {msg}" for msg in _flatten_detail(value))
+        return out
+    if isinstance(detail, (list, tuple)):
+        out = []
+        for item in detail:
+            out.extend(_flatten_detail(item))
+        return out
+    return [str(detail)]
+
+
+def _format_field_errors(errors: Any) -> str:
+    """
+    Flatten a Laravel ``errors`` block into a compact, agent-readable string.
+
+    Laravel returns ``{"message": ..., "errors": {"<field.path>": ["msg", ...]}}``
+    where ``message`` is often just "The given data was invalid." and every
+    actionable detail — which field, what was wrong — lives only in ``errors``.
+    Dropping it leaves the caller with nothing to correct, so we surface it.
+
+    Values may be a list of strings, a bare string, or (for nested payloads such
+    as ``tasks``) a list of dicts keyed by ID, so each shape is handled.
+    """
+    if not isinstance(errors, dict) or not errors:
+        return ""
+
+    parts = []
+    for field, detail in list(errors.items())[:_MAX_FIELD_ERRORS]:
+        messages = _flatten_detail(detail)
+
+        joined = "; ".join(str(m) for m in messages if m)
+        if joined:
+            parts.append(f"{field}: {joined}")
+
+    if not parts:
+        return ""
+
+    remaining = len(errors) - _MAX_FIELD_ERRORS
+    if remaining > 0:
+        parts.append(f"(+{remaining} more)")
+
+    rendered = _sanitize_api_error(" | ".join(parts))
+    if len(rendered) > _MAX_FIELD_ERROR_CHARS:
+        rendered = rendered[:_MAX_FIELD_ERROR_CHARS].rstrip() + "…"
+    return rendered
+
+
 def _extract_api_message(error: TallyfyError) -> str:
     """
     Extract a clean, user-facing message from a TallyfyError.
@@ -76,23 +141,33 @@ def _extract_api_message(error: TallyfyError) -> str:
     The SDK formats messages as:
       "API request failed with status 400: <actual message>"
     This strips the technical prefix and returns just the API message.
-    If response_data contains a 'message' key, prefer that.
+    If response_data contains a 'message' key, prefer that, and append the
+    per-field ``errors`` block when present so the caller can self-correct.
 
     Internal system details (SQL queries, stack traces, file paths) are
     stripped before returning — the full error is already in logs/Sentry.
     """
-    # Prefer the message from response_data if available
     response_data = getattr(error, "response_data", None)
+
+    # The per-field ``errors`` block is the only part that names the offending
+    # field, so it must survive regardless of which source supplies the message.
+    # Some api-v2 responses (custom ResourceExceptions) carry `errors` with no
+    # `message` at all — dropping them there would defeat the whole point.
+    field_errors = ""
+    if isinstance(response_data, dict):
+        field_errors = _format_field_errors(response_data.get("errors"))
+
     if isinstance(response_data, dict) and "message" in response_data:
-        return _sanitize_api_error(response_data["message"])
+        message = _sanitize_api_error(response_data["message"])
+    else:
+        # Strip the SDK's "API request failed with status NNN: " prefix
+        raw = str(error)
+        match = re.match(r"API request failed with status \d+:\s*(.+)", raw)
+        message = _sanitize_api_error(match.group(1) if match else raw)
 
-    # Strip the SDK's "API request failed with status NNN: " prefix
-    raw = str(error)
-    match = re.match(r"API request failed with status \d+:\s*(.+)", raw)
-    if match:
-        return _sanitize_api_error(match.group(1))
-
-    return _sanitize_api_error(raw)
+    if field_errors:
+        return f"{message} [{field_errors}]"
+    return message
 
 
 def _build_error_message(operation_name: str, error: TallyfyError) -> str:

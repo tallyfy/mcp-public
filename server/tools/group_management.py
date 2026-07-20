@@ -4,6 +4,7 @@ Tools for managing organization groups
 """
 
 from fastmcp.tools.tool import ToolResult
+from fastmcp.exceptions import ToolError
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
 from utils.fastmcp_errors import handle_tallyfy_errors
@@ -164,7 +165,21 @@ def register_group_management_tools(mcp):
 
     @mcp.tool(
         name="create_group",
-        description="Create a new group in the organization. REQUIRED: 'name' (group name). Optional: 'description', 'members' (list of user IDs), 'guests' (list of emails). Never call this without name.",
+        description="""Create a new group (team) in the organization.
+
+REQUIRED: 'name' (group name, max 200 chars, must be unique in the organization)
+AND 'description' (non-empty string). The API rejects a create without a
+description, so ask the user for one — or pass a short factual summary of the
+group's purpose — rather than omitting it.
+
+Optional: 'members' (list of numeric member user IDs), 'guests' (list of guest emails).
+
+CORRECT usage:
+  create_group(name="Finance", description="Finance department approvers")
+  create_group(name="Onboarding buddies", description="Volunteers who mentor new hires",
+               members=[20059, 20033])
+
+Never call this without both name and description.""",
         tags=["groups", "organization", "write"],
         annotations=ToolAnnotations(
             title="Create group",
@@ -179,7 +194,7 @@ def register_group_management_tools(mcp):
     @handle_tallyfy_errors("create group")
     def create_group(
         name: GroupName,
-        description: OptionalString = None,
+        description: str,
         members: Optional[List[int]] = None,
         guests: Optional[List[str]] = None,
     ) -> GenericDict:
@@ -187,14 +202,23 @@ def register_group_management_tools(mcp):
         Create a new group in the organization.
 
         Args:
-            name: Group name (REQUIRED)
-            description: Group description (optional)
+            name: Group name (REQUIRED — max 200 chars, unique per organization)
+            description: Group description (REQUIRED — api-v2's CreateGroupRequest
+                declares 'description' => 'required|string', so a create without
+                one is rejected with a 422)
             members: List of numeric user IDs to add as members (optional)
             guests: List of guest emails to add as members (optional)
 
         Returns:
             Created group object
         """
+        if not description or not description.strip():
+            raise ToolError(
+                "description is required and cannot be empty — the Tallyfy API "
+                "rejects a group create without one. Provide a short description "
+                "of the group's purpose."
+            )
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             group = sdk.groups.create_group(

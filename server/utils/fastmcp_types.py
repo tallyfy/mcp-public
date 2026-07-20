@@ -342,8 +342,8 @@ TagTitle = Annotated[str, Field(
 # Folder-related types
 FolderId = Annotated[str, Field(
     min_length=1,
-    description="Folder ID",
-    examples=["folder_abc123"]
+    description="Folder ID (32-char hex)",
+    examples=["7c9e6679742540de944be07fc1f90ae7"]
 )]
 
 FolderName = Annotated[str, Field(
@@ -352,10 +352,18 @@ FolderName = Annotated[str, Field(
     examples=["Q1 2026", "Finance"]
 )]
 
-FolderObjectId = Annotated[str, Field(
-    min_length=1,
-    description="Folder-object relation ID",
-    examples=["fo_abc123"]
+# core.folder_objects.id is an auto-increment INTEGER (db-schema.sql:3418),
+# not a hex string — the value comes back on the folder-object relation
+# created by add_object_to_folder.
+FolderObjectId = Annotated[int, Field(
+    ge=1,
+    description="Folder-object relation ID (positive integer)",
+    examples=[12345]
+)]
+
+FolderType = Annotated[str, Field(
+    description="Folder kind: 'checklist' for template folders, 'run' for process folders",
+    examples=["checklist", "run"]
 )]
 
 # Comment-related types

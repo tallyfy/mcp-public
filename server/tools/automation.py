@@ -124,6 +124,94 @@ def register_automation_tools(mcp):
         "set_deadline": "deadline",
     }
 
+    # action_type constrains action_verb — the two are NOT independent. Mirrors
+    # DoableActionValidator::acceptedActionVerbs()
+    # (app/Http/Requests/Checklists/AutomatedActions/DoableActionValidator.php:71-85).
+    # A pair outside this map is rejected by the API with
+    # "The action verb only accepts ...", so catch it locally with a better message.
+    _ACTION_VERBS_BY_TYPE = {
+        "visibility": ["show", "hide"],
+        "deadline": ["deadline"],
+        "status": ["reopen"],
+        "assignment": ["assign", "assign_only", "clear_assignees", "unassign"],
+        "webhook": ["emit_webhook"],
+    }
+
+    # Types with exactly one legal verb — safe to infer when the caller omits it.
+    _INFERABLE_VERBS = {
+        t: v[0] for t, v in _ACTION_VERBS_BY_TYPE.items() if len(v) == 1
+    }
+
+    # 'then_actions.*.deadline.unit'   => in:minutes,hours,days,weeks,months
+    # 'then_actions.*.deadline.option' => in:before,from
+    # 'then_actions.*.deadline.value'  => integer
+    # Each is required_with the deadline object, so a partial deadline 422s.
+    _DEADLINE_UNITS = ["minutes", "hours", "days", "weeks", "months"]
+    _DEADLINE_OPTIONS = ["before", "from"]
+
+    # 'conditions.*.logic' => in:and,or  (per-condition, NOT a top-level field)
+    _CONDITION_LOGIC_VALUES = ["and", "or"]
+
+    def _validate_action_pair(act: dict) -> None:
+        """Reject an action_type/action_verb pair the API would refuse."""
+        at = act.get("action_type")
+        av = act.get("action_verb")
+
+        accepted = _ACTION_VERBS_BY_TYPE.get(at)
+        if accepted is None:
+            raise ToolError(
+                f"action_type must be one of "
+                f"{', '.join(sorted(_ACTION_VERBS_BY_TYPE))} — got {at!r}."
+            )
+
+        if av in accepted:
+            return
+
+        message = (
+            f"action_verb {av!r} is not valid for action_type {at!r}. "
+            f"{at!r} accepts: {', '.join(accepted)}."
+        )
+        # If the verb is legal but under a different type, name that type —
+        # e.g. reopen belongs to 'status', never to 'visibility'.
+        owner = next(
+            (t for t, verbs in _ACTION_VERBS_BY_TYPE.items() if av in verbs), None
+        )
+        if owner:
+            message += f" The verb {av!r} belongs to action_type '{owner}'."
+        raise ToolError(message)
+
+    def _validate_deadline(act: dict) -> None:
+        """A deadline action needs a COMPLETE {value, option, unit} object."""
+        if act.get("action_type") != "deadline":
+            return
+        dl = act.get("deadline")
+        if not isinstance(dl, dict):
+            raise ToolError(
+                'A deadline action requires a complete deadline object: '
+                '{"value": <int>, "unit": "minutes|hours|days|weeks|months", '
+                '"option": "before|from"}. All three keys are required together.'
+            )
+        missing = [k for k in ("value", "unit", "option") if dl.get(k) in (None, "")]
+        if missing:
+            raise ToolError(
+                f"deadline is missing required key(s): {', '.join(missing)}. "
+                'All of value, unit and option must be sent together, e.g. '
+                '{"value": 3, "unit": "days", "option": "from"}.'
+            )
+        if not isinstance(dl["value"], int) or isinstance(dl["value"], bool):
+            raise ToolError(f"deadline.value must be an integer — got {dl['value']!r}.")
+        if dl["unit"] not in _DEADLINE_UNITS:
+            raise ToolError(
+                f"deadline.unit must be one of {', '.join(_DEADLINE_UNITS)} "
+                f"— got {dl['unit']!r}."
+            )
+        if dl["option"] not in _DEADLINE_OPTIONS:
+            raise ToolError(
+                f"deadline.option must be one of {', '.join(_DEADLINE_OPTIONS)} "
+                f"— got {dl['option']!r}. 'before' counts backwards from the "
+                f"anchor, 'from' counts forwards."
+            )
+
     def _normalize_actions(actions: list) -> list:
         """Resolve shorthand action_type/action_verb and fix assignee payload."""
         for act in actions:
@@ -140,6 +228,10 @@ def register_automation_tools(mcp):
                 resolved = _ACTION_VERB_MAP.get(av.lower())
                 if resolved:
                     act["action_verb"] = resolved
+            elif act.get("action_type") in _INFERABLE_VERBS:
+                # deadline/status/webhook each accept exactly one verb, so an
+                # omitted verb is unambiguous rather than an error.
+                act["action_verb"] = _INFERABLE_VERBS[act["action_type"]]
 
             # Fix LLM-guessed assignee payloads → API "assignees" format.
             # LLMs often send: subject:{type:"member",id:123} or user_id:123
@@ -170,6 +262,10 @@ def register_automation_tools(mcp):
                 if users or guests:
                     act["assignees"] = {"users": users, "guests": guests}
 
+            # Only after normalisation can the pair be judged.
+            _validate_action_pair(act)
+            _validate_deadline(act)
+
         return actions
 
     def _normalize_conditions(conditions: list) -> list:
@@ -199,7 +295,52 @@ def register_automation_tools(mcp):
                 ):
                     cond["statement"] = None
 
+            # 'conditions.*.statement' => 'present' in AutomatedActionRequest.
+            # Laravel's `present` requires the KEY to exist (null is fine), so a
+            # condition that simply omits it is a 422. Step conditions legitimately
+            # carry no statement — the operation alone is the trigger — which is
+            # exactly the case an LLM tends to omit.
+            cond.setdefault("statement", None)
+
+            # Per-condition AND/OR. There is NO top-level condition_logic field in
+            # api-v2; the boolean join lives on each condition as `logic`
+            # (AutomatedActionRequest: 'conditions.*.logic' => 'in:and,or',
+            # persisted to Rule.logic).
+            logic = cond.get("logic")
+            if logic is not None:
+                normalized_logic = str(logic).strip().lower()
+                if normalized_logic not in _CONDITION_LOGIC_VALUES:
+                    raise ToolError(
+                        f"condition 'logic' must be 'and' or 'or' — got {logic!r}."
+                    )
+                cond["logic"] = normalized_logic
+
         return conditions
+
+    def _apply_condition_logic(automation_data: dict) -> None:
+        """Translate the non-existent top-level condition_logic to per-condition logic.
+
+        `condition_logic` is not a field api-v2 has ever had — the SDK forwards it
+        verbatim and AutomatedActionsController strips it via onlyValidatedFields(),
+        so any AND/OR intent expressed that way was silently dropped and every rule
+        fell back to the API default. Fold it onto each condition, where the API
+        actually reads it, and drop the dead key so it is not sent.
+        """
+        if "condition_logic" not in automation_data:
+            return
+
+        logic = automation_data.pop("condition_logic")
+        if logic is None:
+            return
+
+        normalized = str(logic).strip().lower()
+        if normalized not in _CONDITION_LOGIC_VALUES:
+            raise ToolError(
+                f"condition_logic must be 'and' or 'or' — got {logic!r}."
+            )
+        for cond in automation_data.get("conditions") or []:
+            # An explicit per-condition logic always wins.
+            cond.setdefault("logic", normalized)
 
     @mcp.tool(
         name="create_automation_rule",
@@ -207,41 +348,30 @@ def register_automation_tools(mcp):
 
 REQUIRED: 'template_id' (32-char hex) + 'automation_data' (dict with `conditions`+`actions`).
 
-action_verbs: show, hide, deadline, assign, unassign, reopen, emit_webhook
+COMPATIBILITY — action_type CONSTRAINS action_verb, they are NOT independent:
+  visibility -> show | hide    deadline -> deadline    status -> reopen
+  webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
+`reopen` NEVER pairs with `visibility`. Single-verb types may omit action_verb.
+
 conditionable_type: step | field | kickoff (auto-resolved)
 Step ops: completed, reopened, approved, rejected, acknowledged, expired, not_assigned
-Field/kickoff ops: contains, not_contains, equals, not_equals, equals_any, greater_than, less_than, is_empty, is_not_empty
+Field/kickoff ops: contains, not_contains, equals, not_equals, equals_any,
+greater_than, less_than, is_empty, is_not_empty
 
-CONCRETE EXAMPLES (show, hide, deadline, assign):
+EVERY condition needs a `statement` key (null for step ops). AND/OR goes on EACH
+condition as `logic`:"and"|"or". No top-level condition_logic exists.
 
-SHOW step when kickoff field = "Yes" (HIDE: action_verb:"hide"):
-```
-{"alias":"Show legal","condition_logic":"and",
- "conditions":[{"conditionable_id":"<kickoff_field_id>","conditionable_type":"kickoff",
-                "operation":"equals","statement":"Yes"}],
- "actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
-```
+EXAMPLE (ids are 32-char hex, no hyphens) — SHOW a step when a kickoff
+field = "Yes" (to hide it: action_verb "hide"):
+{"alias":"Show legal","conditions":[{"conditionable_id":"<ko_field_id>","conditionable_type":"kickoff","operation":"equals","statement":"Yes","logic":"and"}],"actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
 
-DEADLINE 3 days after step completes:
-```
-{"alias":"Deadline 3d","condition_logic":"and",
- "conditions":[{"conditionable_id":"<step_id>","conditionable_type":"step",
-                "operation":"completed","statement":null}],
- "actions":[{"action_type":"deadline","action_verb":"deadline","target_step_id":"<other>",
-             "deadline":{"value":3,"unit":"days","option":"from"}}]}
-```
+Same envelope for other actions, swapping the "actions" entry:
+  deadline: {..,"action_type":"deadline","deadline":{"value":3,"unit":"days","option":"from"}}
+  assign:   {..,"action_type":"assignment","action_verb":"assign","assignees":{"users":[12345]}}
 
-ASSIGN when form field > 10000:
-```
-{"alias":"Assign reviewer","condition_logic":"and",
- "conditions":[{"conditionable_id":"<form_field_id>","conditionable_type":"field",
-                "operation":"greater_than","statement":"10000"}],
- "actions":[{"action_type":"assignment","action_verb":"assign","target_step_id":"<step_id>",
-             "assignees":{"users":[12345],"guests":[]}}]}
-```
-
-PAYLOADS: assignment → `assignees:{users,guests}`; deadline → `deadline:{value,unit (minutes|hours|days|weeks|months),option (from|before)}`; webhook → `webhook_url`+`alias_name`.
-Step conditions: `statement` is null. Use "actions" (NOT "then_actions"), "alias" (NOT "automated_alias").""",
+Every action needs `target_step_id`. deadline needs ALL of value/unit/option
+(unit minutes|hours|days|weeks|months, option before|from). webhook needs webhook_url+alias_name.
+Use "actions" (NOT "then_actions"), "alias" (NOT "automated_alias").""",
         tags=["automation", "rules", "conditional", "write"],
         annotations=ToolAnnotations(
             title="Create automation rule",
@@ -268,15 +398,19 @@ Step conditions: `statement` is null. Use "actions" (NOT "then_actions"), "alias
         if "conditions" not in automation_data:
             raise ToolError(
                 "automation_data must contain a 'conditions' key defining when the rule triggers. "
-                "Example: {\"conditions\": [{\"conditionable_id\": \"<step_id>\", \"conditionable_type\": \"step\", \"operation\": \"is\", \"statement\": \"complete\"}], \"actions\": [...]}"
+                "Example: {\"conditions\": [{\"conditionable_id\": \"a1b2c3d4e5f6789012345678901234ef\", "
+                "\"conditionable_type\": \"step\", \"operation\": \"completed\", \"statement\": null, "
+                "\"logic\": \"and\"}], \"actions\": [...]}"
             )
         if "actions" not in automation_data:
             raise ToolError(
                 "automation_data must contain an 'actions' key (NOT 'then_actions') defining what happens when conditions are met. "
-                "Example: {\"conditions\": [...], \"actions\": [{\"action_type\": \"complete_step\", \"action_verb\": \"complete\", \"target_step_id\": \"<step_id>\"}]}"
+                "Example: {\"conditions\": [...], \"actions\": [{\"action_type\": \"visibility\", "
+                "\"action_verb\": \"show\", \"target_step_id\": \"a1b2c3d4e5f6789012345678901234ef\"}]}"
             )
 
         # Resolve shorthand values to API-expected format (MCP-3X)
+        _apply_condition_logic(automation_data)
         _normalize_conditions(automation_data["conditions"])
         if "actions" in automation_data:
             _normalize_actions(automation_data["actions"])
@@ -300,24 +434,27 @@ Use "actions" (NOT "then_actions"). Use "alias" (NOT "automated_alias"). Use "st
 VALID ENUM VALUES:
   STEP operations:    completed, reopened, approved, rejected, acknowledged, expired, not_assigned
   FIELD/KICKOFF ops:  contains, not_contains, equals, not_equals, equals_any, greater_than, less_than, is_empty, is_not_empty
-  action_verb:        show, hide, deadline, reopen, assign, unassign, assign_only, clear_assignees, emit_webhook
 
-CONDITION ↔ ACTION COMPATIBILITY MATRIX:
-  conditionable_type=step    + step op  → ANY action_verb (e.g. "step X completed → assign user Z")
-  conditionable_type=field   + field op → ANY action_verb (common: show/hide/assign; e.g. "Amount > 10000 → assign reviewer")
-  conditionable_type=kickoff + field op → ANY action_verb (common: show/hide; e.g. "Department = 'Legal' → show step")
+COMPATIBILITY MATRIX — action_type constrains action_verb
+  visibility -> show | hide    deadline -> deadline    status -> reopen
+  webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
+e.g. `reopen` is only valid with action_type "status", never "visibility".
+conditionable_type step | field | kickoff pairs with any action_verb.
 
-ACTION-SPECIFIC REQUIRED FIELDS:
+CONDITIONS: every entry needs a `statement` key (null for step ops). AND/OR is set
+PER CONDITION as `logic`:"and"|"or"; there is no top-level condition_logic field.
+
+ACTION-SPECIFIC REQUIRED FIELDS (all actions need `target_step_id`):
   - assignment    → `assignees: {users:[...], guests:[...], groups:[...]}`
-  - deadline      → `deadline: {value, unit ("days"|"hours"|"minutes"|"weeks"|"months"), option ("from"|"before")}`
+  - deadline      → COMPLETE `deadline: {value:int, unit:minutes|hours|days|weeks|months, option:before|from}`
   - emit_webhook  → `webhook_url` AND `alias_name`
-  - show/hide/reopen/clear_assignees/unassign → only `target_step_id`
 
 INCOMPATIBLE COMBOS (produce 422 errors):
-  - assignment without `assignees`
-  - deadline without `deadline.value` + `deadline.unit`
+  - an action_verb outside its action_type's list (see matrix above)
+  - assignment without `assignees`; a partial `deadline`
   - webhook without `webhook_url` + `alias_name`
-  - operation="completed" with conditionable_type="field" (use "equals"/"contains")
+  - operation="completed" with conditionable_type="field" (use "equals")
+  - a condition with no `statement` key
 
 CORRECT: update_automation_rule(template_id="abc...", automation_id="def...", automation_data={"conditions":[...], "actions":[...]})
 WRONG:   update_automation_rule(automation_id="def...", automation_data={...})  ← MISSING template_id
@@ -354,6 +491,7 @@ Never call this without all three parameters.""",
             Updated AutomatedAction object data
         """
         # Resolve shorthand values to API-expected format (MCP-3X)
+        _apply_condition_logic(automation_data)
         if "conditions" in automation_data:
             _normalize_conditions(automation_data["conditions"])
         if "actions" in automation_data:

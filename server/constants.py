@@ -203,8 +203,14 @@ FASTMCP_SETTINGS = {
 # Server Metadata
 # ============================================================================
 
-# Server version (used in Prometheus metrics)
-SERVER_VERSION = "1.0.0"
+# Server version (used in Prometheus metrics, the server card, and server.json).
+# Keep this in step with server.json — the MCP registry reads that file, and the
+# three copies had already drifted (server.json 1.0.1 vs 1.0.0 here and in the
+# server card) before they were reconciled. server_card.py now imports this
+# rather than repeating the literal.
+# 1.1.0: launch_process prerun/roles now take an ID-keyed object, a breaking
+# change to the advertised tool schema.
+SERVER_VERSION = "1.1.0"
 
 # FastMCP framework version — read at runtime so it stays accurate after upgrades
 FASTMCP_VERSION = importlib.metadata.version("fastmcp")

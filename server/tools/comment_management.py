@@ -32,23 +32,39 @@ logger = logging.getLogger(__name__)
 # @mention parsing (W-bug6 / issue #173)
 # ---------------------------------------------------------------------------
 #
-# Comment bodies may include @mentions in several formats. The MCP layer
-# parses them out, resolves them to user_ids via the org-users helper, and
-# forwards the resulting integer IDs to the SDK as `sent_to=` so the Tallyfy
-# API fires the @mention notification. Without this step, mentions written
-# in plain English (e.g. ``@Zurly Nike``) or as canonical Froala markup
-# (``<span data-id="…">``) are stored as inert text and trigger no notification.
+# THE ONLY THING THAT FIRES A MENTION NOTIFICATION IS ``@[<user_id>]`` MARKUP
+# INSIDE THE COMMENT BODY.
 #
-# Recognised formats:
+# api-v2 parses mentions out of the stored content — ``atmentioned_users()``
+# (app/Helpers/email.php:500) feeds ``atmentioned_users_ids()``
+# (app/Helpers/email.php:458-460), which is literally
+# ``preg_match_all('/@\[(\d+)]/', $content, $matches)``. The resulting users
+# are what ``App\Messaging\Comment::postOn()`` (app/Messaging/Comment.php:70)
+# dispatches ``users.at_mentioned`` for.
+#
+# There is NO request-side ``sent_to`` parameter. PostCommentRequest
+# (app/Http/Requests/Tasks/PostCommentRequest.php) validates only
+# content/state/label, and a repo-wide grep for ``sent_to`` finds it in just
+# two @SWG doc annotations plus ThreadTransformer, where it is a RESPONSE
+# field derived from ``$thread->participants``. A ``sent_to`` key in the
+# request body is therefore read by nothing and notifies nobody.
+#
+# So the MCP layer resolves every mention shorthand to a user_id and then
+# REWRITES THE BODY so each one is ``@[<user_id>]``. Rendering comes free:
+# api-v2 turns ``@[id]`` back into ``<strong>Full Name</strong>`` on read.
+#
+# Recognised input formats (all normalised to ``@[<user_id>]``):
+#   @[<numeric_id>]         e.g. @[20059]                    -> already canonical
 #   @<numeric_id>           e.g. @20059                      -> by id
 #   @<email>                e.g. @zurly@example.com          -> by email
 #   @"Display Name"         e.g. @"Zurly Nike"               -> by full name
 #   @<username>             e.g. @zurly                      -> by username
-#   <span … data-id="…">    Froala mention HTML (pre-formatted markup)
+#   <span … data-id="…">    Froala mention HTML (id read, span left intact)
 #
-# The parser is lenient: malformed tokens (``@@invalid``) are silently left
-# in the comment body unchanged. No mentions found means no org-users API
-# call is made (the lookup is opt-in based on the body content).
+# The parser is lenient: malformed tokens (``@@invalid``) and tokens that
+# resolve to nobody are silently left in the comment body unchanged. No
+# mentions found means no org-users API call is made (the lookup is opt-in
+# based on the body content).
 
 # HTML mention span (Froala tribute) — extract data-id attribute.
 _HTML_MENTION_RE = re.compile(
@@ -74,6 +90,51 @@ _USER_ID_RE = re.compile(r'(?<![\w@])@(\d{4,10})\b')
 # @<username> — alphanumeric token with allowed punctuation `._-`.
 _USERNAME_RE = re.compile(r'(?<![\w@])@([A-Za-z][\w._\-]*)\b')
 
+# @[<user_id>] — the canonical markup api-v2 actually reads. None of the
+# rewrite patterns above can match inside it (each requires the character
+# after `@` to be a digit, letter or quote — never `[`), so already-canonical
+# mentions survive the rewrite untouched.
+_MARKUP_MENTION_RE = re.compile(r'@\[(\d+)]')
+
+# A whole Froala mention element, opening tag through closing tag. Its inner
+# text is a rendered display name like ``@Zurly Nike`` — running the plain-text
+# rewrites over it would corrupt the label (``@[20059] Nike``) for no gain,
+# since the id is already carried by data-id. Masked out during rewriting.
+_MENTION_SPAN_ELEMENT_RE = re.compile(
+    r'<span[^>]*\bdata-id\s*=\s*["\']\d+["\'][^>]*>.*?</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Placeholder for a masked span. Deliberately contains no '@' so none of the
+# mention patterns can match it while it stands in for the real markup.
+_MASK_TEMPLATE = "\x00mention-span-{}\x00"
+
+
+def _mask_mention_spans(content: str) -> tuple:
+    """Replace Froala mention elements with inert placeholders.
+
+    Returns ``(masked_content, spans)``; pass both to :func:`_unmask_mention_spans`.
+    """
+    spans: List[str] = []
+
+    def _stash(m):
+        spans.append(m.group(0))
+        return _MASK_TEMPLATE.format(len(spans) - 1)
+
+    return _MENTION_SPAN_ELEMENT_RE.sub(_stash, content), spans
+
+
+def _unmask_mention_spans(content: str, spans: List[str]) -> str:
+    """Restore the elements removed by :func:`_mask_mention_spans`."""
+    for i, original in enumerate(spans):
+        content = content.replace(_MASK_TEMPLATE.format(i), original)
+    return content
+
+
+def mention_markup(user_id: int) -> str:
+    """Render the one mention form the Tallyfy API notifies on."""
+    return f"@[{user_id}]"
+
 
 def _has_mention_token(content: str) -> bool:
     """Quick check: does the body contain any @-token worth resolving?"""
@@ -84,16 +145,25 @@ def _has_mention_token(content: str) -> bool:
     return True
 
 
-def _extract_mentioned_user_ids(content: str, sdk, org_id: str) -> List[int]:
-    """Parse @mentions from a comment body and resolve them to user IDs.
+def _finish(content: str, spans: List[str], resolved: List[int]) -> str:
+    """Restore masked spans, then guarantee every resolved id has @[id] markup."""
+    return _ensure_mention_markup(_unmask_mention_spans(content, spans), resolved)
 
-    Returns a deduplicated list of integer user IDs in insertion order. A
-    failure to resolve any individual token is silent — the comment is
+
+def _resolve_mentions(content: str, sdk, org_id: str) -> tuple:
+    """Normalise every @mention in a comment body to ``@[<user_id>]`` markup.
+
+    Returns ``(rewritten_content, resolved_ids)``. ``resolved_ids`` is a
+    deduplicated list of integer user IDs in insertion order; every one of
+    them is guaranteed to appear as ``@[<user_id>]`` in ``rewritten_content``,
+    which is the only form api-v2 notifies on (app/Helpers/email.php:458-460).
+
+    A failure to resolve any individual token is silent — the comment is
     posted with whatever IDs we did manage to resolve, and unresolved tokens
     remain in the body as plain text (matching native Tallyfy behaviour).
     """
     if not _has_mention_token(content):
-        return []
+        return content, []
 
     resolved: List[int] = []
 
@@ -101,19 +171,36 @@ def _extract_mentioned_user_ids(content: str, sdk, org_id: str) -> List[int]:
         if uid is not None and uid not in resolved:
             resolved.append(uid)
 
-    # 1. HTML mention spans — `data-id` is a verbatim user_id, no lookup needed.
+    # 1. HTML mention spans — `data-id` is a verbatim user_id, no lookup
+    # needed. The span is then masked so the plain-text rewrites below cannot
+    # corrupt its rendered display name; `_ensure_mention_markup` guarantees a
+    # matching @[id] token exists so the notification still fires.
     for m in _HTML_MENTION_RE.finditer(content):
         try:
             _add(int(m.group(1)))
         except ValueError:
             continue
 
-    # 2. @<numeric_id> — verbatim user_id, no lookup needed.
-    for m in _USER_ID_RE.finditer(content):
+    content, _spans = _mask_mention_spans(content)
+
+    # 2. Already-canonical @[<numeric_id>] markup — count it as resolved so
+    # the trailing pass does not prepend a duplicate.
+    for m in _MARKUP_MENTION_RE.finditer(content):
         try:
             _add(int(m.group(1)))
         except ValueError:
             continue
+
+    # 3. @<numeric_id> — verbatim user_id, no lookup needed. Rewrite to markup.
+    def _sub_user_id(m):
+        try:
+            uid = int(m.group(1))
+        except ValueError:
+            return m.group(0)
+        _add(uid)
+        return mention_markup(uid)
+
+    content = _USER_ID_RE.sub(_sub_user_id, content)
 
     # The remaining patterns (email, quoted name, username) need the org
     # users index to translate text -> integer ID. Build it lazily — we only
@@ -124,7 +211,7 @@ def _extract_mentioned_user_ids(content: str, sdk, org_id: str) -> List[int]:
         or _USERNAME_RE.search(content)
     )
     if not needs_directory:
-        return resolved
+        return _finish(content, _spans, resolved), resolved
 
     try:
         users_list = sdk.users.get_organization_users_list(org_id)
@@ -135,7 +222,7 @@ def _extract_mentioned_user_ids(content: str, sdk, org_id: str) -> List[int]:
             org_id,
             exc_info=True,
         )
-        return resolved
+        return _finish(content, _spans, resolved), resolved
 
     by_email: dict = {}
     by_username: dict = {}
@@ -156,27 +243,55 @@ def _extract_mentioned_user_ids(content: str, sdk, org_id: str) -> List[int]:
         if full:
             by_full_name.setdefault(full, uid)
 
-    # 3. @<email>
-    for m in _EMAIL_RE.finditer(content):
-        token = m.group(1).lower()
-        _add(by_email.get(token))
+    def _sub_from(index: dict, key_fn):
+        """Build a re.sub callback that rewrites a resolvable token to markup."""
 
-    # 4. @"Display Name"
-    for m in _QUOTED_NAME_RE.finditer(content):
-        name = m.group(1).strip().lower()
-        _add(by_full_name.get(name))
+        def _repl(m):
+            key = key_fn(m.group(1))
+            uid = index.get(key) if key is not None else None
+            if uid is None:
+                # Unresolvable — leave the token exactly as the author wrote it.
+                return m.group(0)
+            _add(uid)
+            return mention_markup(uid)
 
-    # 5. @<username> — last because email/quoted-name patterns may already
-    # have consumed parts of the body, but our regex doesn't mutate `content`,
-    # it just finds matches. The duplicate guard in `_add` keeps things tidy.
-    for m in _USERNAME_RE.finditer(content):
-        token = m.group(1).lower()
-        # Skip purely numeric usernames (already handled by _USER_ID_RE)
-        if token.isdigit():
-            continue
-        _add(by_username.get(token))
+        return _repl
 
-    return resolved
+    # 4. @<email>
+    content = _EMAIL_RE.sub(_sub_from(by_email, lambda t: t.lower()), content)
+
+    # 5. @"Display Name"
+    content = _QUOTED_NAME_RE.sub(
+        _sub_from(by_full_name, lambda t: t.strip().lower()), content
+    )
+
+    # 6. @<username> — last because the email and quoted-name patterns subsume
+    # it; running it earlier would rewrite the local part of an @email token.
+    # Purely numeric tokens were already handled by _USER_ID_RE above.
+    content = _USERNAME_RE.sub(
+        _sub_from(by_username, lambda t: t.lower() if not t.isdigit() else None),
+        content,
+    )
+
+    return _finish(content, _spans, resolved), resolved
+
+
+def _ensure_mention_markup(content: str, user_ids: List[int]) -> str:
+    """Guarantee every resolved user_id appears as ``@[uid]`` in the body.
+
+    Covers the ids that could not be rewritten in place — Froala
+    ``<span data-id="…">`` markup, and ids supplied out-of-band by the
+    caller. Without a literal ``@[uid]`` token api-v2 never sees the mention
+    and no notification is sent.
+    """
+    if not user_ids:
+        return content
+    already = {int(m.group(1)) for m in _MARKUP_MENTION_RE.finditer(content)}
+    missing = [uid for uid in user_ids if uid not in already]
+    if not missing:
+        return content
+    prefix = " ".join(mention_markup(uid) for uid in missing)
+    return f"{prefix} {content}".strip()
 
 
 def register_comment_management_tools(mcp):
@@ -241,12 +356,18 @@ Optional:
 - 'run_id': process/run ID — pass it if you have it; you'll need it to call 'get_task_comments' later
 - 'label': "comment" (default) | "problem" | "resolve" | "improvement" | "advice"
 - 'state': "open" (default) | "hide-for-guests" | "collapsed"
-- 'sent_to': list of user IDs (integers) to @mention and notify. Look up user IDs first via get_organization_users or get_organization_users_list, then pass them here. Example: sent_to=[20059, 20033]
+- 'sent_to': numeric user IDs to @mention. Look up IDs via get_organization_users first.
+
+@MENTIONS: a user is notified ONLY when the stored body contains @[<user_id>] markup,
+so 'sent_to' entries are rendered into the body as that. You can also write the mention
+straight into 'content' — @[20059], @20059, @alice@acme.com, @"Alice Smith" and @alice
+all resolve and are normalised to @[20059]. An unresolvable token stays plain text and
+notifies nobody, so prefer a numeric ID. Mentioning someone also grants them task access.
 
 LABEL='resolve' SEMANTICS (issue #172):
-- If the task HAS an open problem flag (an existing thread with label='problem' that has not been resolved), this tool automatically clears that flag by routing through the resolve endpoint, matching the native Tallyfy app's behaviour. Pass 'run_id' when available to avoid an extra API lookup.
-- If the task has NO open problem flag, label='resolve' is cosmetic only — the comment is stored with the resolve label but no problem flag is cleared (because there is nothing to clear). The function logs a WARNING in that case so the cosmetic outcome is visible in logs.
-- To explicitly clear a specific known problem thread without posting a separate comment, call resolve_task_issues(task_id, thread_id) directly — that path is unambiguous and returns the resolution outcome.
+- If the task HAS an unresolved label='problem' thread, this clears that flag via the resolve endpoint, matching the native app. Pass 'run_id' to avoid an extra lookup.
+- If it has NO open problem flag, label='resolve' is cosmetic only — the comment is stored with the label but nothing is cleared. A WARNING is logged so that is visible.
+- To clear a specific known problem thread without a separate comment, call resolve_task_issues(task_id, thread_id) directly — unambiguous, and returns the outcome.
 
 CORRECT usage:
   add_task_comment(task_id="abc123...", content="Everything is on track")
@@ -285,7 +406,9 @@ Never call this without both required parameters.""",
                 it in context for a subsequent get_task_comments call (optional)
             label: Comment type — "comment" | "problem" | "resolve" | "improvement" | "advice" (default: "comment")
             state: Visibility — "open" | "hide-for-guests" | "collapsed" (default: "open")
-            sent_to: List of user IDs (integers) to @mention and notify (optional)
+            sent_to: List of numeric user IDs to @mention (optional). Rendered into
+                the body as @[<user_id>] markup — the API has no request-side
+                sent_to parameter, body markup is what notifies.
 
         Returns:
             Created comment object
@@ -293,36 +416,30 @@ Never call this without both required parameters.""",
         if not content or not content.strip():
             raise ToolError("content cannot be empty")
 
-        # Inject @[uid] markup for explicit sent_to so the rendered comment
-        # shows the mention. The actual notification is fired by the
-        # `sent_to` body parameter forwarded to the SDK below.
         effective_content = content.strip()
-        if sent_to:
-            mention_str = " ".join(f"@[{uid}]" for uid in sent_to)
-            effective_content = f"{mention_str} {effective_content}"
 
         # run_id is intentionally not forwarded — the write endpoint only needs task_id.
         # It is accepted here so callers (e.g. Claude) keep it in context for get_task_comments.
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # W-bug6 / issue #173: parse @mentions out of the body and merge
-            # them with explicit sent_to before forwarding to the SDK. The
-            # Tallyfy API's `sent_to` parameter is what fires the
-            # notification — plain-text @-tokens alone do not.
-            body_mention_ids = _extract_mentioned_user_ids(
+            # W-bug6 / issue #173: resolve every @mention shorthand in the body
+            # and rewrite it to @[uid]. Note what deliberately does NOT happen
+            # here: `sent_to` is not forwarded to the API. PostCommentRequest
+            # validates only content/state/label, and api-v2 never reads a
+            # request-side `sent_to` — sending it notified nobody, which is why
+            # mentions silently failed.
+            effective_content, _mention_ids = _resolve_mentions(
                 effective_content, sdk, org_id
             )
-            combined_sent_to = None
-            if sent_to or body_mention_ids:
-                merged = []
-                for uid in (sent_to or []):
-                    if uid not in merged:
-                        merged.append(uid)
-                for uid in body_mention_ids:
-                    if uid not in merged:
-                        merged.append(uid)
-                combined_sent_to = merged or None
-
+            # Seed markup for out-of-band `sent_to` ids AFTER resolving, not before.
+            # _resolve_mentions already guarantees @[uid] for everything it found in
+            # the body (including Froala spans, via its own tail call at :150). Doing
+            # this first instead meant a user named BOTH ways — sent_to=[101] plus
+            # "@john@example.com" in the body — got @[101] twice. This call is
+            # idempotent against tokens already present, so ordering is the whole fix.
+            effective_content = _ensure_mention_markup(
+                effective_content, list(sent_to or [])
+            )
             # When resolving, find open problem threads and resolve them using the
             # user's content directly. This avoids double-posting: the resolve
             # endpoint itself stores the comment, so we skip add_task_comment.
@@ -399,12 +516,9 @@ Never call this without both required parameters.""",
                 )
 
             if label != "resolve" or resolved_count == 0:
-                _kwargs = {"state": state, "label": label}
-                if combined_sent_to is not None:
-                    _kwargs["sent_to"] = combined_sent_to
                 result = sdk.threads.add_task_comment(
                     org_id, task_id, effective_content,
-                    **_kwargs,
+                    state=state, label=label,
                 )
                 serialized = serialize_dataclass(result) if result else {}
             else:
@@ -417,7 +531,7 @@ Never call this without both required parameters.""",
 
     @mcp.tool(
         name="update_task_comment",
-        description="Update an existing comment on a task. REQUIRED: 'task_id' (32-char hex), 'comment_id', and 'content' (new text). Optional: 'run_id' (pass if available), 'label', 'state', 'sent_to' (list of user IDs to @mention and notify). Never call this without all three required parameters.",
+        description="Update an existing comment on a task. REQUIRED: 'task_id' (32-char hex), 'comment_id', and 'content' (new text). Optional: 'run_id' (pass if available), 'label', 'state', 'sent_to' (list of numeric user IDs to @mention — rendered into the body as @[<user_id>] markup, which is what notifies them; you can also write @[20059] / @20059 / @alice@acme.com / @\"Alice Smith\" / @alice directly in 'content' and it is normalised for you). Never call this without all three required parameters.",
         tags=["tasks", "comments", "threads", "write", "collaboration"],
         annotations=ToolAnnotations(
             title="Update task comment",
@@ -449,7 +563,9 @@ Never call this without both required parameters.""",
             run_id: Process/run ID — not used by this endpoint, accepted for context continuity (optional)
             label: Comment type — "comment" | "problem" | "resolve" | "improvement" | "advice" (optional)
             state: Visibility — "open" | "hide-for-guests" | "collapsed" (optional)
-            sent_to: List of user IDs (integers) to @mention and notify (optional)
+            sent_to: List of numeric user IDs to @mention (optional). Rendered into
+                the body as @[<user_id>] markup — the API has no request-side
+                sent_to parameter, body markup is what notifies.
 
         Returns:
             Updated comment object
@@ -458,13 +574,19 @@ Never call this without both required parameters.""",
             raise ToolError("content cannot be empty")
 
         effective_content = content.strip()
-        if sent_to:
-            mention_str = " ".join(f"@[{uid}]" for uid in sent_to)
-            effective_content = f"{mention_str} {effective_content}"
 
         # run_id intentionally not forwarded — write endpoint only needs task_id.
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            # Same contract and same ordering as add_task_comment: resolve the body
+            # first, then seed out-of-band sent_to ids, so a user named both ways
+            # does not get duplicate @[uid] markup.
+            effective_content, _mention_ids = _resolve_mentions(
+                effective_content, sdk, org_id
+            )
+            effective_content = _ensure_mention_markup(
+                effective_content, list(sent_to or [])
+            )
             result = sdk.threads.update_task_comment(
                 org_id, task_id, comment_id, effective_content,
                 state=state,
