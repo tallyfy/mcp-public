@@ -1,4 +1,4 @@
-tallyfy==1.3.9
+tallyfy==1.3.10
 dateparser==1.2.1
 fastmcp==3.4.2
 requests==2.33.0
