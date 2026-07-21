@@ -302,7 +302,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="move_form_field",
-        description="Move form field between steps with position control. REQUIRED: 'template_id' (32-char hex), 'from_step' (32-char hex), 'field_id' (32-char hex), and 'to_step' (32-char hex). Optional: 'position' (defaults to 1). Never call this without the four required parameters.",
+        description="Move form field between steps with position control. REQUIRED: 'template_id' (32-char hex), 'from_step' (32-char hex), 'field_id' (32-char hex), and 'to_step' (32-char hex). Optional: 'position' (1-BASED integer between 1 and 9999 — the first field is position 1, not 0; defaults to 1). Never call this without the four required parameters.",
         tags=["forms", "fields", "ui", "write", "management", "positioning"],
         annotations=ToolAnnotations(
             title="Move form field",
@@ -330,7 +330,8 @@ Never call this without all four parameters.""",
             from_step: Source step ID (REQUIRED - 32-character hex string)
             field_id: Form field ID to move (REQUIRED - 32-character hex string)
             to_step: Target step ID (REQUIRED - 32-character hex string)
-            position: Position in target step (default: 1)
+            position: Position in target step (1-BASED integer between 1 and 9999;
+                the first field is position 1, not 0. Default: 1)
 
         Returns:
             True if move was successful
@@ -647,20 +648,51 @@ REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call th
     # ------------------------------------------------------------------
 
     def _get_template_and_prerun(sdk, org_id, template_id):
-        """Fetch template title and current kickoff fields as raw dicts.
+        """Fetch template title, current kickoff fields, and the raw payload.
 
         Uses ``get_template_with_steps`` which exposes ``raw_data`` — the
         unmodified API response before SDK model conversion.  This preserves
         ``label`` and every other field the API returns, which the
         ``PrerunField`` dataclass would otherwise drop.
 
-        Returns (title, prerun_list).
+        Returns (title, prerun_list, raw_template).
         """
         result = sdk.templates.get_template_with_steps(org_id, template_id=template_id)
         if not result or not result.get("raw_data"):
             raise ToolError(f"Template '{template_id}' not found")
         raw = result["raw_data"]
-        return raw.get("title", ""), raw.get("prerun", [])
+        return raw.get("title", ""), raw.get("prerun", []), raw
+
+    def _preserved_assignment_buckets(raw_template, template_id):
+        """Return the template's CURRENT users/groups so a PUT does not wipe them.
+
+        ChecklistService::update (app/Services/ChecklistService.php:209)
+        unconditionally calls
+          saveAssignees(Assignees::newFromArray(Arr::only($data, ['users','groups'])))
+        and BaseAssignees::newFromArray (app/Domain/Owners/BaseAssignees.php:24)
+        reads ``$data['users'] ?? []`` — so an ABSENT key becomes an EMPTY SET,
+        not "leave alone". Assignees::modify then computes removed = every
+        current user/group and AssignableTrait::saveAssignees detaches them.
+        A kickoff-field PUT carrying only {title, prerun} therefore silently
+        strips every member and group off the template, HTTP 200, no error.
+
+        ChecklistTransformer.php:55-56 emits both keys unconditionally via
+        wrappedAssignees(), so a missing or non-list bucket means the READ
+        failed — and sending [] on a failed read is precisely the wipe this
+        guard exists to prevent. Abort instead of guessing. A genuinely empty
+        list is legitimate (nobody is assigned) and passes straight through.
+        """
+        buckets = {}
+        for field in ("users", "groups"):
+            value = raw_template.get(field)
+            if not isinstance(value, list):
+                raise ToolError(
+                    f"Template {template_id} did not return its current '{field}', "
+                    f"so changing only the kickoff form would detach every member "
+                    f"and group. Nothing was sent."
+                )
+            buckets[field] = list(value)
+        return buckets
 
     @mcp.tool(
         name="add_kickoff_field",
@@ -753,10 +785,11 @@ Never call this without both parameters.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            title, existing = _get_template_and_prerun(sdk, org_id, template_id)
+            title, existing, raw = _get_template_and_prerun(sdk, org_id, template_id)
             existing.append(field_data)
             result = sdk.update_template_metadata(
                 org_id, template_id, title=title, prerun=existing,
+                **_preserved_assignment_buckets(raw, template_id),
             )
             return ToolResult(
                 content=serialize_dataclass(result) if result else {},
@@ -820,7 +853,7 @@ Never call this without all three parameters.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            title, existing = _get_template_and_prerun(sdk, org_id, template_id)
+            title, existing, raw = _get_template_and_prerun(sdk, org_id, template_id)
 
             target = None
             for f in existing:
@@ -838,6 +871,7 @@ Never call this without all three parameters.""",
 
             result = sdk.update_template_metadata(
                 org_id, template_id, title=title, prerun=existing,
+                **_preserved_assignment_buckets(raw, template_id),
             )
             return ToolResult(
                 content=serialize_dataclass(result) if result else {},
@@ -935,7 +969,7 @@ Never call this without both parameters.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            title, existing = _get_template_and_prerun(sdk, org_id, template_id)
+            title, existing, raw = _get_template_and_prerun(sdk, org_id, template_id)
 
             fields_by_id = {f.get("id"): f for f in existing if f.get("id")}
 
@@ -969,6 +1003,7 @@ Never call this without both parameters.""",
 
             result = sdk.update_template_metadata(
                 org_id, template_id, title=title, prerun=reordered,
+                **_preserved_assignment_buckets(raw, template_id),
             )
             return ToolResult(
                 content=serialize_dataclass(result) if result else {},
@@ -1016,7 +1051,7 @@ Never call this without both parameters.""",
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            _, existing = _get_template_and_prerun(sdk, org_id, template_id)
+            _, existing, _ = _get_template_and_prerun(sdk, org_id, template_id)
 
             target = None
             for f in existing:

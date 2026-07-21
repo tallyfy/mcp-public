@@ -6,6 +6,7 @@ Tools for managing templates, steps, and template health
 import re
 from typing import Any
 
+from email_validator import validate_email, EmailNotValidError
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
 from tallyfy import TallyfySDK
@@ -287,6 +288,10 @@ assignees: {"users": [10026], "guests": ["alice@example.com"]}
 assignees: {"guests": ["alice@example.com"]}
 assignees: {"users": [10026]}
 
+This APPENDS: the tool reads the step first and re-sends its existing members,
+guests and groups alongside the additions, which the API would otherwise clear
+on an update that omits them. Existing assignees are never removed.
+
 Never call this without all three parameters.""",
         tags=["templates", "workflow", "write", "management", "assignees"],
         annotations=ToolAnnotations(
@@ -331,13 +336,86 @@ Never call this without all three parameters.""",
         if not isinstance(assignees, dict):
             raise ToolError('assignees must be a dict like {"users": [10026]} or {"guests": ["alice@example.com"]} or {"users": [10026], "guests": ["alice@example.com"]}')
 
-        user_ids = assignees.get('users', [])
-        guest_emails = assignees.get('guests') or None
+        # `or []` on both: an explicit null means "none given", not a type error.
+        # Strict guidance in the description, lenient parsing here.
+        user_ids = assignees.get('users') or []
+        guest_emails = assignees.get('guests') or []
+
+        if not isinstance(user_ids, list):
+            raise ToolError("assignees['users'] must be a list of numeric user IDs")
+        for user_id in user_ids:
+            if not isinstance(user_id, int):
+                raise ToolError(f"User ID {user_id!r} must be an integer")
+
+        if not isinstance(guest_emails, list):
+            raise ToolError("assignees['guests'] must be a list of email addresses")
+        validated_guests = []
+        for guest_email in guest_emails:
+            if not isinstance(guest_email, str):
+                raise ToolError(f"Guest email {guest_email!r} must be a string")
+            try:
+                # check_deliverability=False — syntax only, NO DNS lookup. The SDK
+                # path this replaces used the library default (True), which resolves
+                # MX records on every call: a network round-trip plus a transient
+                # failure mode inside a tool call, and it rejected this tool's OWN
+                # documented example (alice@example.com has a null MX by RFC 2606).
+                # api-v2 is the authority on whether a guest address is acceptable.
+                validated_guests.append(
+                    validate_email(guest_email, check_deliverability=False).normalized
+                )
+            except EmailNotValidError as exc:
+                raise ToolError(f"Invalid email address: {exc}")
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.templates.add_assignees_to_step(org_id, template_id, step_id, user_ids, guests=guest_emails)
-            return ToolResult(content=result, structured_content=None)
+            # READ-MODIFY-WRITE, done here rather than via the SDK. The SDK's
+            # templates.add_assignees_to_step() (tallyfy/template_management/
+            # automation.py:248-254) builds {title, assignees, guests} with NO
+            # 'groups' key at all, and StepBuilder::build (app/Step/StepBuilder.php:37)
+            # unconditionally calls
+            #   saveAssignees(Assignees::newFromArray(Arr::only($data, ['assignees','guests','groups'])))
+            # where BaseAssignees::newFromArray (app/Domain/Owners/BaseAssignees.php:24)
+            # reads `$data['groups'] ?? []` — an ABSENT key is an EMPTY SET, not
+            # "leave alone". So ADDING one member silently DETACHED every group
+            # from the step. Same mechanism as edit_description_on_step above.
+            endpoint = f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}"
+            current = sdk._make_request("GET", endpoint)
+            step = current.get("data", current) if isinstance(current, dict) else {}
+
+            title = step.get("title") or ""
+            if not title:
+                raise ToolError(
+                    "Could not read the step's current title, which the API requires "
+                    "on every step update. Verify template_id and step_id are correct."
+                )
+
+            # StepTransformer.php:33-35 emits all three buckets unconditionally, so a
+            # missing or malformed bucket means the READ failed, not that the step is
+            # unassigned — and sending [] on a failed read is the wipe this guard
+            # exists to prevent. An empty list is legitimate and passes through.
+            payload = {"title": title}
+            for field in ("assignees", "guests", "groups"):
+                value = step.get(field)
+                if not isinstance(value, list):
+                    raise ToolError(
+                        f"Step {step_id} did not return its current '{field}', so "
+                        f"adding an assignee would detach every assignee. "
+                        f"Nothing was sent."
+                    )
+                payload[field] = list(value)
+
+            # Append-not-replace, preserving existing order (a set would reorder
+            # nondeterministically between runs).
+            for user_id in user_ids:
+                if user_id not in payload["assignees"]:
+                    payload["assignees"].append(user_id)
+            for guest_email in validated_guests:
+                if guest_email not in payload["guests"]:
+                    payload["guests"].append(guest_email)
+
+            response = sdk._make_request("PUT", endpoint, data=payload)
+            result = response.get("data", response) if isinstance(response, dict) else response
+            return ToolResult(content=result or {}, structured_content=None)
 
     @mcp.tool(
         name="edit_description_on_step",
@@ -1036,7 +1114,7 @@ Never call this without both parameters.""",
 
     @mcp.tool(
         name="reorder_step",
-        description="Move a step to a new position in a template. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'position' (integer >= 0). Never call this without all three parameters.",
+        description="Move a step to a new position in a template. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'position' (1-based integer >= 1; the first step is position 1, not 0). Never call this without all three parameters.",
         tags=["templates", "steps", "write", "reorder"],
         annotations=ToolAnnotations(
             title="Reorder step",

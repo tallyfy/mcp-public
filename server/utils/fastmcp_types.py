@@ -208,9 +208,17 @@ FieldLabel = Annotated[str, Field(
     examples=["Employee Name", "Start Date"]
 )]
 
+# Form-field positions are 1-BASED and capped, exactly like StepPosition below.
+# api-v2's MoveCaptureRequest validates 'required|integer|between:1,9999'
+# (app/Http/Requests/Captures/MoveCaptureRequest.php:13, message at :20), and the
+# sibling app/Http/Requests/Checklists/CapturesReorderRequest.php:19 uses
+# 'digits_between:1,4|gte:1' — 1..9999 from both ends. This
+# previously declared ge=0 with no upper bound, so the schema invited position=0
+# and unbounded values that the API then rejected — the same drift as #581.
 FieldPosition = Annotated[int, Field(
-    ge=0,
-    description="Position/order of the field in the form",
+    ge=1,
+    le=9999,
+    description="Position/order of the field in the form (1-BASED — the first field is position 1, not 0)",
     examples=[1, 2, 3]
 )]
 

@@ -836,11 +836,17 @@ Never call this without run_id and task_id.""",
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}
             taskdata: Form field values, keyed by form field id. The value is shaped by
-                the field's type and is sent verbatim — there is no {"value": ...}
-                wrapper. text/textarea/date/email/file take a bare scalar; radio takes
-                the option's text as a bare scalar; dropdown takes {"id","text"};
-                multiselect a list of {"id","text"}; table a list with one entry per
-                column; assignees_form {"users","guests","groups"}.
+                the field's type and is sent verbatim. There is no {"value": ...}
+                wrapper: most types reject one with a 422, email stores it verbatim
+                (silent corruption), and file returns a 500. text/textarea/date/email
+                take a bare scalar; file takes a LIST of objects and NEVER a scalar,
+                e.g. [{"filename":"x.pdf","url":"uploads/x.pdf","source":"url"}] (the
+                key is "filename", not "name"; a bare scalar is an HTTP 500); radio
+                takes the option's text as a bare scalar; dropdown takes {"id","text"}
+                with the id as the option's integer id; multiselect a list of
+                {"id","text","selected":true}; table a list with one entry per column,
+                each entry holding that column's row values; assignees_form
+                {"users","guests","groups"}.
             status: Task status string
             position: Task position (1-based)
             max_assignable: Maximum number of assignees who must complete the task
@@ -999,11 +1005,17 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}
             taskdata: Form field values, keyed by form field id. The value is shaped by
-                the field's type and is sent verbatim — there is no {"value": ...}
-                wrapper. text/textarea/date/email/file take a bare scalar; radio takes
-                the option's text as a bare scalar; dropdown takes {"id","text"};
-                multiselect a list of {"id","text"}; table a list with one entry per
-                column; assignees_form {"users","guests","groups"}.
+                the field's type and is sent verbatim. There is no {"value": ...}
+                wrapper: most types reject one with a 422, email stores it verbatim
+                (silent corruption), and file returns a 500. text/textarea/date/email
+                take a bare scalar; file takes a LIST of objects and NEVER a scalar,
+                e.g. [{"filename":"x.pdf","url":"uploads/x.pdf","source":"url"}] (the
+                key is "filename", not "name"; a bare scalar is an HTTP 500); radio
+                takes the option's text as a bare scalar; dropdown takes {"id","text"}
+                with the id as the option's integer id; multiselect a list of
+                {"id","text","selected":true}; table a list with one entry per column,
+                each entry holding that column's row values; assignees_form
+                {"users","guests","groups"}.
             status: Task status string
             max_assignable: Maximum number of assignees who must complete the task
             top_secret: Hide task from non-assignees (only assignees and admins can see it)

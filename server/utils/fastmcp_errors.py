@@ -177,11 +177,16 @@ def _is_auth_style_message(error: TallyfyError) -> bool:
     Decide whether a 403 is an auth failure (hint helps) or a business rule
     (hint actively misleads, see #592).
 
-    A 403 with no message at all is treated as auth-style, preserving the old
-    behaviour for the opaque case where the caller has nothing else to go on.
+    A 403 with no message at all AND no field errors is treated as auth-style,
+    preserving the old behaviour for the opaque case where the caller has
+    nothing else to go on.  When ``response_data`` carries an ``errors`` block
+    the 403 is a business-rule rejection even if ``message`` is blank.
     """
     message = _extract_primary_message(error)
     if not message or not message.strip():
+        response_data = getattr(error, "response_data", None)
+        if isinstance(response_data, dict) and response_data.get("errors"):
+            return False
         return True
     lowered = message.lower()
     return any(marker in lowered for marker in _AUTH_STYLE_MARKERS)
