@@ -218,7 +218,7 @@ FieldLabel = Annotated[str, Field(
 FieldPosition = Annotated[int, Field(
     ge=1,
     le=9999,
-    description="Position/order of the field in the form (1-BASED — the first field is position 1, not 0)",
+    description="Position/order of the field in the form (1-BASED: the first field is position 1, not 0)",
     examples=[1, 2, 3]
 )]
 
@@ -427,7 +427,7 @@ CommentId = Annotated[str, Field(
 # [0, 1, 2], so callers followed the schema, sent 0, and were rejected (#581).
 StepPosition = Annotated[int, Field(
     ge=1,
-    description="Step position (1-BASED — the first step is position 1, not 0)",
+    description="Step position (1-BASED: the first step is position 1, not 0)",
     examples=[1, 2, 3]
 )]
 
