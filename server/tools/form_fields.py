@@ -114,7 +114,12 @@ Never call this without all three parameters.""",
             field_data["field_type"] = _FIELD_TYPE_ALIASES[ft]
             ft = field_data["field_type"]
 
-        # Validate field_type against allowed values (per API's CaptureRequestValidator)
+        # Validate field_type against allowed values (per API's CaptureRequestValidator).
+        # DELIBERATELY NARROWER THAN api-v2: BaseCapture::$field_types (BaseCapture.php:183-194)
+        # also accepts "email", but the native Tallyfy UI cannot create or render an email
+        # field, so a field made this way is invisible/broken for the customer. Blocked here
+        # on purpose per issue #439 (closed 2026-06-28) until UI parity exists. Do NOT add
+        # "email" back just because the API tolerates it.
         allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
         if ft and ft not in allowed_field_types:
             raise ToolError(
@@ -725,6 +730,8 @@ Never call this without both parameters.""",
             field_data["field_type"] = _FIELD_TYPE_ALIASES[ft]
             ft = field_data["field_type"]
 
+        # Same deliberate narrowing as add_form_field_to_step: "email" is valid in api-v2
+        # but has no native-UI equivalent, so it stays blocked per issue #439.
         allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
         if ft not in allowed_field_types:
             raise ToolError(f"Invalid field_type '{ft}'. Allowed values: {', '.join(sorted(allowed_field_types))}")

@@ -73,7 +73,7 @@ def register_template_management_tools(mcp):
 MANDATORY: You MUST provide either 'template_id' OR 'template_name'. Calling with empty parameters WILL FAIL.
 
 CORRECT usage examples:
-- get_template(template_id="abc123def456") - when you have the template ID from a previous result
+- get_template(template_id="a1b2c3d4e5f6789012345678901234ef") - 32-char hex ID from a previous result
 - get_template(template_name="Employee Onboarding") - when you know the template name
 
 WRONG usage (will fail):
@@ -491,7 +491,8 @@ Use this data to suggest kickoff fields that would help initialize the workflow 
 - What information the steps will need (client names, project details, dates, budgets)
 - What existing kickoff fields already capture (avoid duplicates)
 - The template's domain and purpose (inferred from title, summary, and step content)
-- Field types: text, textarea, date, dropdown, number, file
+- Field types: text, textarea, date, dropdown, multiselect, radio, file, table, assignees_form
+  (there is NO `number` and NO `checkbox` field type — add_kickoff_field rejects both)
 
 REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.""",
         tags=["templates", "workflow", "analysis", "kickoff", "read-only"],
@@ -796,9 +797,12 @@ Never call this without template_id.""",
 
 REQUIRED: 'template_id' (32-char hex) and 'new_name' (string).
 
+The clone copies steps, form fields and automation rules. Permissions are handled
+by the API's own clone semantics and are NOT controllable from here — there is no
+parameter to opt in or out.
+
 CORRECT usage:
-  clone_template(template_id="abc123...", new_name="Employee Onboarding v2")
-  clone_template(template_id="abc123...", new_name="Copy of Template", copy_permissions=True)
+  clone_template(template_id="a1b2c3d4e5f6789012345678901234ef", new_name="Employee Onboarding v2")
 
 Never call this without both required parameters.""",
         tags=["templates", "blueprints", "write", "management", "clone", "duplicate"],
@@ -815,16 +819,14 @@ Never call this without both required parameters.""",
     @handle_tallyfy_errors("clone template")
     def clone_template(
         template_id: TemplateId,
-        new_name: str,
-        copy_permissions: bool = False,
+        new_name: TemplateTitle,
     ) -> GenericDict:
         """
         Clone (duplicate) a template with a new name.
 
         Args:
             template_id: Template ID to clone (REQUIRED - 32-character hex string)
-            new_name: Name for the new template copy (REQUIRED)
-            copy_permissions: Whether to copy template permissions to the new copy (default: False)
+            new_name: Name for the new template copy (REQUIRED - max 250 characters)
 
         Returns:
             New template object (the clone)
@@ -899,7 +901,20 @@ REQUIRED: 'title' (template name). Optional: 'type' ('procedure' for multi-step 
 
     @mcp.tool(
         name="delete_template",
-        description="Delete a template permanently. REQUIRED: 'template_id' (32-char hex). This action cannot be undone — all steps and automation rules will be deleted. Never call this without template_id.",
+        description="""ARCHIVE a template. REQUIRED: 'template_id' (32-char hex).
+
+This is a RECOVERABLE soft delete, NOT a permanent one. The template is archived
+(hidden from default template lists) and its steps, form fields and automation rules
+are preserved. Tallyfy exposes a restore endpoint, so an archived template can be
+brought back — reassure the user rather than warning them the action is irreversible.
+
+References to the template from folders and similar relations ARE removed, and the
+response lists what was detached under `deleted_references`.
+
+Permanently purging a template is a separate admin-only API operation that this tool
+does not perform, and it still requires the template to be archived first.
+
+Never call this without template_id.""",
         tags=["templates", "blueprints", "write", "delete"],
         annotations=ToolAnnotations(
             title="Delete template",
@@ -914,13 +929,18 @@ REQUIRED: 'title' (template name). Optional: 'type' ('procedure' for multi-step 
     @handle_tallyfy_errors("delete template")
     def delete_template(template_id: TemplateId) -> GenericDict:
         """
-        Delete a template permanently.
+        Archive a template (recoverable soft delete).
+
+        Hits DELETE /organizations/{org}/checklists/{id}, which api-v2 routes to
+        ChecklistsControllerNew::destroy -> ChecklistService::archiveProcess ->
+        Checklist::archive(), i.e. a soft delete that sets deleted_at. A companion
+        `PUT restore` endpoint exists, so this is NOT permanent.
 
         Args:
-            template_id: Template ID to delete (REQUIRED - 32-character hex string)
+            template_id: Template ID to archive (REQUIRED - 32-character hex string)
 
         Returns:
-            Result of the deletion operation
+            Result of the archive operation, including `deleted_references`
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -932,7 +952,23 @@ REQUIRED: 'title' (template name). Optional: 'type' ('procedure' for multi-step 
 
     @mcp.tool(
         name="delete_step",
-        description="Delete a step from a template permanently. REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). This action cannot be undone. Never call this without both parameters. NOTE: Deleting a step also removes any automation rules that reference it (as conditionable_id, target_step_id, or in then_actions); orphaned rules are pruned server-side. If you need to preserve those rules, update them to reference a different step BEFORE deleting.",
+        description="""Delete a step from a template PERMANENTLY. REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex).
+
+Unlike archiving a template, this is a true hard delete with no restore endpoint. It cannot be undone.
+
+THE API BLOCKS THE DELETE INSTEAD OF CASCADING. Orphaned automation rules are NOT pruned
+server-side. The request is REJECTED with an error if either of these holds:
+  - any automation rule references the step (as a rule's `conditionable_id`, or as the
+    target of a then-action) → "Cannot delete this step because there are rules dependent on it."
+  - any other step's deadline is anchored to this step → "Cannot delete this step because
+    other steps have deadlines that depend on it."
+
+So you MUST clear the dependents FIRST to preserve or retarget them: use
+`get_step_dependencies` / `analyze_template_automations` to find what points at this step,
+then `update_automation_rule` (or `delete_automation_rule`) and re-anchor any dependent
+deadlines. Only then will the delete succeed.
+
+Never call this without both parameters.""",
         tags=["templates", "steps", "write", "delete"],
         annotations=ToolAnnotations(
             title="Delete step",

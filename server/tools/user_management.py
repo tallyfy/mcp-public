@@ -13,6 +13,7 @@ from mcp.types import ToolAnnotations
 from utils.fastmcp_types import (
     UserEmail,
     UserName,
+    GuestName,
     UserRole,
     UserId,
     OptionalString,
@@ -277,8 +278,8 @@ Never call this without the three required parameters.""",
     @handle_tallyfy_errors("create guest")
     def create_guest(
         email: UserEmail,
-        first_name: UserName,
-        last_name: UserName,
+        first_name: GuestName,
+        last_name: GuestName,
         phone_1: OptionalString = None,
         phone_2: OptionalString = None,
         company_name: OptionalString = None,

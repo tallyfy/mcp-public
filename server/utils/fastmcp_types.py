@@ -57,10 +57,21 @@ UserRole = Annotated[str, Field(
     examples=["light"]
 )]
 
+# api-v2 caps MEMBER names at 32 (InviteUserRequest.php:13-14,
+# UpdateUserRequest.php:12-13 — 'required|string|max:32|disallowed_name|is_not_url').
 UserName = Annotated[str, Field(
     min_length=1,
-    max_length=100,
-    description="User's first or last name",
+    max_length=32,
+    description="Organization member's first or last name (max 32 characters)",
+    examples=["John", "Smith"]
+)]
+
+# Guests are a DIFFERENT contract: api-v2 allows 200
+# (CreateGuestRequest.php:13-14 — 'nullable|max:200|string').
+GuestName = Annotated[str, Field(
+    min_length=1,
+    max_length=200,
+    description="Guest's first or last name (max 200 characters)",
     examples=["John", "Smith"]
 )]
 
@@ -73,10 +84,11 @@ TaskId = Annotated[str, Field(
     examples=["a1b2c3d4e5f6789012345678901234ef"]
 )]
 
+# api-v2: CreateOneOffTaskRequest.php:19 / UpdateTasksRequest.php:61 -> 'max:600'
 TaskTitle = Annotated[str, Field(
     min_length=1,
-    max_length=255,
-    description="Task title or name",
+    max_length=600,
+    description="Task title or name (max 600 characters)",
     examples=["Review quarterly report"]
 )]
 
@@ -102,10 +114,11 @@ ProcessId = Annotated[str, Field(
     examples=["a1b2c3d4e5f6789012345678901234ef"]
 )]
 
+# api-v2: CreateRunRequest.php:38 / UpdateRunRequest.php:26 -> 'string|max:550'
 ProcessTitle = Annotated[str, Field(
     min_length=1,
-    max_length=255,
-    description="Process title or name",
+    max_length=550,
+    description="Process title or name (max 550 characters)",
     examples=["Employee Onboarding"]
 )]
 
@@ -124,10 +137,11 @@ TemplateId = Annotated[str, Field(
     max_length=32
 )]
 
+# api-v2: CreateChecklistRequest.php:15 / UpdateChecklistRequest.php:16 -> 'required|max:250'
 TemplateTitle = Annotated[str, Field(
     min_length=1,
-    max_length=255,
-    description="Template title or name",
+    max_length=250,
+    description="Template title or name (max 250 characters)",
     examples=["New Employee Onboarding Template"]
 )]
 
@@ -146,10 +160,11 @@ StepId = Annotated[str, Field(
     examples=["a1b2c3d4e5f6789012345678901234ef"]
 )]
 
+# api-v2: CreateStepRequest.php:17 / UpdateStepRequest.php:92 -> 'required|max:600'
 StepTitle = Annotated[str, Field(
     min_length=1,
-    max_length=255,
-    description="Step title or name",
+    max_length=600,
+    description="Step title or name (max 600 characters)",
     examples=["Review document", "Complete form"]
 )]
 
@@ -176,8 +191,12 @@ FieldName = Annotated[str, Field(
     examples=["employee_name", "start_date"]
 )]
 
+# Mirrors what tools/form_fields.py actually enforces. api-v2's canonical set is
+# BaseCapture::$field_types (BaseCapture.php:183-194) = the 9 below PLUS "email";
+# "email" is deliberately excluded here because the native Tallyfy UI cannot render
+# it (issue #439). There is NO `number` and NO `checkbox` field type in either set.
 FieldType = Annotated[str, Field(
-    pattern="^(text|number|date|dropdown|checkbox|textarea|file)$",
+    pattern="^(text|textarea|radio|dropdown|multiselect|date|file|table|assignees_form)$",
     description="Form field type",
     examples=["text"]
 )]
@@ -218,10 +237,11 @@ RuleId = Annotated[str, Field(
     examples=["a1b2c3d4e5f6789012345678901234ef"]
 )]
 
+# api-v2: AutomatedActionRequest.php:15 -> 'automated_alias' => 'required|string|max:300'
 RuleName = Annotated[str, Field(
     min_length=1,
-    max_length=200,
-    description="Automation rule name",
+    max_length=300,
+    description="Automation rule name (max 300 characters)",
     examples=["Auto-assign manager tasks"]
 )]
 
@@ -308,47 +328,62 @@ TimestampString = Annotated[Optional[str], Field(
 )]
 
 # Group-related types (for future use)
+# core.groups.id is character varying(32) (db-schema.sql:3472) — a 32-char hex
+# string, NOT a "group_<n>" slug. Verified live against GET /organizations/{org}/groups.
 GroupId = Annotated[str, Field(
-    min_length=1,
-    description="Unique group identifier",
-    examples=["group_303"]
+    min_length=32,
+    max_length=32,
+    pattern="^[a-f0-9]{32}$",
+    description="Group ID (32-character hexadecimal string)",
+    examples=["53a4560dc877f9b4f709f97630efbb5a"]
 )]
 
+# api-v2: CreateGroupRequest.php:13 / UpdateGroupRequest.php:15 -> 'required|max:200|string'
 GroupName = Annotated[str, Field(
     min_length=1,
-    max_length=100,
-    description="Group name",
+    max_length=200,
+    description="Group name (max 200 characters)",
     examples=["Development Team", "Finance Department"]
 )]
 
 GroupIdList = Annotated[Optional[List[str]], Field(
-    description="List of group IDs",
-    examples=[["group_303", "group_404"]]
+    description="List of group IDs (32-character hexadecimal strings)",
+    examples=[["53a4560dc877f9b4f709f97630efbb5a", "149fca2c855069c8a7d0280fd19d9cf7"]]
 )]
 
 # Tag-related types
+# core.tags.id is character varying(32) (db-schema.sql:5016) — a 32-char hex string,
+# NOT a "tag_<slug>". Verified live against GET /organizations/{org}/tags.
 TagId = Annotated[str, Field(
-    min_length=1,
-    description="Tag ID",
-    examples=["tag_abc123"]
+    min_length=32,
+    max_length=32,
+    pattern="^[a-f0-9]{32}$",
+    description="Tag ID (32-character hexadecimal string)",
+    examples=["a1424ae2d796fbaba9e6b46cb0453475"]
 )]
 
+# api-v2: CreateTagRequest.php:12 -> 'required|unique:...|max:30'
 TagTitle = Annotated[str, Field(
     min_length=1,
-    description="Tag title",
+    max_length=30,
+    description="Tag title (max 30 characters)",
     examples=["urgent", "quarterly"]
 )]
 
 # Folder-related types
 FolderId = Annotated[str, Field(
-    min_length=1,
-    description="Folder ID (32-char hex)",
+    min_length=32,
+    max_length=32,
+    pattern="^[a-f0-9]{32}$",
+    description="Folder ID (32-character hexadecimal string)",
     examples=["7c9e6679742540de944be07fc1f90ae7"]
 )]
 
+# api-v2: CreateFolderRequest.php:16 / UpdateFolderRequest.php:21 -> 'required|max:32'
 FolderName = Annotated[str, Field(
     min_length=1,
-    description="Folder name",
+    max_length=32,
+    description="Folder name (max 32 characters)",
     examples=["Q1 2026", "Finance"]
 )]
 
@@ -367,10 +402,14 @@ FolderType = Annotated[str, Field(
 )]
 
 # Comment-related types
+# core.threads.id is character varying(32) (db-schema.sql:5346) — a 32-char hex
+# string, NOT a "comment_<slug>".
 CommentId = Annotated[str, Field(
-    min_length=1,
-    description="Comment ID",
-    examples=["comment_abc123"]
+    min_length=32,
+    max_length=32,
+    pattern="^[a-f0-9]{32}$",
+    description="Comment (thread) ID (32-character hexadecimal string)",
+    examples=["a1b2c3d4e5f6789012345678901234ef"]
 )]
 
 # Step position type

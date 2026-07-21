@@ -177,7 +177,12 @@ def register_tag_management_tools(mcp):
             title="Tag template",
             readOnlyHint=False,
             destructiveHint=False,
-            idempotentHint=True,
+            # NOT idempotent. The pivot row IS deduped (TagsChecklistsRepository::create
+            # returns the existing row, plus a UNIQUE index on (subject_id, tag_id)), but
+            # TagChecklistService::storeTagChecklist dispatches 'tag.created' and
+            # 'checklist.update' UNCONDITIONALLY, outside that guard. Because the activity
+            # feed only dedupes verb='updated', each repeat call appends a new audit row.
+            idempotentHint=False,
             openWorldHint=True,
         ),
         output_schema=None
@@ -239,13 +244,15 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="tag_process",
-        description="Assign a user-defined tag to a running process. REQUIRED: 'run_id' (32-char hex) and 'tag_id'. Multiple tags per process are allowed — call this tool repeatedly with the same run_id and different tag_ids to apply more than one. Idempotent: re-tagging with an already-applied tag_id is a no-op. Tags are used for filtering (search_for_processes), grouping in dashboards, and organizing processes by team/department/category. To create a new tag first, use create_tag; to remove a tag, use untag_process. Never call this without both parameters.",
+        description="Assign a user-defined tag to a running process. REQUIRED: 'run_id' (32-char hex) and 'tag_id'. Multiple tags per process are allowed — call this tool repeatedly with the same run_id and different tag_ids to apply more than one. Re-tagging with an already-applied tag_id does NOT create a duplicate tag, but it is not a full no-op: it re-fires the tag event and appends an audit-trail entry, so avoid redundant calls. Tags are used for filtering (search_for_processes), grouping in dashboards, and organizing processes by team/department/category. To create a new tag first, use create_tag; to remove a tag, use untag_process. Never call this without both parameters.",
         tags=["tags", "processes", "write"],
         annotations=ToolAnnotations(
             title="Tag process",
             readOnlyHint=False,
             destructiveHint=False,
-            idempotentHint=True,
+            # NOT idempotent — same reason as tag_template. For runs the service ALSO
+            # calls Run::recalcSearchVector() unconditionally on every repeat call.
+            idempotentHint=False,
             openWorldHint=True,
         ),
         output_schema=None

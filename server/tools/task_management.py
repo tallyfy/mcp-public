@@ -40,27 +40,43 @@ from metrics import track_tool_execution
 # value is passed STRAIGHT into validation with no unwrapping:
 # TaskRequestValidator::validateFormFieldsValues (app/Http/Requests/Tasks/
 # TaskRequestValidator.php:31-38) iterates `$taskdata as $captureTimelineId =>
-# $values` and hands `$values` to validateFormField. There is therefore NO
-# {"value": ...} envelope — a wrapper fails validation for EVERY field type
-# (a dict is not a scalar for text/date, and lacks the id+text keys a dropdown
-# requires).
+# $values` and hands `$values` to validateFormField.
+#
+# There is NO {"value": ...} envelope, but the failure mode is NOT uniform —
+# verified by live round-trip, not by reading the validator:
+#   - text, textarea, date, dropdown, radio, multiselect, assignees_form
+#     REJECT a wrapper with a 422 (a dict is not a scalar; a dropdown needs id+text).
+#   - `email` ACCEPTS it with a 200 and stores {"value": "..."} VERBATIM. This is
+#     silent corruption and is exactly the failure class of the prerun incident.
+#   - `file` returns a 500 (Task.php:1654 foreachs the value).
 #
 # The per-type shapes below are the switch arms of
-# app/Http/Requests/Captures/FormValuesValidator.php:20-119. Note dropdown and
-# radio are deliberately asymmetric: dropdown validates {id,text} as a pair,
-# radio only checks the submitted scalar is one of the option texts. `file` and
-# `email` have no case in the switch at all, so they are unvalidated.
-_TASKDATA_SHAPE_HELP = """FORM FIELD VALUES ('taskdata') — a dict keyed by the form field's id. The value
-shape depends on the field's type. Send the value ITSELF; there is NO {"value": ...} wrapper.
-  text, textarea, date, email, file -> bare scalar          e.g. "Acme Corp", "2026-03-01 09:00:00"
-  radio        -> the chosen option's TEXT, as a bare scalar  e.g. "Approved"
-  dropdown     -> {"id": "<option_id>", "text": "<option label>"}  BOTH keys; text must match that option
-  multiselect  -> [{"id": "<option_id>", "text": "<option label>"}, ...]
-                  add "selected": true per entry when the field requires every choice checked
-  table        -> a list with EXACTLY one entry per configured column
-  assignees_form -> {"users": [20059], "guests": ["a@b.com"], "groups": ["<group_id>"]}
-Check a field's type (and its option ids) before writing to it — dropdown/multiselect
-ids and texts must match an existing option or the API rejects the whole update."""
+# app/Http/Requests/Captures/FormValuesValidator.php:20-119. Note that:
+#   - text/textarea/date are THREE different rules, not one: text is is_scalar
+#     (ints/bools stored as-is), textarea is strictly is_string (12345 -> 422),
+#     date must be a parseable string (an epoch int -> 422).
+#   - dropdown and radio are deliberately asymmetric: dropdown validates {id,text}
+#     as a pair, radio only checks the scalar is one of the option texts.
+#   - `file` and `email` have no case in the switch, but "unvalidated" does NOT
+#     mean "accepts anything" — see the wrapper behaviour above. `file` in
+#     particular needs a LIST of file objects or the storage layer 500s.
+#   - multiselect entries need "selected": true for RENDERING, not validation:
+#     VariableReplacement.php:270 skips any entry without it, so the field renders
+#     EMPTY wherever it is used as a variable. (`must_all_checked` is NOT the
+#     reason — it only fires from MarkTaskCompleteRequest.php:52, never on this path.)
+_TASKDATA_SHAPE_HELP = """FORM FIELD VALUES ('taskdata') — dict keyed by the form field's id. Send the value ITSELF:
+a {"value":...} wrapper is REJECTED by most types, stored VERBATIM by email (silent
+corruption), and 500s file. Never send one.
+  text        -> scalar e.g. "Acme Corp"  ·  textarea -> string only (12345 -> 422)
+  date        -> "2026-03-01 09:00:00" (epoch int -> 422)  ·  email -> "a@b.com"
+  file        -> LIST of objects, never a scalar:
+                 [{"url":"uploads/x.pdf","name":"x.pdf","source":"url"}]
+  radio       -> the chosen option's TEXT as a bare scalar  e.g. "Approved"
+  dropdown    -> {"id":"<option_id>","text":"<option label>"}  BOTH keys, must match an option
+  multiselect -> [{"id":"<option_id>","text":"<label>","selected":true}, ...]
+                 ALWAYS set "selected":true — entries without it render EMPTY as a variable
+  table       -> a list with EXACTLY one entry per configured column
+  assignees_form -> {"users":[20059],"guests":["a@b.com"],"groups":["<group_id>"]}"""
 
 
 def _search_process_by_name(sdk, org_id: str, process_name: str) -> str:
@@ -652,7 +668,12 @@ Never call this without both required parameters.""",
             title="Complete task",
             readOnlyHint=False,
             destructiveHint=False,
-            idempotentHint=True,
+            # NOT idempotent. Task::complete() (Task.php:1037-1039) returns false when
+            # the task is already complete, but TaskService::complete() (TaskService.php:147)
+            # DISCARDS that return and still dispatches 'task.completed' (:151). A repeat
+            # call therefore re-fires webhooks, assignee emails, watcher digests, the
+            # realtime broadcast and an activity-feed row even though status is unchanged.
+            idempotentHint=False,
             openWorldHint=True,
         ),
         output_schema=None
@@ -717,7 +738,10 @@ Never call this without all three required parameters. Always ask the user to pr
             title="Reopen task",
             readOnlyHint=False,
             destructiveHint=False,
-            idempotentHint=True,
+            # NOT idempotent: every call posts the `reason` as a NEW audit comment
+            # (sdk.threads.add_task_comment below), so calling twice leaves two
+            # comments on the task even though the task status is unchanged.
+            idempotentHint=False,
             openWorldHint=True,
         ),
         output_schema=None
