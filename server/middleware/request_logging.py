@@ -142,10 +142,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         if claims:
             user_id = claims.get('sub') or claims.get('user_id') or claims.get('uid')
 
-        # Extract MCP protocol info for requests to root path
+        # Extract MCP protocol info for requests to the MCP transport paths.
+        # The transport is served at '/' and aliased at '/mcp' + '/mcp/'
+        # (see server.py), so all three must extract mcp_method / tool name.
         mcp_method = None
         mcp_tool_name = None
-        is_mcp_root = path == "/" and method in ["POST", "GET"]
+        is_mcp_root = path in ("/", "/mcp", "/mcp/") and method in ["POST", "GET"]
 
         if is_mcp_root and method == "POST":
             try:

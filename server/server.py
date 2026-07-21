@@ -230,6 +230,22 @@ logging.info(f"   Registered tools: {tool_count}")
 
 app = mcp.http_app(path='/', json_response=True)
 
+# ALSO serve the MCP protocol at /mcp (both slash forms), keeping / for back-compat.
+# FastMCP's ecosystem default path is /mcp, so external clients try it first; the
+# catch-all Route('/{path:path}') registered below turns that into a 404 today.
+# Reuse the transport route's endpoint object already registered at '/', so /mcp
+# shares the same session manager, JWT enforcement, request logging, and lifespan
+# as '/'. Exact Routes (NOT a Mount): Route('/mcp') matches only the literal path,
+# so it can never shadow the /mcp/oauth/* routes, and a Mount('/mcp', ...) would
+# not match bare /mcp at all. Do NOT call mcp.http_app(path='/mcp') a second time
+# (each call builds its own session manager + lifespan; only the first runs).
+_mcp_transport_route = next(
+    r for r in app.routes if isinstance(r, Route) and r.path == '/'
+)
+for _mcp_alias in ('/mcp', '/mcp/'):
+    app.routes.append(Route(_mcp_alias, endpoint=_mcp_transport_route.endpoint,
+                            methods=_mcp_transport_route.methods))
+
 
 # Kick off the Tallyfy OpenAPI spec refresh at ASGI startup.
 # Background task will refresh hourly; ``tallyfy_api_call`` depends on this.

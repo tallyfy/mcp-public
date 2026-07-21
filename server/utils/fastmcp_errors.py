@@ -134,6 +134,59 @@ def _format_field_errors(errors: Any) -> str:
     return rendered
 
 
+# Markers that mean a 403 really is an authentication or authorization failure
+# rather than a domain rule. Kept deliberately narrow: anything not matched here
+# keeps its own specific message with no re-authentication hint bolted on.
+_AUTH_STYLE_MARKERS = (
+    "unauthenticated",
+    "unauthorized",
+    "token",
+    "expired",
+    "invalid credentials",
+    "access denied",
+    "permission denied",
+    "forbidden",
+    "audience",
+)
+
+
+def _extract_primary_message(error: TallyfyError) -> str:
+    """
+    Extract only the primary API message for auth-style classification.
+
+    Unlike _extract_api_message, this does NOT append field errors — preventing
+    unrelated field text (containing substrings like 'token' or 'expired') from
+    influencing the auth classification. It also correctly treats an empty body
+    after the SDK prefix as empty (not as the full SDK string).
+    """
+    response_data = getattr(error, "response_data", None)
+
+    if isinstance(response_data, dict) and "message" in response_data:
+        return _sanitize_api_error(response_data["message"])
+
+    raw = str(error)
+    match = re.match(r"API request failed with status \d+:\s*(.*)", raw)
+    if match:
+        body = match.group(1).strip()
+        return _sanitize_api_error(body) if body else ""
+    return _sanitize_api_error(raw)
+
+
+def _is_auth_style_message(error: TallyfyError) -> bool:
+    """
+    Decide whether a 403 is an auth failure (hint helps) or a business rule
+    (hint actively misleads, see #592).
+
+    A 403 with no message at all is treated as auth-style, preserving the old
+    behaviour for the opaque case where the caller has nothing else to go on.
+    """
+    message = _extract_primary_message(error)
+    if not message or not message.strip():
+        return True
+    lowered = message.lower()
+    return any(marker in lowered for marker in _AUTH_STYLE_MARKERS)
+
+
 def _extract_api_message(error: TallyfyError) -> str:
     """
     Extract a clean, user-facing message from a TallyfyError.
@@ -241,10 +294,14 @@ def handle_tallyfy_errors(operation_name: str):
                     # logger.error triggers Sentry via LoggingIntegration — no explicit capture needed
                     logger.error(f"Tallyfy API error in {operation_name}: {e}")
 
-                # 401/403 from the Tallyfy API means the OAuth token is expired or was
-                # issued with an audience restriction (aud) that the Tallyfy API rejects.
-                # Append a re-authentication hint so the caller knows what to do.
-                if status in (401, 403):
+                # 401, and 403s that actually look like auth failures, mean the OAuth
+                # token is expired or carries an audience the Tallyfy API rejects, so a
+                # re-authentication hint helps. A 403 is ALSO how api-v2 refuses a
+                # business rule ("Cannot disable guest with incomplete tasks"), and
+                # appending the hint there told users to re-authenticate over a correct,
+                # specific rejection they could do nothing about (#592). Trust a specific
+                # domain message; only add the hint when the message reads like auth.
+                if status == 401 or (status == 403 and _is_auth_style_message(e)):
                     api_msg = _extract_api_message(e)
                     raise ToolError(
                         f"Could not {operation_name} — {api_msg} "

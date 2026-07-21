@@ -413,10 +413,14 @@ CommentId = Annotated[str, Field(
 )]
 
 # Step position type
+# Step positions are 1-BASED. api-v2's own StepService::reorderStep docblock says
+# "(1-based)", and live templates confirm it (minimum observed position is 1, never 0).
+# This previously declared ge=0 with a "0-based index" description and examples
+# [0, 1, 2], so callers followed the schema, sent 0, and were rejected (#581).
 StepPosition = Annotated[int, Field(
-    ge=0,
-    description="Step position (0-based index)",
-    examples=[0, 1, 2]
+    ge=1,
+    description="Step position (1-BASED — the first step is position 1, not 0)",
+    examples=[1, 2, 3]
 )]
 
 # Generic container types for flexible responses

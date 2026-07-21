@@ -1060,7 +1060,8 @@ Never call this without both parameters.""",
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
             step_id: Step ID to move (REQUIRED - 32-character hex string)
-            position: New position for the step (REQUIRED - integer >= 0)
+            position: New position for the step (REQUIRED - 1-BASED integer >= 1;
+                the first step is position 1, not 0)
 
         Returns:
             Updated step object with new position

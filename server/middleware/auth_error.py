@@ -106,8 +106,9 @@ class AuthErrorMiddleware(BaseHTTPMiddleware):
             }
         }
 
-        # Demote OAuth discovery probes (POST/GET to root without MCP body) to DEBUG
-        if request.method in ("POST", "GET") and request.url.path == "/":
+        # Demote OAuth discovery probes (POST/GET to a transport path without MCP body) to DEBUG.
+        # The MCP transport is served at '/' and aliased at '/mcp' + '/mcp/' (see server.py).
+        if request.method in ("POST", "GET") and request.url.path in ("/", "/mcp", "/mcp/"):
             logger.debug(f"Auth error returned: {error} (status={response.status_code}) [oauth-discovery]")
         else:
             logger.info(f"Auth error returned: {error} (status={response.status_code})")
