@@ -101,12 +101,29 @@ def register_automation_tools(mcp):
         "show": "visibility",
         "hide": "visibility",
         "show_hide": "visibility",
-        "complete": "status",
-        "complete_step": "status",
         "reopen_step": "status",
         "set_deadline": "deadline",
         "emit_webhook": "webhook",
         "send_webhook": "webhook",
+    }
+
+    # Shorthands an LLM reaches for that Tallyfy has no action for. These were
+    # briefly mapped to "status", whose only verb is `reopen` (DoableAction.php
+    # $actions_verbs has no complete verb), so _INFERABLE_VERBS below turned a
+    # request to COMPLETE a step into one that REOPENED it. Removing the mapping
+    # stopped the wrong action but left a bare 422 that names no cause, which is
+    # how the kickoff contract bug stayed undiagnosed for seven months. Say why.
+    _UNSUPPORTED_ACTION_TYPES = {
+        "complete": (
+            "Tallyfy automations cannot complete a step. The only status action "
+            "is 'reopen' (action_type='status'). To make a step finish on its own, "
+            "look at the step's own settings rather than an automation rule."
+        ),
+        "complete_step": (
+            "Tallyfy automations cannot complete a step. The only status action "
+            "is 'reopen' (action_type='status'). To make a step finish on its own, "
+            "look at the step's own settings rather than an automation rule."
+        ),
     }
 
     # Map LLM-guessed action_verb to API-expected values.
@@ -218,6 +235,8 @@ def register_automation_tools(mcp):
             # Normalize action_type
             at = act.get("action_type", "")
             if at:
+                if at.lower() in _UNSUPPORTED_ACTION_TYPES:
+                    raise ToolError(_UNSUPPORTED_ACTION_TYPES[at.lower()])
                 resolved = _ACTION_TYPE_MAP.get(at.lower())
                 if resolved:
                     act["action_type"] = resolved
