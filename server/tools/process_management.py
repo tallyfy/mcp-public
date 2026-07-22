@@ -33,6 +33,45 @@ def _is_tallyfy_id(value: str) -> bool:
     return bool(re.fullmatch(r'[0-9a-f]{32}', value.lower()))
 
 
+def _preserved_run_assignment_buckets(run: Dict[str, Any], run_id: str) -> Dict[str, list]:
+    """Return the run's CURRENT users/groups so a PUT does not wipe them.
+
+    RunService::editRun (app/Services/RunService.php:135) unconditionally calls
+      saveAssignees(Assignees::newFromArray(Arr::only($data, ['users','groups'])))
+    and BaseAssignees::newFromArray (app/Domain/Owners/BaseAssignees.php:24)
+    reads ``$data['users'] ?? []``, so an ABSENT key becomes an EMPTY SET, not
+    "leave alone". Assignees::modify then calls every current member and group
+    "removed" and AssignableTrait::saveAssignees (app/Models/Concerns/
+    AssignableTrait.php:115-124) detaches them. The guarded
+    ``if (isset($data['prerun']))`` one line above at :132 is the tell: prerun
+    is protected from exactly this, assignees are not.
+
+    A rename carrying only {name} therefore silently strips every member and
+    group off a RUNNING process. Proven live on production 2026-07-21: a run
+    holding {"users":[10013],"groups":["53a4..."]} was PUT with {"name":"renamed"},
+    returned HTTP 200, and read back {"users":[],"groups":[]}. Worse than the
+    template variant fixed in #624, because people lose access to work already
+    in flight.
+
+    RunTransformer.php:80-81 emits both keys unconditionally via
+    wrappedAssignees(), so a missing or non-list bucket means the READ failed,
+    and sending [] on a failed read is precisely the wipe this guard exists to
+    prevent. Abort instead of guessing. A genuinely empty list is legitimate
+    (nobody is assigned) and passes straight through.
+    """
+    buckets: Dict[str, list] = {}
+    for field in ("users", "groups"):
+        value = run.get(field)
+        if not isinstance(value, list):
+            raise ToolError(
+                f"Process {run_id} did not return its current '{field}', so "
+                f"updating it would detach every member and group from a "
+                f"running process. Nothing was sent."
+            )
+        buckets[field] = list(value)
+    return buckets
+
+
 def _resolve_folder_name_to_id(sdk, org_id: str, folder_name: str) -> str:
     """Resolve a folder name to its ID by searching process folders. Returns original value if no match found."""
     try:
@@ -321,7 +360,13 @@ WRONG usage (will fail):
 
     @mcp.tool(
         name="update_process",
-        description="Update a process name, summary, or starred status. REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'starred'. Never call this without run_id.",
+        description="""Update a process name, summary, or starred status.
+
+Only those properties change: this tool reads the process first and re-sends its
+existing members and groups, which the API would otherwise detach from the
+running process on an update that omits them.
+
+REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'starred'. Never call this without run_id.""",
         tags={"processes", "workflow", "runs", "write"},
         annotations=ToolAnnotations(
             title="Update process",
@@ -357,12 +402,29 @@ WRONG usage (will fail):
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.tasks.update_process(
-                org_id, run_id,
-                name=name,
-                summary=summary,
-                starred=starred,
-            )
+            # READ-MODIFY-WRITE, done here rather than via the SDK. The SDK's
+            # tasks.update_process() (tallyfy/task_management/creation.py:327-335)
+            # builds a body of ONLY {name, summary, starred} and has no parameter
+            # that could carry users/groups, while RunService::editRun detaches
+            # both on any payload that omits them. See
+            # _preserved_run_assignment_buckets for the full trace. Reading the
+            # run back and re-sending the current sets makes the diff empty, so
+            # saveAssignees returns before touching the pivot tables.
+            endpoint = f"organizations/{org_id}/runs/{run_id}"
+            current = sdk._make_request("GET", endpoint)
+            run = current.get("data", current) if isinstance(current, dict) else {}
+
+            payload: Dict[str, Any] = {}
+            if name is not None:
+                payload["name"] = name
+            if summary is not None:
+                payload["summary"] = summary
+            if starred is not None:
+                payload["starred"] = starred
+            payload.update(_preserved_run_assignment_buckets(run, run_id))
+
+            response = sdk._make_request("PUT", endpoint, data=payload)
+            result = response.get("data", response) if isinstance(response, dict) else response
             return ToolResult(
                 content=serialize_dataclass(result) if result else {},
                 structured_content=None

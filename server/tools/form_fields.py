@@ -16,12 +16,44 @@ from utils.fastmcp_types import (
     StepId,
     FieldId,
     FieldIdList,
+    FieldOrderList,
     GenericDict,
-    GenericList,
     FieldPosition,
 )
 from utils.sdk_serializer import serialize_dataclass
 from metrics import track_tool_execution
+
+
+def _normalize_option_dicts(options):
+    """Normalize option dicts to the ONE shape api-v2 accepts: {id: int, text: str}.
+
+    `label` is a common alias api-v2 has no rule for, so an option carrying only `label`
+    422s ("options.N.text field is required"); rename it to `text`. Also auto-fill a
+    sequential integer id where one is missing (api-v2 `options.*.id` is required|integer).
+    Mutates the dicts in place; a non-list argument or non-dict entry passes through
+    untouched. Centralized so all four option-carrying paths (add/update x step/kickoff)
+    stay in sync - the copy-per-surface pattern is exactly what left #627 broken on siblings.
+    """
+    if not isinstance(options, list):
+        return
+    for i, option in enumerate(options, start=1):
+        if isinstance(option, dict):
+            if "text" not in option and "label" in option:
+                option["text"] = option.pop("label")
+            if "id" not in option:
+                option["id"] = i
+
+
+def _normalize_column_dicts(columns):
+    """Auto-fill a sequential integer id on each table-column dict missing one (api-v2
+    `columns.*.id` is required|integer). Mutates in place; non-list/non-dict pass through.
+    Shared by every path that accepts a `columns` list, for the same reason as options.
+    """
+    if not isinstance(columns, list):
+        return
+    for i, column in enumerate(columns, start=1):
+        if isinstance(column, dict) and "id" not in column:
+            column["id"] = i
 
 
 def register_form_fields_tools(mcp):
@@ -43,25 +75,26 @@ def register_form_fields_tools(mcp):
 
 REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_data' (dict).
 
-SUPPORTED `field_type` ENUM (9 values — must be one of these exactly):
+SUPPORTED `field_type` ENUM (9 values, must be one of these exactly):
   - `text`           single-line text input
   - `textarea`       multi-line text input (free-form notes)
   - `date`           date picker (yyyy-mm-dd)
   - `dropdown`       single-select from a list of options
-  - `multiselect`    multi-select from a list of options (checkbox-style)
+  - `multiselect`    multi-select from options (checkbox-style)
   - `radio`          single-select radio buttons (mutually exclusive)
   - `file`           file upload
   - `table`          tabular data with named columns (REQUIRES `columns` list)
   - `assignees_form` member/assignee picker (the "person" field type)
 
-CONVENIENCE ALIASES (auto-resolved): `assignee`, `assignee_picker`, `member`, `member_picker` → `assignees_form`.
+CONVENIENCE ALIASES (auto-resolved): `assignee`, `assignee_picker`, `member`, `member_picker` -> `assignees_form`.
 
 CONDITIONAL REQUIRED `field_data` KEYS (per field_type):
-  - `dropdown` / `radio` / `multiselect`: REQUIRE `options` — list of {text|label, optional id}
-  - `table`: REQUIRES `columns` — list of {label, optional id} (id auto-assigned sequentially if omitted)
+  - `dropdown` / `multiselect`: REQUIRE `options`: list of {text, optional int id}. `label` aliases `text`.
+  - `radio`: REQUIRES `options` with AT LEAST 2 entries: list of {text, optional int id}.
+  - `table`: REQUIRES `columns`: list of {label, optional id} (id auto-assigned if omitted)
 
-ALWAYS-REQUIRED `field_data` KEYS: `field_type`, `label`, `required` (bool).
-Optional: `description`, `placeholder`, `validation`, `position`, `alias`.
+ALWAYS-REQUIRED `field_data` KEYS: `field_type`, `label`, `required` (bool). Pass `required=False` for an optional field; there is NO default.
+Optional: `guidance` (help text), `position`, `field_validation`, `collect_time`, `use_wysiwyg_editor`, `default_value`, `default_value_enabled`, `prefix`, `suffix`, `settings`.
 
 CORRECT usage:
   add_form_field_to_step(template_id="abc...", step_id="def...",
@@ -126,29 +159,39 @@ Never call this without all three parameters.""",
                 f"Invalid field_type '{ft}'. Allowed values: {', '.join(sorted(allowed_field_types))}"
             )
 
+        # `required` is mandatory on every capture write (CaptureRequestValidator.php:24
+        # `required|boolean`). The SDK silently defaults an omitted value to True, so a
+        # field the user wanted optional is created mandatory, with no error (#630). Fail
+        # locally instead. Presence check, NOT truthiness, so an explicit `required=False`
+        # is honored rather than re-triggering the default.
+        if "required" not in field_data:
+            raise ToolError(
+                "field_data must include 'required' (bool): whether the field is "
+                "mandatory. Pass required=False for an optional field; there is no default."
+            )
+
         # Validate conditional required fields
         if ft == "table" and not field_data.get("columns"):
             raise ToolError("field_type 'table' requires a 'columns' list in field_data")
-        if ft in ("dropdown", "radio"):
+        if ft in ("dropdown", "radio", "multiselect"):
             options = field_data.get("options")
-            if options:
-                for opt in options:
-                    if isinstance(opt, dict) and "text" not in opt and "label" not in opt:
-                        raise ToolError(
-                            f"Each option for field_type '{ft}' must have a 'text' or 'label' field"
-                        )
+            if not options:
+                raise ToolError(f"field_type '{ft}' requires an 'options' list in field_data")
+            for opt in options:
+                if isinstance(opt, dict) and "text" not in opt and "label" not in opt:
+                    raise ToolError(
+                        f"Each option for field_type '{ft}' must have a 'text' (or 'label') field"
+                    )
+            # api-v2 (CaptureRequestValidator.php:73-74) rejects a radio field with
+            # fewer than 2 options. Fail locally rather than as a remote 422.
+            if ft == "radio" and len(options) < 2:
+                raise ToolError("field_type 'radio' requires at least 2 options")
 
-        # Auto-generate sequential IDs for dropdown/radio options that are missing them
-        if 'options' in field_data and isinstance(field_data['options'], list):
-            for i, option in enumerate(field_data['options'], start=1):
-                if isinstance(option, dict) and 'id' not in option:
-                    option['id'] = i
-
-        # Auto-generate sequential IDs for table columns that are missing them
-        if 'columns' in field_data and isinstance(field_data['columns'], list):
-            for i, column in enumerate(field_data['columns'], start=1):
-                if isinstance(column, dict) and 'id' not in column:
-                    column['id'] = i
+        # Normalize option/column dicts to the shapes api-v2 requires (#627): rename the
+        # `label` alias to `text` and fill sequential ids. Shared helpers keep this identical
+        # across every option-carrying path (the copy-per-surface pattern broke #627 before).
+        _normalize_option_dicts(field_data.get('options'))
+        _normalize_column_dicts(field_data.get('columns'))
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -167,38 +210,32 @@ REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), 'field_id' (32-c
 UPDATABLE vs IMMUTABLE PROPERTIES:
 
   UPDATABLE:
-    - `label`        human-readable name
-    - `description`  help/instruction text
-    - `placeholder`  placeholder shown in empty input
-    - `required`     mandatory flag (bool)
-    - `validation`   validation rules object
-    - `position`     ordering within the step
-    - `options`      (dropdown/radio/multiselect ONLY) — prefer `update_dropdown_options` for cleaner semantics
-    - `columns`      (table fields ONLY)
+    - `label`            human-readable name
+    - `field_type`       the field's type. api-v2 changes it in place and reconciles existing rules; do NOT delete then recreate (that hard-deletes every collected value). Changing TO dropdown/radio/multiselect also needs `options`; changing TO table also needs `columns`.
+    - `guidance`         help/instruction text shown under the field
+    - `required`         mandatory flag (bool)
+    - `field_validation` validation rules array (e.g. ["email"] or ["numeric"])
+    - `position`         ordering within the step
+    - `options`          (dropdown/radio/multiselect ONLY) list of {id:int, text:str}; prefer `update_dropdown_options` for cleaner semantics
+    - `columns`          (table fields ONLY)
 
-  IMMUTABLE (CANNOT be changed — would corrupt existing data):
-    - `field_type`   To change a field's type: `delete_form_field` then `add_form_field_to_step`.
-                     WARNING: Deletion drops ALL collected data for that field.
-    - `id`           Permanent.
-    - `alias`        Set on creation; changing breaks automation rules and references.
+  IMMUTABLE (CANNOT be changed):
+    - `id`               Permanent.
+    - `alias`            Server-generated on creation; changing it breaks automation rules and references.
 
   AUTO-FILLED: The API requires `label`, `field_type`, `required` on every update. If you
   omit any, this tool fetches the current field and fills them in. To update only the
-  `description`, pass `field_data={"description":"..."}` — the others auto-fill.
+  `guidance`, pass `field_data={"guidance":"..."}` and the others auto-fill.
 
-field_type enum (reference — NOT updatable):
-  text, textarea, date, dropdown, multiselect, radio, file, table, assignees_form
+field_type enum: text, textarea, date, dropdown, multiselect, radio, file, table, assignees_form
 
 CORRECT usage:
   update_form_field(template_id="abc...", step_id="def...", field_id="ghi...",
     field_data={"label":"Customer Name (legal)","required":True})
 
-  # partial — field_type/required auto-filled from current state:
+  # partial, field_type/required auto-filled from current state:
   update_form_field(template_id="abc...", step_id="def...", field_id="ghi...",
-    field_data={"description":"Use the legal entity name from the contract"})
-
-WRONG usage:
-  field_data={"field_type":"textarea"}   # Cannot change type — delete + recreate instead
+    field_data={"guidance":"Use the legal entity name from the contract"})
 
 Never call this without all four parameters.""",
         tags=["forms", "fields", "ui", "write", "management", "configuration"],
@@ -227,7 +264,7 @@ Never call this without all four parameters.""",
             step_id: Step ID containing the field (REQUIRED - 32-character hex string)
             field_id: Form field ID to update (REQUIRED - 32-character hex string)
             field_data: Dictionary containing updated field properties (REQUIRED)
-                - Can include: label, field_type, required, placeholder, options, etc.
+                - Can include: label, field_type, required, guidance, field_validation, options, etc.
                 - Only specified fields will be updated
 
         Returns:
@@ -235,6 +272,28 @@ Never call this without all four parameters.""",
         """
         if not field_data:
             raise ToolError("field_data must include at least one property to update (e.g. label, required, description)")
+
+        # When the caller explicitly sets field_type, apply the same guards
+        # as add_form_field_to_step: resolve aliases and reject types that
+        # would create invisible/broken fields (e.g. "email" per #439).
+        _caller_set_field_type = "field_type" in field_data
+        # Capture whether the CALLER supplied options/columns BEFORE auto-fill runs. The
+        # auto-fill block below injects the stored options/columns into field_data, so a
+        # later `"options" in field_data` test cannot tell caller intent from auto-filled
+        # data. Gating validation on these flags (plus a real type change) stops an unrelated
+        # partial update (e.g. only guidance) from re-validating stored data (Bugbot @393/@385).
+        _caller_set_options = "options" in field_data
+        _caller_set_columns = "columns" in field_data
+        if _caller_set_field_type:
+            ft_raw = field_data["field_type"]
+            if ft_raw in _FIELD_TYPE_ALIASES:
+                field_data["field_type"] = _FIELD_TYPE_ALIASES[ft_raw]
+            ft_val = field_data["field_type"]
+            allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
+            if ft_val not in allowed_field_types:
+                raise ToolError(
+                    f"Invalid field_type '{ft_val}'. Allowed values: {', '.join(sorted(allowed_field_types))}"
+                )
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -244,6 +303,10 @@ Never call this without all four parameters.""",
             # any missing keys the API would reject without.
             required_keys = {"label", "field_type", "required"}
             missing_keys = required_keys - field_data.keys()
+
+            # The field's stored type, captured from the fetched record below. Used to tell
+            # a real field_type CHANGE from an echo of the current type (Bugbot @385).
+            stored_field_type = None
 
             # Determine field_type early to check conditional requirements
             ft = field_data.get("field_type")
@@ -283,6 +346,8 @@ Never call this without all four parameters.""",
                         f"Please include 'label', 'field_type', and 'required' explicitly in field_data."
                     )
 
+                stored_field_type = getattr(current, "field_type", None)
+
                 for key in missing_keys:
                     default = False if key == "required" else None
                     field_data[key] = getattr(current, key, default)
@@ -294,6 +359,45 @@ Never call this without all four parameters.""",
                 if ft == "table" and "columns" not in field_data:
                     field_data["columns"] = getattr(current, "columns", []) or []
 
+            # Normalize any option/column dicts (caller-supplied or auto-filled) to the
+            # shapes api-v2 requires (#627), via the shared helpers. Without this,
+            # changing field_type to dropdown/radio/multiselect, or passing a label-keyed
+            # option, 422s on options.N.id / options.N.text. Similarly, id-less column
+            # dicts on a table field 422 on columns.N.id.
+            _normalize_option_dicts(field_data.get("options"))
+            _normalize_column_dicts(field_data.get("columns"))
+
+            # On an explicit field_type change, strip type-specific keys incompatible with the
+            # new type so stale leftovers from the old type do not reach the API.
+            ft_final = field_data.get("field_type")
+            if _caller_set_field_type:
+                if ft_final not in ("dropdown", "radio", "multiselect"):
+                    field_data.pop("options", None)
+                if ft_final != "table":
+                    field_data.pop("columns", None)
+
+            # Validate the new type's option/column requirements, but ONLY for data the caller
+            # is responsible for: a REAL type change (new type differs from the stored type) or
+            # caller-supplied options/columns. Echoing the current type, or a partial update
+            # that never touched options, must not re-validate stored/auto-filled data - that
+            # is the API's authority, and doing so would fail a guidance/label edit on a legacy
+            # field (Bugbot @393/@385). `... or []` keeps a null/empty options value from a
+            # TypeError and routes it through the presence check (Bugbot @401).
+            type_changed = _caller_set_field_type and ft_final != stored_field_type
+            if (type_changed or _caller_set_columns) and ft_final == "table" and not field_data.get("columns"):
+                raise ToolError("field_type 'table' requires a 'columns' list in field_data")
+            if (type_changed or _caller_set_options) and ft_final in ("dropdown", "radio", "multiselect"):
+                opts = field_data.get("options") or []
+                if not opts:
+                    raise ToolError(f"field_type '{ft_final}' requires an 'options' list in field_data")
+                if ft_final == "radio" and len(opts) < 2:
+                    raise ToolError("field_type 'radio' requires at least 2 options")
+                for opt in opts:
+                    if isinstance(opt, dict) and "text" not in opt and "label" not in opt:
+                        raise ToolError(
+                            f"Each option for field_type '{ft_final}' must have a 'text' (or 'label') field"
+                        )
+
             result = sdk.form_fields.update_form_field(org_id, template_id, step_id, field_id, **field_data)
             return ToolResult(
                 content=serialize_dataclass(result) if result else {},
@@ -302,7 +406,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="move_form_field",
-        description="Move form field between steps with position control. REQUIRED: 'template_id' (32-char hex), 'from_step' (32-char hex), 'field_id' (32-char hex), and 'to_step' (32-char hex). Optional: 'position' (1-BASED integer between 1 and 9999 — the first field is position 1, not 0; defaults to 1). Never call this without the four required parameters.",
+        description="Move form field between steps with position control. REQUIRED: 'template_id' (32-char hex), 'from_step' (32-char hex), 'field_id' (32-char hex), and 'to_step' (32-char hex). Optional: 'position' (1-BASED integer between 1 and 9999, where the first field is position 1, not 0; defaults to 1). Never call this without the four required parameters.",
         tags=["forms", "fields", "ui", "write", "management", "positioning"],
         annotations=ToolAnnotations(
             title="Move form field",
@@ -355,7 +459,7 @@ Never call this without all four parameters.""",
                 return ToolResult(
                     content={
                         "success": False,
-                        "message": f"Move failed — field '{field_id}' was NOT moved to step '{to_step}'. The field may still be on the original step '{from_step}'. Verify with get_template_steps.",
+                        "message": f"Move failed: field '{field_id}' was NOT moved to step '{to_step}'. The field may still be on the original step '{from_step}'. Verify with get_template_steps.",
                         "field_id": field_id,
                         "from_step": from_step,
                         "to_step": to_step,
@@ -365,7 +469,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="delete_form_field",
-        description="Delete a form field from a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). Never call this without all three parameters.",
+        description="Delete a form field from a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). NOTE: if the field is referenced by an automation rule (visibility condition) in another step, deletion fails with a 403 error; remove the automation rule first. Never call this without all three parameters.",
         tags=["forms", "fields", "ui", "write", "management", "deletion"],
         annotations=ToolAnnotations(
             title="Delete form field",
@@ -441,26 +545,24 @@ Never call this without all four parameters.""",
 
 REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), 'field_id' (32-char hex), and 'options' (list).
 
-ACCEPTED `options` FORMATS — pass EITHER format (the tool normalizes both):
+ACCEPTED `options` FORMATS (pass EITHER; the tool normalizes both):
 
-  Format A — STRING ARRAY (simplest, recommended for new options):
+  Format A - STRING ARRAY (simplest, recommended for new options):
     options=["High", "Medium", "Low"]
-    The tool auto-converts each string to {id: <sequential>, label: <string>}.
+    The tool auto-converts each string to {id: <sequential>, text: <string>}.
     IDs are assigned 1, 2, 3, ... in input order.
 
-  Format B — DICT ARRAY with explicit ids/labels:
+  Format B - DICT ARRAY with explicit ids and text:
     options=[
-      {"id": 1, "label": "High"},
-      {"id": 2, "label": "Medium"},
-      {"id": 3, "label": "Low"}
+      {"id": 1, "text": "High"},
+      {"id": 2, "text": "Medium"},
+      {"id": 3, "text": "Low"}
     ]
     Use this when you need to preserve specific IDs (e.g. matching external
-    system codes, or keeping IDs stable across updates).
+    system codes, or keeping IDs stable across updates). `label` is accepted
+    as an alias for `text` and is renamed automatically.
 
-  Format B alternate — `text` instead of `label` (also accepted):
-    options=[{"id": 1, "text": "High"}, ...]
-
-REPLACEMENT vs APPEND: This tool REPLACES the entire options list — it does NOT
+REPLACEMENT vs APPEND: This tool REPLACES the entire options list; it does NOT
 append. To add an option, fetch existing options with `get_dropdown_options`,
 add the new entry to the array, and pass the full updated list back.
 
@@ -476,7 +578,7 @@ CORRECT usage:
 
   update_dropdown_options(
     template_id="abc...", step_id="def...", field_id="ghi...",
-    options=[{"id": 100, "label": "Approved"}, {"id": 200, "label": "Rejected"}]
+    options=[{"id": 100, "text": "Approved"}, {"id": 200, "text": "Rejected"}]
   )
 
 Never call this without all four parameters.""",
@@ -506,7 +608,8 @@ Never call this without all four parameters.""",
             step_id: Step ID (REQUIRED - 32-character hex string)
             field_id: Form field ID (REQUIRED - 32-character hex string)
             options: List of option strings or dicts (REQUIRED).
-                     Strings are auto-converted to {id, label} format.
+                     Strings are auto-converted to {id, text} format; a dict's
+                     `label` key is renamed to `text`.
 
         Returns:
             True if the update was successful
@@ -594,7 +697,7 @@ REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call th
 
     @mcp.tool(
         name="reorder_form_fields",
-        description="Reorder form fields in a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_order' (list of field IDs in desired order). Never call this without all three parameters.",
+        description="Reorder form fields in a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_order'. Pass 'field_order' as EITHER a list of field IDs (32-char hex) in the desired order (positions assigned 1, 2, 3, ... by list order), OR a list of {capture_id, position} objects when you need explicit non-sequential positions. Never call this without all three parameters.",
         tags=["forms", "fields", "write", "reorder"],
         annotations=ToolAnnotations(
             title="Reorder form fields",
@@ -610,7 +713,7 @@ REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call th
     def reorder_form_fields(
         template_id: TemplateId,
         step_id: StepId,
-        field_order: GenericList,
+        field_order: FieldOrderList,
     ) -> GenericDict:
         """
         Reorder form fields in a step.
@@ -618,7 +721,9 @@ REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call th
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
             step_id: Step ID (REQUIRED - 32-character hex string)
-            field_order: List of field objects in the desired order (REQUIRED)
+            field_order: Ordered list of field IDs (32-char hex strings), OR a list of
+                {capture_id, position} dicts for explicit positions (REQUIRED). Both
+                shapes are normalized to {capture_id, position} for the API.
 
         Returns:
             Updated step with reordered fields
@@ -698,7 +803,7 @@ REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call th
         name="add_kickoff_field",
         description="""Add a form field to a template's kickoff (prerun) form.
 
-Kickoff fields are filled out BEFORE a process starts — they collect initialization data
+Kickoff fields are filled out BEFORE a process starts; they collect initialization data
 (e.g. customer name, start date, priority). This is different from step form fields which
 are filled out DURING the process.
 
@@ -710,10 +815,11 @@ SUPPORTED `field_type` ENUM (same as step fields):
 CONVENIENCE ALIASES: assignee, assignee_picker, member, member_picker → assignees_form
 
 CONDITIONAL REQUIRED `field_data` KEYS:
-  - dropdown / radio / multiselect: REQUIRE `options` — list of {text, optional id}
-  - table: REQUIRES `columns` — list of {label, optional id}
+  - dropdown / multiselect: REQUIRE `options`, a list of {text, optional integer id}. `label` is accepted as an alias for `text`.
+  - radio: REQUIRES `options` with AT LEAST 2 entries, a list of {text, optional integer id}.
+  - table: REQUIRES `columns`, a list of {label, optional id}
 
-ALWAYS-REQUIRED `field_data` KEYS: `field_type`, `label`, `required` (bool).
+ALWAYS-REQUIRED `field_data` KEYS: `field_type`, `label`, `required` (bool). Pass `required=False` for an optional field; there is NO default.
 Optional: guidance, position, collect_time, use_wysiwyg_editor, field_validation,
           default_value, default_value_enabled, prefix, suffix, settings.
 
@@ -756,6 +862,16 @@ Never call this without both parameters.""",
             raise ToolError("field_data must include 'label'")
         if not field_data.get("field_type"):
             raise ToolError("field_data must include 'field_type'")
+        # `required` is mandatory on every capture write (CaptureRequestValidator.php:24).
+        # The kickoff path forwards field_data verbatim into the prerun array, so an
+        # omitted `required` reaches api-v2 absent and 422s. Fail locally and identically
+        # to add_form_field_to_step (#630). Presence check, not truthiness, so an explicit
+        # `required=False` is honored.
+        if "required" not in field_data:
+            raise ToolError(
+                "field_data must include 'required' (bool): whether the field is "
+                "mandatory. Pass required=False for an optional field; there is no default."
+            )
 
         ft = field_data.get("field_type", "")
         if ft in _FIELD_TYPE_ALIASES:
@@ -772,16 +888,14 @@ Never call this without both parameters.""",
             raise ToolError("field_type 'table' requires a 'columns' list in field_data")
         if ft in ("dropdown", "radio", "multiselect") and not field_data.get("options"):
             raise ToolError(f"field_type '{ft}' requires an 'options' list in field_data")
+        # api-v2 (CaptureRequestValidator.php:73-74) rejects a radio field with < 2 options.
+        if ft == "radio" and len(field_data.get("options") or []) < 2:
+            raise ToolError("field_type 'radio' requires at least 2 options")
 
-        if "options" in field_data and isinstance(field_data["options"], list):
-            for i, opt in enumerate(field_data["options"], start=1):
-                if isinstance(opt, dict) and "id" not in opt:
-                    opt["id"] = i
-
-        if "columns" in field_data and isinstance(field_data["columns"], list):
-            for i, col in enumerate(field_data["columns"], start=1):
-                if isinstance(col, dict) and "id" not in col:
-                    col["id"] = i
+        # Normalize option/column dicts to the shapes api-v2 requires (#627) via the shared
+        # helpers, so a {label}-only or id-less option/column does not 422.
+        _normalize_option_dicts(field_data.get("options"))
+        _normalize_column_dicts(field_data.get("columns"))
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -807,7 +921,7 @@ UPDATABLE PROPERTIES:
   columns (table), collect_time, use_wysiwyg_editor, field_validation,
   default_value, default_value_enabled, prefix, suffix, settings.
 
-IMMUTABLE: field_type, id, alias — cannot be changed (delete + recreate instead).
+IMMUTABLE: id, alias - cannot be changed. `field_type` CAN be changed in place (send the new type plus any options/columns it needs); do NOT delete and recreate, which drops collected data.
 
 AUTO-FILLED: This tool fetches the current field and merges your changes in, so you
 only need to pass the properties you want to change.
@@ -851,6 +965,23 @@ Never call this without all three parameters.""",
         if not field_data:
             raise ToolError("field_data must include at least one property to update")
 
+        # When the caller explicitly sets field_type, apply the same guards
+        # as add_kickoff_field: resolve aliases and reject types that would
+        # create invisible/broken fields (e.g. "email" per #439).
+        _caller_set_field_type = "field_type" in field_data
+        _caller_set_options = "options" in field_data
+        _caller_set_columns = "columns" in field_data
+        if _caller_set_field_type:
+            ft_raw = field_data["field_type"]
+            if ft_raw in _FIELD_TYPE_ALIASES:
+                field_data["field_type"] = _FIELD_TYPE_ALIASES[ft_raw]
+            ft_val = field_data["field_type"]
+            allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
+            if ft_val not in allowed_field_types:
+                raise ToolError(
+                    f"Invalid field_type '{ft_val}'. Allowed values: {', '.join(sorted(allowed_field_types))}"
+                )
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             title, existing, raw = _get_template_and_prerun(sdk, org_id, template_id)
@@ -867,7 +998,47 @@ Never call this without all three parameters.""",
                     f"Use get_kickoff_fields to list available fields."
                 )
 
+            # The field's stored type, captured BEFORE the merge, so a real field_type CHANGE
+            # is told apart from an echo of the current type (Bugbot @385).
+            stored_field_type = target.get("field_type")
+
+            # Normalize any option/column dicts the caller supplied to the shapes
+            # api-v2 requires (#627) via the shared helpers, so a label-keyed or
+            # id-less option/column does not 422.
+            _normalize_option_dicts(field_data.get("options"))
+            _normalize_column_dicts(field_data.get("columns"))
+
             target.update(field_data)
+
+            # On an explicit field_type change, strip type-specific keys incompatible with the
+            # new type (they would otherwise survive the merge and pollute the PUT payload).
+            ft_final = target.get("field_type")
+            if _caller_set_field_type:
+                if ft_final not in ("dropdown", "radio", "multiselect"):
+                    target.pop("options", None)
+                if ft_final != "table":
+                    target.pop("columns", None)
+
+            # Validate the new type's option/column requirements on the merged state, but ONLY
+            # for data the caller is responsible for: a REAL type change (new type differs from
+            # stored) or caller-supplied options/columns. Echoing the current type, or a partial
+            # update that never touched options, must not re-validate stored/merged data - that
+            # is the API's authority (Bugbot @393/@385). `... or []` keeps a null/empty options
+            # value from a TypeError and routes it through the presence check (Bugbot @401).
+            type_changed = _caller_set_field_type and ft_final != stored_field_type
+            if (type_changed or _caller_set_columns) and ft_final == "table" and not target.get("columns"):
+                raise ToolError("field_type 'table' requires a 'columns' list in field_data")
+            if (type_changed or _caller_set_options) and ft_final in ("dropdown", "radio", "multiselect"):
+                opts = target.get("options") or []
+                if not opts:
+                    raise ToolError(f"field_type '{ft_final}' requires an 'options' list in field_data")
+                if ft_final == "radio" and len(opts) < 2:
+                    raise ToolError("field_type 'radio' requires at least 2 options")
+                for opt in opts:
+                    if isinstance(opt, dict) and "text" not in opt and "label" not in opt:
+                        raise ToolError(
+                            f"Each option for field_type '{ft_final}' must have a 'text' (or 'label') field"
+                        )
 
             result = sdk.update_template_metadata(
                 org_id, template_id, title=title, prerun=existing,
@@ -888,7 +1059,7 @@ WARNING: Deleting a kickoff field removes it permanently and drops all collected
 for that field across existing process runs. This cannot be undone.
 
 NOTE: If the field is used in an automation rule (visibility condition), the deletion
-will fail with a 403 error — remove the automation rule first.
+will fail with a 403 error; remove the automation rule first.
 
 Never call this without both parameters.""",
         tags=["forms", "fields", "kickoff", "prerun", "write", "deletion"],
@@ -929,7 +1100,7 @@ Never call this without both parameters.""",
 
 REQUIRED: 'template_id' (32-char hex) and 'field_order' (list of field IDs in desired order).
 
-The API assigns position sequentially based on array order — first ID gets position 1,
+The API assigns position sequentially based on array order: first ID gets position 1,
 second gets position 2, etc. Fields not included in field_order are appended at the end
 in their original relative order.
 
@@ -1017,7 +1188,7 @@ Never call this without both parameters.""",
 REQUIRED: 'template_id' (32-char hex) and 'field_id' (32-char hex).
 
 Returns the options array for the specified kickoff field. Only works on fields with
-field_type dropdown, radio, or multiselect — returns an error for other field types.
+field_type dropdown, radio, or multiselect; returns an error for other field types.
 
 CORRECT usage:
   get_kickoff_dropdown_options(template_id="abc...", field_id="def...")
@@ -1068,7 +1239,7 @@ Never call this without both parameters.""",
             ft = target.get("field_type", "")
             if ft not in ("dropdown", "radio", "multiselect"):
                 raise ToolError(
-                    f"Field '{field_id}' has field_type '{ft}' — options are only "
+                    f"Field '{field_id}' has field_type '{ft}', options are only "
                     f"available for dropdown, radio, or multiselect fields."
                 )
 

@@ -178,7 +178,7 @@ def register_automation_tools(mcp):
         if accepted is None:
             raise ToolError(
                 f"action_type must be one of "
-                f"{', '.join(sorted(_ACTION_VERBS_BY_TYPE))} — got {at!r}."
+                f"{', '.join(sorted(_ACTION_VERBS_BY_TYPE))} - got {at!r}."
             )
 
         if av in accepted:
@@ -216,16 +216,16 @@ def register_automation_tools(mcp):
                 '{"value": 3, "unit": "days", "option": "from"}.'
             )
         if not isinstance(dl["value"], int) or isinstance(dl["value"], bool):
-            raise ToolError(f"deadline.value must be an integer — got {dl['value']!r}.")
+            raise ToolError(f"deadline.value must be an integer - got {dl['value']!r}.")
         if dl["unit"] not in _DEADLINE_UNITS:
             raise ToolError(
                 f"deadline.unit must be one of {', '.join(_DEADLINE_UNITS)} "
-                f"— got {dl['unit']!r}."
+                f"- got {dl['unit']!r}."
             )
         if dl["option"] not in _DEADLINE_OPTIONS:
             raise ToolError(
                 f"deadline.option must be one of {', '.join(_DEADLINE_OPTIONS)} "
-                f"— got {dl['option']!r}. 'before' counts backwards from the "
+                f"- got {dl['option']!r}. 'before' counts backwards from the "
                 f"anchor, 'from' counts forwards."
             )
 
@@ -330,7 +330,7 @@ def register_automation_tools(mcp):
                 normalized_logic = str(logic).strip().lower()
                 if normalized_logic not in _CONDITION_LOGIC_VALUES:
                     raise ToolError(
-                        f"condition 'logic' must be 'and' or 'or' — got {logic!r}."
+                        f"condition 'logic' must be 'and' or 'or' - got {logic!r}."
                     )
                 cond["logic"] = normalized_logic
 
@@ -355,11 +355,48 @@ def register_automation_tools(mcp):
         normalized = str(logic).strip().lower()
         if normalized not in _CONDITION_LOGIC_VALUES:
             raise ToolError(
-                f"condition_logic must be 'and' or 'or' — got {logic!r}."
+                f"condition_logic must be 'and' or 'or' - got {logic!r}."
             )
         for cond in automation_data.get("conditions") or []:
             # An explicit per-condition logic always wins.
             cond.setdefault("logic", normalized)
+
+    def _default_alias(automation_data: dict) -> str:
+        """Build an automated_alias when the caller omits one.
+
+        api-v2 requires it (AutomatedActionRequest.php:15,
+        'automated_alias' => 'required|string|max:300'), and the SDK create path
+        emits it ONLY when `alias` is present (it maps alias to automated_alias and
+        never reads automated_alias itself), so a create with no alias returns 422.
+        Derive a short, readable label from the actions rather than pushing an
+        undocumented required field back onto the caller.
+        """
+        actions = automation_data.get("actions") or []
+        verbs = []
+        for a in actions:
+            if isinstance(a, dict):
+                v = a.get("action_verb") or a.get("action_type")
+                if v and str(v) not in verbs:
+                    verbs.append(str(v))
+        label = ("Auto: " + ", ".join(verbs)) if verbs else "Automation rule"
+        return label[:300]
+
+    def _ensure_automated_alias(automation_data: dict) -> None:
+        """Guarantee automation_data carries an `alias` the SDK will forward.
+
+        Accepts either `alias` or the api-v2 field name `automated_alias`; when both
+        are absent, generates one. Preserves the caller's value, capped at the
+        api-v2 limit of 300 characters. Without this, a create that follows the
+        documented conditions+actions contract fails with a 422 on the missing
+        automated_alias (tallyfy/mcp#617).
+        """
+        alias = automation_data.get("alias") or automation_data.get("automated_alias")
+        if not alias:
+            alias = _default_alias(automation_data)
+        automation_data["alias"] = str(alias)[:300]
+        # The SDK create only reads `alias`; drop the api-v2 field name so the
+        # payload carries a single, canonical key.
+        automation_data.pop("automated_alias", None)
 
     @mcp.tool(
         name="create_automation_rule",
@@ -367,7 +404,7 @@ def register_automation_tools(mcp):
 
 REQUIRED: 'template_id' (32-char hex) + 'automation_data' (dict with `conditions`+`actions`).
 
-COMPATIBILITY — action_type CONSTRAINS action_verb, they are NOT independent:
+COMPATIBILITY - action_type CONSTRAINS action_verb, they are NOT independent:
   visibility -> show | hide    deadline -> deadline    status -> reopen
   webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
 `reopen` NEVER pairs with `visibility`. Single-verb types may omit action_verb.
@@ -380,7 +417,7 @@ greater_than, less_than, is_empty, is_not_empty
 EVERY condition needs a `statement` key (null for step ops). AND/OR goes on EACH
 condition as `logic`:"and"|"or". No top-level condition_logic exists.
 
-EXAMPLE (ids are 32-char hex, no hyphens) — SHOW a step when a kickoff
+EXAMPLE (ids are 32-char hex, no hyphens) - SHOW a step when a kickoff
 field = "Yes" (to hide it: action_verb "hide"):
 {"alias":"Show legal","conditions":[{"conditionable_id":"<ko_field_id>","conditionable_type":"kickoff","operation":"equals","statement":"Yes","logic":"and"}],"actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
 
@@ -390,7 +427,7 @@ Same envelope for other actions, swapping the "actions" entry:
 
 Every action needs `target_step_id`. deadline needs ALL of value/unit/option
 (unit minutes|hours|days|weeks|months, option before|from). webhook needs webhook_url+alias_name.
-Use "actions" (NOT "then_actions"), "alias" (NOT "automated_alias").""",
+Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name, NOT "automated_alias"); if you omit it this tool fills one in.""",
         tags=["automation", "rules", "conditional", "write"],
         annotations=ToolAnnotations(
             title="Create automation rule",
@@ -433,6 +470,9 @@ Use "actions" (NOT "then_actions"), "alias" (NOT "automated_alias").""",
         _normalize_conditions(automation_data["conditions"])
         if "actions" in automation_data:
             _normalize_actions(automation_data["actions"])
+        # api-v2 requires automated_alias; supply one when the caller omits it so
+        # the documented conditions+actions contract no longer 422s (mcp#617).
+        _ensure_automated_alias(automation_data)
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -454,7 +494,7 @@ VALID ENUM VALUES:
   STEP operations:    completed, reopened, approved, rejected, acknowledged, expired, not_assigned
   FIELD/KICKOFF ops:  contains, not_contains, equals, not_equals, equals_any, greater_than, less_than, is_empty, is_not_empty
 
-COMPATIBILITY MATRIX — action_type constrains action_verb
+COMPATIBILITY MATRIX - action_type constrains action_verb
   visibility -> show | hide    deadline -> deadline    status -> reopen
   webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
 e.g. `reopen` is only valid with action_type "status", never "visibility".
@@ -623,7 +663,7 @@ Never call this without all three parameters.""",
             if len(actions_map) > 1:
                 redundant_groups.append({
                     'type': 'same_trigger',
-                    'description': f'{len(rules)} rules share the same trigger conditions — actions could be merged into one rule',
+                    'description': f'{len(rules)} rules share the same trigger conditions - actions could be merged into one rule',
                     'rule_ids': [r.get('id') for r in rules],
                     'rules': [{'id': r.get('id'), 'alias': r.get('alias', '')} for r in rules],
                 })
@@ -640,7 +680,7 @@ and pre-computed redundant_groups identifying duplicates and merge candidates.
 Use this data to:
 - Review redundant_groups for exact duplicates (same trigger AND actions) and same-trigger rules (mergeable actions)
 - Find conflicting rules (same conditions but contradictory actions, e.g. show vs hide the same step)
-- Spot orphaned rules referencing deleted steps (step IDs not in the step_lookup)
+- Spot orphaned rules: a then-action `target_step_id` not in step_lookup, or a condition whose `conditionable_type` is "Step" and whose `conditionable_id` is not in step_lookup. A `conditionable_type` of "Capture" (form field) or "Prerun" (kickoff field) is a valid trigger whose id is NOT a step id, so its absence from step_lookup is normal, NOT an orphan.
 - Assess automation complexity and suggest simplification
 
 IMPORTANT: Two rules with the same structure (e.g. both have 1 condition and 1 action) are NOT redundant
@@ -704,27 +744,63 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
         frozenset({"assign", "unassign"}),
     }
 
-    def _build_suggestions(automations, step_lookup):
+    def _build_suggestions(automations, step_lookup, valid_capture_ids=None, valid_prerun_ids=None):
         """Build prioritized consolidation suggestions from automation rules.
 
         Detects: exact duplicates, same-trigger merge candidates, conflicting rules,
-        and orphaned rules referencing non-existent steps.
+        and orphaned rules referencing entities not in the template.
         Returns a list of suggestion dicts with priority, type, and recommended action.
+
+        valid_capture_ids / valid_prerun_ids are the template's form-field and
+        kickoff-field ids. They are validated separately from step ids because a
+        condition's conditionable_id is a step id ONLY when conditionable_type is
+        "Step" (see the orphan block).
         """
         suggestions = []
 
         if len(automations) < 1:
             return suggestions
 
-        # --- Orphaned rules (reference steps not in the template) ---
+        # --- Orphaned rules (reference entities not in the template) ---
+        # A condition's conditionable_id is NOT always a step id. api-v2 allows
+        # conditionable_type in {Step, Capture, Prerun}
+        # (AutomatedActionRequest.php:21), and AutomatedActionTransformer.php:34-35
+        # emits conditionable_id for all three: Step, Capture (a step form field) and
+        # Prerun (a kickoff field). Only Step ids live in step_lookup, so the old
+        # code (which tested every conditionable_id against step ids) flagged EVERY
+        # form-field- and kickoff-triggered rule as orphaned and recommended deleting
+        # working automations (tallyfy/mcp#617). Validate each conditionable_id
+        # against the id set for its OWN type; when a type's ids cannot be
+        # enumerated, skip it (never a false orphan).
+        #
+        # A then_action's target_step_id is always a step id
+        # (AutomatedActionRequest.php:34, exists:steps,timeline_id), so it is the one
+        # reference that reliably dangles. The old code read only
+        # actions/automated_action_actions, but api-v2 emits `then_actions`
+        # (AutomatedActionTransformer.php:18), so that check never ran and real
+        # orphaned targets were never caught. Read then_actions first, matching the
+        # duplicate/conflict detectors in this same module.
         valid_step_ids = set(step_lookup.keys())
+        condition_id_sets = {
+            "Step": valid_step_ids,
+            "Capture": set(valid_capture_ids) if valid_capture_ids is not None else None,
+            "Prerun": set(valid_prerun_ids) if valid_prerun_ids is not None else None,
+        }
         for rule in automations:
             conditions = rule.get("conditions") or rule.get("automated_action_conditions") or []
-            actions = rule.get("actions") or rule.get("automated_action_actions") or []
+            actions = rule.get("then_actions") or rule.get("actions") or rule.get("automated_action_actions") or []
             orphaned_ids = []
             for c in conditions:
                 cid = c.get("conditionable_id", "")
-                if cid and cid not in valid_step_ids:
+                if not cid:
+                    continue
+                # api-v2 defaults an omitted conditionable_type to Step nowhere, but
+                # every real condition carries one; fall back to Step defensively.
+                ctype = c.get("conditionable_type") or "Step"
+                valid_ids = condition_id_sets.get(ctype)
+                # valid_ids is None => this type's ids are unavailable; do not flag,
+                # so a valid form-field/kickoff rule is never reported as an orphan.
+                if valid_ids is not None and cid not in valid_ids:
                     orphaned_ids.append(cid)
             for a in actions:
                 tid = a.get("target_step_id", "")
@@ -737,8 +813,11 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
                     'rule_ids': [rule.get('id')],
                     'rules': [{'id': rule.get('id'), 'alias': rule.get('alias', '')}],
                     'orphaned_step_ids': orphaned_ids,
-                    'description': f'Rule references {len(orphaned_ids)} step(s) not in the template',
-                    'recommended_action': 'delete',
+                    'description': f'Rule references {len(orphaned_ids)} entity(ies) not in the template',
+                    # Non-destructive: a rule can mix valid and dangling references,
+                    # so deleting the whole rule risks destroying working logic. A
+                    # human decides (mcp#617).
+                    'recommended_action': 'review',
                 })
 
         if len(automations) < 2:
@@ -769,7 +848,7 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
                         'priority': 'high',
                         'rule_ids': [r.get('id') for r in dup_rules],
                         'rules': [{'id': r.get('id'), 'alias': r.get('alias', '')} for r in dup_rules],
-                        'description': f'{len(dup_rules)} rules with identical conditions and actions — keep one, delete the rest',
+                        'description': f'{len(dup_rules)} rules with identical conditions and actions - keep one, delete the rest',
                         'recommended_action': 'delete_duplicates',
                     })
 
@@ -810,7 +889,7 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
                     'priority': 'medium',
                     'rule_ids': [r.get('id') for r in rules],
                     'rules': [{'id': r.get('id'), 'alias': r.get('alias', '')} for r in rules],
-                    'description': f'{len(rules)} rules share the same trigger — actions can be merged into one rule',
+                    'description': f'{len(rules)} rules share the same trigger - actions can be merged into one rule',
                     'recommended_action': 'merge_actions',
                 })
 
@@ -825,14 +904,14 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
         description="""Read-only: prioritized consolidation suggestions for a template's automation rules.
 
 `suggestion_type` (lowercase, in `type` field):
-- `orphaned_rule` (high) — references deleted steps. Includes `orphaned_step_ids`. Recommended: `delete_automation_rule`.
-- `exact_duplicate` (high) — IDENTICAL conditions AND actions across rules. Recommended: keep one, delete rest.
-- `conflict` (high) — same trigger, contradictory `action_verb`s on same target (show/hide, assign/clear_assignees, assign/unassign). Recommended: review.
-- `same_trigger_merge` (medium) — same trigger, non-conflicting actions across rules. Recommended: merge via `update_automation_rule`, delete rest.
+- `orphaned_rule` (high): a condition or a then-action references a step, form field (Capture), or kickoff field (Prerun) that is not in the template. Includes `orphaned_step_ids`. Recommended: review; do NOT auto-delete, a rule may still hold valid actions.
+- `exact_duplicate` (high): IDENTICAL conditions AND actions across rules. Recommended: keep one, delete the rest.
+- `conflict` (high): same trigger, contradictory `action_verb`s on the same target (show/hide, assign/clear_assignees, assign/unassign). Recommended: review.
+- `same_trigger_merge` (medium): same trigger, non-conflicting actions across rules. Recommended: merge via `update_automation_rule`, delete the rest.
 
-RETURN: {template_id, template_title, suggestions: [{type, priority:"high"|"medium"|"low", rule_ids, rules:[{id,alias}], description, recommended_action:"delete"|"delete_duplicates"|"review_and_resolve"|"merge_actions"}], summary: {total_automations, total_suggestions, high_priority, medium_priority}}
+RETURN: {template_id, template_title, suggestions: [{type, priority:"high"|"medium"|"low", rule_ids, rules:[{id,alias}], description, recommended_action:"review"|"delete_duplicates"|"review_and_resolve"|"merge_actions"}], summary: {total_automations, total_suggestions, high_priority, medium_priority}}
 
-EXAMPLE: suggest_automation_consolidation(template_id="58c03f...") → {template_title:"New hire onboarding", suggestions:[{type:"orphaned_rule",priority:"high",rule_ids:["3f8a1c0d9e2b4a6c8d0e1f2a3b4c5d6e"],description:"Rule references deleted step_id '7a1b2c3d4e5f60718293a4b5c6d7e8f9'",recommended_action:"delete"},{type:"exact_duplicate",priority:"high",rule_ids:["b1c2d3e4f5061728394a5b6c7d8e9f00","c2d3e4f5061728394a5b6c7d8e9f0011"],recommended_action:"delete_duplicates"}], summary:{total_automations:12,total_suggestions:5,high_priority:2}}. Remediation: "delete"/"delete_duplicates"→`delete_automation_rule`; "merge_actions"→`update_automation_rule`; "review_and_resolve"→ask user.
+EXAMPLE: suggest_automation_consolidation(template_id="58c03f...") returns {template_title:"New hire onboarding", suggestions:[{type:"orphaned_rule",priority:"high",rule_ids:["3f8a1c0d9e2b4a6c8d0e1f2a3b4c5d6e"],orphaned_step_ids:["7a1b2c3d4e5f60718293a4b5c6d7e8f9"],recommended_action:"review"},{type:"exact_duplicate",priority:"high",rule_ids:["b1c2d3e4f5061728394a5b6c7d8e9f00","c2d3e4f5061728394a5b6c7d8e9f0011"],recommended_action:"delete_duplicates"}], summary:{total_automations:12,total_suggestions:5,high_priority:2}}. Remediation: "delete_duplicates" then `delete_automation_rule`; "merge_actions" then `update_automation_rule`; "review"/"review_and_resolve" then ask a human before deleting.
 
 REQUIRED: 'template_id' (32-character hex). Never call without it.""",
         tags=["automation", "analysis", "optimization", "suggestions", "read-only"],
@@ -867,7 +946,39 @@ REQUIRED: 'template_id' (32-character hex). Never call without it.""",
             steps = [serialize_dataclass(s) for s in template.steps] if template.steps else []
             automations = [serialize_dataclass(a) for a in template.automated_actions] if template.automated_actions else []
             step_lookup = {s['id']: s.get('title', 'Unknown') for s in steps if 'id' in s}
-            suggestions = _build_suggestions(automations, step_lookup)
+
+            # Form-field (Capture) ids live inside each step's `captures`; kickoff
+            # (Prerun) ids live on the template. Both are legitimate condition
+            # triggers and are NOT step ids, so they must be validated against their
+            # OWN id sets rather than step_lookup (mcp#617). get_template already
+            # requests with=steps,automated_actions,prerun, so both are present.
+            # Capture ids come from the serialized steps' nested `captures`. An
+            # empty result means the template genuinely has zero form fields (an
+            # empty capture list contributes zero ids whether or not the serializer
+            # strips it), so the set is ALWAYS authoritative and is passed as-is,
+            # never None: a Capture-triggered rule pointing at a field that no longer
+            # exists is then correctly flagged. get_template always requests
+            # with=steps,automated_actions,prerun, so captures are enumerable. This
+            # refines the empty-set Autofix, which conflated "zero captures" with
+            # "unavailable" via an any('captures' in s) probe -- serialize_dataclass
+            # drops the empty `captures` key, so that probe read every captureless
+            # template as unavailable and skipped the check (mcp#617).
+            valid_capture_ids = {
+                c['id']
+                for s in steps
+                for c in (s.get('captures') or [])
+                if isinstance(c, dict) and c.get('id')
+            }
+            prerun_fields = getattr(template, 'prerun', None)
+            if isinstance(prerun_fields, list):
+                prerun = [serialize_dataclass(p) for p in prerun_fields]
+                valid_prerun_ids = {p['id'] for p in prerun if isinstance(p, dict) and p.get('id')}
+            else:
+                valid_prerun_ids = set()
+
+            suggestions = _build_suggestions(
+                automations, step_lookup, valid_capture_ids, valid_prerun_ids
+            )
 
             return ToolResult(
                 content={

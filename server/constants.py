@@ -210,7 +210,11 @@ FASTMCP_SETTINGS = {
 # rather than repeating the literal.
 # 1.1.0: launch_process prerun/roles now take an ID-keyed object, a breaking
 # change to the advertised tool schema.
-SERVER_VERSION = "1.1.0"
+# 1.1.1: contract-correctness bug fixes (no tool-count change) - stop
+# update_process/update_task/complete_task/kickoff writes from silently
+# detaching assignees or corrupting state; form-field option/type/required
+# contract corrections; automation alias + orphan-detector fixes.
+SERVER_VERSION = "1.1.1"
 
 # FastMCP framework version — read at runtime so it stays accurate after upgrades
 FASTMCP_VERSION = importlib.metadata.version("fastmcp")

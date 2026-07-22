@@ -3,7 +3,7 @@
   "name": "com.tallyfy/mcp-server",
   "title": "Tallyfy Workflow Automation",
   "description": "Automate tasks, processes, and approvals with AI.",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "websiteUrl": "https://tallyfy.com/products/pro/integrations/mcp-server/",
   "repository": {
     "url": "https://github.com/tallyfy/mcp-public",

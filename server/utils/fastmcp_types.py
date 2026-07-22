@@ -5,7 +5,7 @@ This module provides reusable, validated parameter types for all MCP tools
 following FastMCP best practices with Pydantic validation.
 """
 
-from typing import Annotated, List, Optional, Dict, Any
+from typing import Annotated, List, Optional, Dict, Any, Union
 from pydantic import Field
 from constants import TALLYFY_AUTH_SERVER, TOOL_SECURITY_METADATA, MCPScopes
 
@@ -444,6 +444,25 @@ FieldIdList = Annotated[List[str], Field(
     description="Ordered list of field IDs (32-char hex strings)",
     min_length=1,
     examples=[["a1b2c3d4e5f6789012345678901234ef", "b2c3d4e5f67890123456789012345678"]]
+)]
+
+# Reorder input that accepts BOTH a bare field-ID string and an explicit
+# {capture_id (or id), position} object. reorder_form_fields normalizes both in its
+# body, but FastMCP validates the signature with Pydantic BEFORE the body runs, so a
+# bare List[Dict] type rejects the documented "list of field IDs" call at the schema
+# layer and the string-handling branch is dead code (#628). The union widens the type
+# so both shapes pass validation; the dict shape preserves explicit, non-sequential
+# positions that a bare List[str] cannot express.
+FieldOrderList = Annotated[List[Union[str, Dict[str, Any]]], Field(
+    min_length=1,
+    description=(
+        "Ordered list of field IDs (32-char hex strings), OR a list of "
+        "{capture_id, position} objects for explicit positions"
+    ),
+    examples=[
+        ["a1b2c3d4e5f6789012345678901234ef", "b2c3d4e5f67890123456789012345678"],
+        [{"capture_id": "a1b2c3d4e5f6789012345678901234ef", "position": 1}],
+    ]
 )]
 
 

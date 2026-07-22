@@ -31,6 +31,65 @@ from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
 
 
+_OWNER_BUCKETS = ("users", "guests", "groups")
+
+
+def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
+                             owners: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill in any owner bucket the caller left out, so the API keeps it.
+
+    Both task update paths reach the same gate:
+    TaskFactory::buildFromRequest and TaskFactory::editBasicTask
+    (app/Domain/Task/TaskFactory.php:108-110, the one-off route via
+    OneOffTaskService::edit:87) test ``is_array(Arr::get($data, 'owners'))``,
+    so omitting `owners` WHOLESALE is safe and stays safe. The danger is the
+    PARTIAL shape: once `owners` is present, BaseAssignees::newFromArray
+    (app/Domain/Owners/BaseAssignees.php:24) reads each bucket as
+    ``$data['users'] ?? []``, so any bucket the caller left out becomes an
+    EMPTY SET rather than "leave alone". Task::saveAssignees
+    (app/Models/Task.php:2054, :2058, :2060-2063) then detaches every user,
+    guest and group in the missing buckets.
+
+    This tool's own documented example, owners={"users":[123],"guests":[]},
+    omits `groups` and so silently detached every group from the task.
+
+    The fix is to COMPLETE a partially-supplied `owners`, not to always send
+    one. Buckets the caller did supply pass through verbatim, including a
+    deliberate empty list (that is a real "unassign everyone here" request).
+    Only the absent buckets are read back and re-sent.
+
+    TaskTransformer.php:49-52 emits all three buckets unconditionally, so a
+    missing or non-list bucket on the READ means the read failed, and sending
+    [] on a failed read is exactly the wipe this guard exists to prevent.
+    Abort instead of guessing.
+    """
+    missing = [b for b in _OWNER_BUCKETS if b not in owners]
+    if not missing:
+        return owners
+
+    current = sdk._make_request("GET", endpoint)
+    task = current.get("data", current) if isinstance(current, dict) else {}
+    current_owners = task.get("owners")
+    if not isinstance(current_owners, dict):
+        raise ToolError(
+            f"Task {task_id} did not return its current owners, so updating "
+            f"only part of 'owners' would detach every assignee in the "
+            f"buckets you left out ({', '.join(missing)}). Nothing was sent."
+        )
+
+    completed = dict(owners)
+    for bucket in missing:
+        value = current_owners.get(bucket)
+        if not isinstance(value, list):
+            raise ToolError(
+                f"Task {task_id} did not return its current '{bucket}', so "
+                f"updating 'owners' without it would detach everything in "
+                f"that bucket. Nothing was sent."
+            )
+        completed[bucket] = list(value)
+    return completed
+
+
 # ---------------------------------------------------------------------------
 # taskdata value shapes
 # ---------------------------------------------------------------------------
@@ -72,8 +131,8 @@ corruption), and 500s file. Never send one.
   file        -> LIST of objects, never a scalar:
                  [{"url":"uploads/x.pdf","name":"x.pdf","source":"url"}]
   radio       -> the chosen option's TEXT as a bare scalar  e.g. "Approved"
-  dropdown    -> {"id":"<option_id>","text":"<option label>"}  BOTH keys, must match an option
-  multiselect -> [{"id":"<option_id>","text":"<label>","selected":true}, ...]
+  dropdown    -> {"id":<int option_id>,"text":"<option label>"}  BOTH keys; id is the option's INTEGER id, must match an option
+  multiselect -> [{"id":<int option_id>,"text":"<label>","selected":true}, ...]
                  ALWAYS set "selected":true — entries without it render EMPTY as a variable
   table       -> a list with EXACTLY one entry per configured column
   assignees_form -> {"users":[20059],"guests":["a@b.com"],"groups":["<group_id>"]}"""
@@ -637,30 +696,30 @@ If the user doesn't specify a deadline or assignee, ASK them before calling the 
 
 REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex).
 
-⚠️ APPROVAL TASKS — MANDATORY is_approved PARAMETER ⚠️
-  If the task is an approval-type step (`step_type` = "approval"), you MUST provide
-  EITHER `is_approved=True` (approve) OR `is_approved=False` (reject). The API
-  rejects the request with HTTP 422 "The is approved field is required" if you
-  omit `is_approved` on approval tasks.
+APPROVAL TASKS need is_approved:
+  If the task's task_type is "approval", you MUST pass is_approved=True (approve)
+  or is_approved=False (reject). api-v2 returns HTTP 422 "The is approved field is
+  required" if you omit it on an approval task. The requirement is gated on the
+  task's OWN task_type, not on its parent step_type (the two can differ). Read
+  task_type first via get_tasks_for_process or get_task (both return it).
 
-  Before calling, check `step_type` on the task (via get_task or get_tasks_for_process):
-    - step_type="task"      → DO NOT pass is_approved (regular completion)
-    - step_type="approval"  → MUST pass is_approved=True or is_approved=False
-    - step_type="expiring"  → DO NOT pass is_approved (regular completion)
-    - step_type="email"     → DO NOT pass is_approved (regular completion)
+    task_type="task"           -> do NOT pass is_approved (regular completion)
+    task_type="approval"       -> MUST pass is_approved=True or is_approved=False
+    task_type="expiring"       -> do NOT pass is_approved (completing acknowledges it)
+    task_type="expiring_email" -> do NOT pass is_approved (completing acknowledges it)
+    task_type="email"          -> do NOT pass is_approved (regular completion)
 
-  When calling on a regular (non-approval) task with `is_approved`, the parameter
-  is ignored (no error). When calling on an approval task WITHOUT `is_approved`,
-  the API returns 422.
+  is_approved is honored ONLY for approval tasks. On task/email it is ignored. On
+  expiring or expiring_email it is NOT ignored: is_approved=False would record the
+  task as EXPIRED instead of ACKNOWLEDGED, so this tool refuses is_approved=False on
+  an expiring task. There is no way to mark a task expired through this tool.
 
 CORRECT usage:
-  complete_task(run_id="abc123...", task_id="def456...")                       # regular task
-  complete_task(run_id="abc123...", task_id="def456...", is_approved=True)     # approve an approval task
-  complete_task(run_id="abc123...", task_id="def456...", is_approved=False)    # reject an approval task
+  complete_task(run_id="...", task_id="...")                    # regular or expiring task
+  complete_task(run_id="...", task_id="...", is_approved=True)  # approve an approval task
+  complete_task(run_id="...", task_id="...", is_approved=False) # reject an approval task
 
-HOW TO GET run_id, task_id, and step_type:
-- Use get_tasks_for_process() or get_my_tasks() to find tasks with their run_ids,
-  IDs, and step_type.
+Get run_id, task_id, and task_type from get_tasks_for_process() or get_my_tasks().
 
 Never call this without both required parameters.""",
         tags={"tasks", "workflow", "write", "lifecycle"},
@@ -692,7 +751,11 @@ Never call this without both required parameters.""",
         Args:
             run_id: Process (run) ID the task belongs to (REQUIRED - 32-character hex string)
             task_id: Task ID to complete (REQUIRED - 32-character hex string)
-            is_approved: Optional approval flag for approval-type tasks
+            is_approved: Approval decision, honored ONLY for approval-type tasks
+                (True = approve, False = reject). Ignored for task/email tasks. For
+                an expiring task, is_approved=False is REFUSED because api-v2 would
+                record it as EXPIRED instead of ACKNOWLEDGED; complete expiring tasks
+                without is_approved.
             override_user: Optional numeric user ID to record as the completing user
 
         Returns:
@@ -700,9 +763,32 @@ Never call this without both required parameters.""",
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            forwarded_is_approved = is_approved
+            # is_approved is only part of an APPROVAL task's completion contract.
+            # api-v2 Task::complete() (Task.php) ALSO writes it for expiring tasks:
+            # `is_approved = ($is_approved !== false)`, so is_approved=False silently
+            # flips an expiring task from ACKNOWLEDGED to EXPIRED (a 2xx with data
+            # loss). The gate api-v2 uses is the task's own task_type, so resolve it
+            # and forward is_approved only for a genuine approval task.
+            if is_approved is not None:
+                task = sdk.tasks.get_task(org_id, run_id, task_id)
+                task_type = getattr(task, "task_type", None) if task else None
+                if is_approved is False and task_type in ("expiring", "expiring_email"):
+                    raise ToolError(
+                        "is_approved=False cannot be used on an expiring task: "
+                        "completing an expiring task records it as ACKNOWLEDGED, and "
+                        "api-v2 would instead mark it EXPIRED (silent data loss). There "
+                        "is no way to mark a task expired through this tool. Call "
+                        "complete_task without is_approved to acknowledge it."
+                    )
+                if task_type is not None and task_type != "approval":
+                    # task / email (or expiring completed with is_approved=True):
+                    # is_approved is not part of the completion contract, so drop it
+                    # rather than send a value the API ignores or misinterprets.
+                    forwarded_is_approved = None
             result = sdk.tasks.complete_task(
                 org_id, run_id, task_id,
-                is_approved=is_approved,
+                is_approved=forwarded_is_approved,
                 override_user=override_user,
             )
             return ToolResult(
@@ -792,7 +878,12 @@ Plus at least ONE optional field to update.
 CORRECT usage:
   update_task(run_id="abc...", task_id="def...", deadline="2026-03-01 17:00:00")
   update_task(run_id="abc...", task_id="def...", title="New title", summary="Updated description")
-  update_task(run_id="abc...", task_id="def...", owners={"users": [123], "guests": []})
+  update_task(run_id="abc...", task_id="def...", owners={"users": [123], "guests": [], "groups": []})
+
+'owners' REPLACES the assignee list, it does not add to it. Pass all three
+buckets and list everyone who should remain assigned. Any bucket you leave out
+is read back off the task and re-sent unchanged, so it is preserved rather than
+detached, but an empty list you DO pass means "unassign everyone here".
   update_task(run_id="abc...", task_id="def...", taskdata={"a1b2c3d4e5f6789012345678901234ef": "Acme Corp"})
 
 Never call this without run_id and task_id.""",
@@ -834,7 +925,10 @@ Never call this without run_id and task_id.""",
             title: New task title
             summary: New task description
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
-            owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}
+            owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}.
+                Replaces the assignee list rather than adding to it. Any of the three
+                buckets you omit is read back off the task and re-sent unchanged, so it
+                is preserved; a bucket you pass as [] is cleared as you asked.
             taskdata: Form field values, keyed by form field id. The value is shaped by
                 the field's type and is sent verbatim. There is no {"value": ...}
                 wrapper: most types reject one with a 422, email stores it verbatim
@@ -859,8 +953,25 @@ Never call this without run_id and task_id.""",
         Returns:
             Updated task object
         """
+        if owners is not None and not isinstance(owners, dict):
+            raise ToolError(
+                "owners must be a dict with 'users', 'guests' and 'groups' keys, "
+                'e.g. {"users": [123], "guests": [], "groups": []}'
+            )
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            # A partially-supplied `owners` detaches every assignee in the
+            # buckets it omits. Complete it before sending; see
+            # _completed_owner_buckets for the trace.
+            if owners is not None:
+                owners = _completed_owner_buckets(
+                    sdk,
+                    f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}",
+                    task_id,
+                    owners,
+                )
+
             result = sdk.tasks.update_task(
                 org_id, run_id, task_id,
                 title=title,
@@ -965,7 +1076,7 @@ CORRECT usage:
   update_standalone_task(task_id="abc...", title="New title", summary="Updated description")
   update_standalone_task(task_id="abc...", owners={"users": [123], "guests": [], "groups": []})
   update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": "new value"})
-  update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": {"id": "b7", "text": "Approved"}})
+  update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": {"id": 2, "text": "Approved"}})
 
 Never call this without task_id. Do NOT pass a run_id — standalone tasks don't use one.""",
         tags={"tasks", "workflow", "write", "standalone", "update"},
@@ -1003,7 +1114,10 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
             title: New task title
             summary: New task description
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
-            owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}
+            owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}.
+                Replaces the assignee list rather than adding to it. Any of the three
+                buckets you omit is read back off the task and re-sent unchanged, so it
+                is preserved; a bucket you pass as [] is cleared as you asked.
             taskdata: Form field values, keyed by form field id. The value is shaped by
                 the field's type and is sent verbatim. There is no {"value": ...}
                 wrapper: most types reject one with a 422, email stores it verbatim
@@ -1027,10 +1141,29 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
         Returns:
             Updated task object
         """
+        if owners is not None and not isinstance(owners, dict):
+            raise ToolError(
+                "owners must be a dict with 'users', 'guests' and 'groups' keys, "
+                'e.g. {"users": [123], "guests": [], "groups": []}'
+            )
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             current_task = sdk.tasks.get_standalone_task(org_id, task_id)
             current_data = serialize_dataclass(current_task) if current_task else {}
+
+            # Same partial-bucket hazard as update_task: OneOffTaskService::edit
+            # routes through TaskFactory::editBasicTask, which hits the identical
+            # is_array('owners') gate, so a partially-supplied owners detaches
+            # every assignee in the buckets it omits. Only the CALLER-supplied
+            # dict needs completing. The `current_data` fallback below is already
+            # safe: serialize_dataclass strips only EMPTY buckets, and detaching
+            # an already-empty bucket is a no-op.
+            if owners is not None:
+                owners = _completed_owner_buckets(
+                    sdk, f"organizations/{org_id}/tasks/{task_id}", task_id, owners
+                )
+
             result = sdk.tasks.update_standalone_task(
                 org_id, task_id,
                 title=title if title is not None else current_data.get('title'),
