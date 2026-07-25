@@ -23,6 +23,7 @@ from utils.fastmcp_types import (
     GenericList,
 )
 from utils.sdk_serializer import serialize_dataclass
+from utils.field_value_encoding import coerce_field_values_safely
 from utils.kickoff_encoding import normalize_keyed_payload
 from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
@@ -206,38 +207,41 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         },
         description="""Launch a new workflow process (run) from a template.
 
-REQUIRED: 'template_id' (32-char hex) and 'name' (process name string). For the name, generate a short descriptive instance name based on the template name and context (e.g. "Onboarding - Jane Doe", "Q1 Budget Review - Marketing"). Do not ask the user for a name unless they want to specify one.
+REQUIRED: 'template_id' (32-char hex) and 'name'. Generate a short descriptive
+instance name from the template name and context (e.g. "Onboarding - Jane Doe").
+Do not ask the user for a name unless they want to pick one.
 
-PRERUN vs STEP-FORM-FIELDS — TWO DIFFERENT FORM SURFACES:
+TWO DIFFERENT FORM SURFACES:
 
-  - `prerun` (optional object): KICKOFF FORM fields, collected BEFORE the workflow
-    starts (e.g. "Customer name"). Defined at TEMPLATE level. Call
-    `get_kickoff_fields(template_id)` first for field IDs, types and options.
+  - `prerun` (optional): KICKOFF fields, collected BEFORE the workflow starts.
+    Defined at TEMPLATE level. Call `get_kickoff_fields(template_id)` first for
+    field IDs, types and options.
 
-    A single OBJECT keyed by each field's `timeline_id` — NOT a list, NOT labels:
+    ONE OBJECT keyed by each field's `timeline_id` — not a list, not labels:
       prerun={"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6": "Acme Corp"}
 
-    Value shape follows the field's type. Bare scalar for text/textarea/date/email,
-    and for radio use the option's TEXT. dropdown needs {"id":..,"text":..} (both
-    keys, text matching that option exactly); multiselect a list of those objects;
-    table a list with one entry per column; assignees_form
-    {"users":[id],"guests":["email"],"groups":[id]}. dropdown and radio are
-    asymmetric: object vs bare text.
+    Values follow the field type. Bare scalar for text/textarea/date/email. For
+    dropdown/radio/multiselect pass the option's id OR its exact text
+    (multiselect: a list of them) — this tool resolves each to the shape the API
+    needs, so never hand-build {"id","text"} or recall that multiselect entries
+    need "selected":true. table: one entry per column. file: a list of objects,
+    each with "filename" plus one of id/full_url/url. assignees_form:
+    {"users":[id],"guests":["email"],"groups":[id]}.
 
-  - Step-level form fields (NOT set here): filled DURING execution, via
-    `update_task` with `taskdata={field_id: value}`. These are NOT prerun fields.
+  - Step-level fields (NOT here): filled DURING execution via `update_task`
+    with `taskdata={field_id: value}`.
 
-CORRECT usage:
+CORRECT:
   launch_process(template_id="abc123...", name="Onboarding - Jane Doe")
-  launch_process(template_id="abc123...", name="Q1 Review", tags=["tag_id"])
   launch_process(template_id="abc123...", name="Onboarding - Acme",
     prerun={"<customer_name_field_id>": "Acme Corp"}, owner_id=12345)
 
-WRONG usage (will fail):
-  launch_process(template_id="abc123...")  ← MISSING name
-  launch_process(name="Review")  ← MISSING template_id
-  launch_process(..., prerun=[{"<field_id>": "Acme Corp"}])  ← LIST, must be one object
-  launch_process(..., prerun={"Customer name": "Acme"})  ← LABEL, must be timeline_id""",
+WRONG:
+  launch_process(template_id="abc123...")  ← no name, fails
+  launch_process(..., prerun={"Customer name": "Acme"})  ← LABEL not timeline_id:
+    matches no field, so it is DROPPED — a 201 with an empty kickoff form
+  launch_process(..., prerun=[{"<field_id>": "Acme"}])  ← legacy list; accepted
+    and folded, but send the object""",
         tags={"processes", "workflow", "runs", "write", "create", "launch"},
         annotations=ToolAnnotations(
             title="Launch process",
@@ -304,6 +308,20 @@ WRONG usage (will fail):
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            # Correct container, wrong VALUES is a separate 422 class: dropdown
+            # needs {"id","text"}, radio the bare text, multiselect a list of
+            # objects carrying `selected`. Resolve them against the template's
+            # own option lists so an option id or its text both work. Costs one
+            # extra GET, and only when kickoff values were actually supplied.
+            prerun = coerce_field_values_safely(
+                prerun,
+                lambda: getattr(
+                    sdk.templates.get_template(org_id, template_id=template_id),
+                    "prerun",
+                    None,
+                ),
+            )
+
             result = sdk.tasks.launch_process(
                 org_id=org_id,
                 template_id=template_id,

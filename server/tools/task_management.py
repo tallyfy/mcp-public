@@ -13,6 +13,7 @@ from tallyfy.models import Task
 from mcp.types import ToolAnnotations
 from utils.date_utils import DateExtractor
 from utils.fastmcp_errors import handle_tallyfy_errors
+from utils.field_value_encoding import coerce_field_values_safely
 from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 from utils.fastmcp_types import (
     OptionalUserId,
@@ -32,6 +33,57 @@ from metrics import track_tool_execution
 
 
 _OWNER_BUCKETS = ("users", "guests", "groups")
+
+
+def _task_fields(sdk, endpoint: str) -> list:
+    """
+    Read a task's form-field DEFINITIONS, which is the only way to coerce
+    `taskdata` values into their per-type shapes.
+
+    The definitions are an OPTIONAL Fractal include, so they have to be asked
+    for by name and then unwrapped. Verified against the live API on both task
+    surfaces (2026-07-24):
+
+        GET .../runs/{run}/tasks/{task}?with=form_fields  ->  data.form_fields.data[]
+        GET .../tasks/{task}?with=form_fields             ->  data.form_fields.data[]
+
+    Each entry carries `{id, field_type, label, options}`, which is exactly what
+    `coerce_field_values` matches on. A plain GET returns NEITHER `form_fields`
+    NOR `step` (`TaskTransformer.php:14-28` lists both under `$availableIncludes`),
+    so reading them off an already-fetched task object silently yields nothing -
+    that was the bug this replaced.
+
+    `?with=step` also works for run tasks, but not for one-off tasks, which have
+    no step and yet can carry their own choice fields. `form_fields` is the one
+    parameter that covers both.
+    """
+    response = sdk._make_request("GET", endpoint, params={"with": "form_fields"})
+    data = response.get("data", response) if isinstance(response, dict) else response
+    fields = data.get("form_fields") if isinstance(data, dict) else None
+    if isinstance(fields, dict):
+        fields = fields.get("data")  # unwrap the Fractal include
+    return list(fields or [])
+
+
+def _coerce_taskdata(sdk, endpoint: str,
+                     taskdata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Shape `taskdata` values to their field types before sending.
+
+    Same failure class as the kickoff `prerun` incident, one surface along:
+    the keys are right but dropdown/radio/multiselect each want a different
+    value shape, so the API answers with a generic "Invalid dropdown choice
+    selected." Resolving against the field's own options turns an option id or
+    its text into whatever that type requires.
+
+    A read failure here must not block the write - the API stays the authority,
+    and un-coerced values behave exactly as they did before this existed. That
+    guard lives in `coerce_field_values_safely`, shared with the launch path so
+    the two cannot drift (CLAUDE.md rule 16).
+    """
+    return coerce_field_values_safely(
+        taskdata, lambda: _task_fields(sdk, endpoint)
+    )
 
 
 def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
@@ -107,7 +159,9 @@ def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
 #     REJECT a wrapper with a 422 (a dict is not a scalar; a dropdown needs id+text).
 #   - `email` ACCEPTS it with a 200 and stores {"value": "..."} VERBATIM. This is
 #     silent corruption and is exactly the failure class of the prerun incident.
-#   - `file` returns a 500 (Task.php:1654 foreachs the value).
+#   - `file` rejects it too since the new arm landed: a wrapper dict is not a
+#     LIST, so it fails `array_is_list` rather than reaching the storage layer
+#     that used to 500 on it (Task.php:1654 foreachs the value).
 #
 # The per-type shapes below are the switch arms of
 # app/Http/Requests/Captures/FormValuesValidator.php:20-119. Note that:
@@ -116,25 +170,31 @@ def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
 #     date must be a parseable string (an epoch int -> 422).
 #   - dropdown and radio are deliberately asymmetric: dropdown validates {id,text}
 #     as a pair, radio only checks the scalar is one of the option texts.
-#   - `file` and `email` have no case in the switch, but "unvalidated" does NOT
-#     mean "accepts anything" — see the wrapper behaviour above. `file` in
-#     particular needs a LIST of file objects or the storage layer 500s.
+#   - `email` has no case in the switch, but "unvalidated" does NOT mean
+#     "accepts anything" — see the wrapper behaviour above.
+#   - `file` GAINED a validator arm (FormValuesValidator.php:124-158, merged
+#     2026-07-23) that rejects a non-list with a clean 422 instead of letting
+#     the storage layer 500. It requires a LIST whose every entry is an object
+#     carrying at least one of `id`, `full_url`, `url`. The rendering key is
+#     `filename` (VariableReplacement.php:246 reads `$file->filename`), NOT
+#     `name`. Note the arm is on master; state the SHAPE rather than the exact
+#     status code, since the two environments can be a deploy apart.
 #   - multiselect entries need "selected": true for RENDERING, not validation:
 #     VariableReplacement.php:270 skips any entry without it, so the field renders
 #     EMPTY wherever it is used as a variable. (`must_all_checked` is NOT the
 #     reason — it only fires from MarkTaskCompleteRequest.php:52, never on this path.)
 _TASKDATA_SHAPE_HELP = """FORM FIELD VALUES ('taskdata') — dict keyed by the form field's id. Send the value ITSELF:
-a {"value":...} wrapper is REJECTED by most types, stored VERBATIM by email (silent
-corruption), and 500s file. Never send one.
-  text        -> scalar e.g. "Acme Corp"  ·  textarea -> string only (12345 -> 422)
-  date        -> "2026-03-01 09:00:00" (epoch int -> 422)  ·  email -> "a@b.com"
-  file        -> LIST of objects, never a scalar:
-                 [{"url":"uploads/x.pdf","name":"x.pdf","source":"url"}]
-  radio       -> the chosen option's TEXT as a bare scalar  e.g. "Approved"
-  dropdown    -> {"id":<int option_id>,"text":"<option label>"}  BOTH keys; id is the option's INTEGER id, must match an option
-  multiselect -> [{"id":<int option_id>,"text":"<label>","selected":true}, ...]
-                 ALWAYS set "selected":true — entries without it render EMPTY as a variable
-  table       -> a list with EXACTLY one entry per configured column
+a {"value":...} wrapper is REJECTED by most types and stored VERBATIM by email
+(silent corruption). Never send one.
+  text     -> scalar e.g. "Acme Corp"  ·  textarea -> string only (12345 -> 422)
+  date     -> "2026-03-01 09:00:00" (epoch int -> 422)  ·  email -> "a@b.com"
+  file     -> LIST of objects, never a scalar; the key is "filename", not "name":
+              [{"url":"uploads/x.pdf","filename":"x.pdf","source":"url"}]
+  dropdown -> {"id":N,"text":"..."} · radio -> bare text · multiselect -> a LIST
+              of [{"id":N,"text":"...","selected":true}] ("selected" omitted still
+              validates, then renders EMPTY in every variable). You may instead pass
+              just the option id or its exact text and this tool resolves it.
+  table    -> a list with EXACTLY one entry per configured column
   assignees_form -> {"users":[20059],"guests":["a@b.com"],"groups":["<group_id>"]}"""
 
 
@@ -931,11 +991,12 @@ Never call this without run_id and task_id.""",
                 is preserved; a bucket you pass as [] is cleared as you asked.
             taskdata: Form field values, keyed by form field id. The value is shaped by
                 the field's type and is sent verbatim. There is no {"value": ...}
-                wrapper: most types reject one with a 422, email stores it verbatim
-                (silent corruption), and file returns a 500. text/textarea/date/email
+                wrapper: most types reject one with a 422 and email stores it verbatim
+                (silent corruption). text/textarea/date/email
                 take a bare scalar; file takes a LIST of objects and NEVER a scalar,
                 e.g. [{"filename":"x.pdf","url":"uploads/x.pdf","source":"url"}] (the
-                key is "filename", not "name"; a bare scalar is an HTTP 500); radio
+                key is "filename", not "name"; every entry needs at least one of
+                id/full_url/url, and a bare scalar is rejected); radio
                 takes the option's text as a bare scalar; dropdown takes {"id","text"}
                 with the id as the option's integer id; multiselect a list of
                 {"id","text","selected":true}; table a list with one entry per column,
@@ -971,6 +1032,10 @@ Never call this without run_id and task_id.""",
                     task_id,
                     owners,
                 )
+
+            taskdata = _coerce_taskdata(
+                sdk, f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}", taskdata
+            )
 
             result = sdk.tasks.update_task(
                 org_id, run_id, task_id,
@@ -1120,11 +1185,12 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
                 is preserved; a bucket you pass as [] is cleared as you asked.
             taskdata: Form field values, keyed by form field id. The value is shaped by
                 the field's type and is sent verbatim. There is no {"value": ...}
-                wrapper: most types reject one with a 422, email stores it verbatim
-                (silent corruption), and file returns a 500. text/textarea/date/email
+                wrapper: most types reject one with a 422 and email stores it verbatim
+                (silent corruption). text/textarea/date/email
                 take a bare scalar; file takes a LIST of objects and NEVER a scalar,
                 e.g. [{"filename":"x.pdf","url":"uploads/x.pdf","source":"url"}] (the
-                key is "filename", not "name"; a bare scalar is an HTTP 500); radio
+                key is "filename", not "name"; every entry needs at least one of
+                id/full_url/url, and a bare scalar is rejected); radio
                 takes the option's text as a bare scalar; dropdown takes {"id","text"}
                 with the id as the option's integer id; multiselect a list of
                 {"id","text","selected":true}; table a list with one entry per column,
@@ -1163,6 +1229,13 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
                 owners = _completed_owner_buckets(
                     sdk, f"organizations/{org_id}/tasks/{task_id}", task_id, owners
                 )
+
+            # current_task cannot serve here: `get_standalone_task` fetches
+            # without `?with=`, and the SDK's Task dataclass has no field for
+            # the definitions at all. This re-reads with the include.
+            taskdata = _coerce_taskdata(
+                sdk, f"organizations/{org_id}/tasks/{task_id}", taskdata
+            )
 
             result = sdk.tasks.update_standalone_task(
                 org_id, task_id,

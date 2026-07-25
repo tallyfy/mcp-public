@@ -214,7 +214,14 @@ FASTMCP_SETTINGS = {
 # update_process/update_task/complete_task/kickoff writes from silently
 # detaching assignees or corrupting state; form-field option/type/required
 # contract corrections; automation alias + orphan-detector fixes.
-SERVER_VERSION = "1.1.1"
+# 1.1.2: per-type form-field VALUE coercion (no tool-count change). 1.1.0 fixed
+# the prerun CONTAINER shape; the values inside it were still passed through
+# untouched, so dropdown/radio/multiselect kept 422-ing. launch_process and both
+# task update paths now resolve an option id or its text against the field's own
+# options and emit the shape FormValuesValidator requires, including the
+# selected:true that multiselect needs to render at all. get_dropdown_options
+# returns {id,text} pairs so a writable value can actually be read.
+SERVER_VERSION = "1.1.2"
 
 # FastMCP framework version — read at runtime so it stays accurate after upgrades
 FASTMCP_VERSION = importlib.metadata.version("fastmcp")

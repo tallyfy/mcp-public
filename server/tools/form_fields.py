@@ -18,9 +18,11 @@ from utils.fastmcp_types import (
     FieldIdList,
     FieldOrderList,
     GenericDict,
+    GenericList,
     FieldPosition,
 )
 from utils.sdk_serializer import serialize_dataclass
+from utils.field_value_encoding import option_pairs
 from metrics import track_tool_execution
 
 
@@ -505,7 +507,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="get_dropdown_options",
-        description="Get current dropdown options for analysis. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). Never call this without all three parameters.",
+        description="Get the options on a dropdown/radio/multiselect field, as {\"id\", \"text\"} objects. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). Never call this without all three parameters. The id is needed to WRITE a value: dropdown takes {\"id\",\"text\"}, multiselect a list of {\"id\",\"text\",\"selected\":true}, radio the bare text. Options the API could not have issued (missing an id or a text) are OMITTED rather than given a made-up id, so an empty list means none were usable and NOT that the field has no options - do not feed an empty result back into update_dropdown_options, which would replace the real list.",
         tags=["forms", "fields", "ui", "read-only", "dropdown", "options"],
         annotations=ToolAnnotations(
             title="Get dropdown options",
@@ -522,9 +524,15 @@ Never call this without all four parameters.""",
         template_id: TemplateId,
         step_id: StepId,
         field_id: FieldId
-    ) -> List[str]:
+    ) -> GenericList:
         """
-        Get current dropdown options for analysis.
+        Get the options on a choice field, with their ids.
+
+        The SDK's `get_dropdown_options` flattens options to a list of TEXT and
+        drops every id, which makes a dropdown value unconstructible from the
+        one tool whose whole job is reading options: `FormValuesValidator.php:23`
+        requires BOTH `id` and `text` and requires them to resolve to the same
+        option. So this reads the step directly and keeps the pairs intact.
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
@@ -532,12 +540,29 @@ Never call this without all four parameters.""",
             field_id: Form field ID (REQUIRED - 32-character hex string)
 
         Returns:
-            List of dropdown option strings
+            List of {"id", "text"} option objects, in their configured order.
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.form_fields.get_dropdown_options(org_id, template_id, step_id, field_id)
-            return ToolResult(content=result, structured_content=None)
+            response = sdk._make_request(
+                "GET",
+                f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}",
+            )
+            step = response.get("data", response) if isinstance(response, dict) else {}
+            captures = step.get("captures") or []
+            field = next(
+                (c for c in captures if isinstance(c, dict) and c.get("id") == field_id),
+                None,
+            )
+            if field is None:
+                raise ToolError(
+                    f"Form field {field_id} not found in step {step_id}."
+                )
+
+            # Same helper the write path resolves against, so what this tool
+            # reports and what `update_task` will accept cannot drift.
+            options = option_pairs(field.get("options"))
+            return ToolResult(content=options, structured_content=None)
 
     @mcp.tool(
         name="update_dropdown_options",
