@@ -7,25 +7,87 @@ Explicitly declares server capabilities for standards compliance with:
 - MCP specification compliance
 """
 
+from unittest.mock import MagicMock
+
 from mcp.types import ServerCapabilities, ToolsCapability, ResourcesCapability
 
+from constants import MCP_RESOURCE_URL
+# Imported, not re-listed: this is the exact array the live
+# /.well-known/oauth-authorization-server document publishes, and clients
+# believe that document. A hand-copied list here previously advertised the
+# internal Python constant NAMES (USERS_READ, ...) rather than the wire
+# values (mcp.users.read, ...), and was missing four scopes.
+from routes.oauth import SUPPORTED_SCOPES
+
+# (label, tools module, description). The per-category TOOL COUNT is NOT
+# written here — it is derived from the module's own registrations by
+# ``category_breakdown()`` below.
+#
+# It used to be a hand-maintained integer per row and it drifted badly: the
+# list advertised 110 tools across 15 categories while the server had 108,
+# including two categories (Template Generation, Text AI Helpers) whose tools
+# were deleted in PR #492 and omitting Template Mapping Validation entirely.
+# This file's whole job is to describe the server accurately to directory
+# reviewers, so the numbers now come from the same source of truth the server
+# registers from. See #654.
 CATEGORY_DESCRIPTIONS = [
-    ("User Management", 14, "Organization members, guests, invitations, user/guest CRUD, role management"),
-    ("Task Management", 13, "Task CRUD, standalone tasks, NLP date extraction, kickoff forms"),
-    ("Process Management", 7, "Workflow process operations, reactivation, kickoff forms"),
-    ("Template Management", 18, "Blueprint/template CRUD, step management, cloning"),
-    ("Form Fields", 8, "Dynamic form field management, suggestions, reordering"),
-    ("Search", 5, "Task, process, template, snippet search, plus cross-type search_all"),
-    ("Automation", 6, "If-then rules, creation, analysis, redundancy detection, consolidation suggestions"),
-    ("Group Management", 7, "Team/group CRUD and membership"),
-    ("Comment Management", 6, "Task comments, issue reporting and resolution"),
-    ("Tag Management", 8, "Tag CRUD, template/process tagging"),
-    ("Folder Management", 7, "Folder CRUD, object-folder organization"),
-    ("User Interaction", 3, "Structured user questions, ranking, and confirmation"),
-    ("Template Generation", 5, "AI-driven template draft creation from prompts, documents, and images"),
-    ("Text AI Helpers", 2, "AI-powered name and procedure suggestions"),
-    ("Universal API Fallback", 1, "Catch-all for any Tallyfy REST API endpoint"),
+    ("User Management", "user_management", "Organization members, guests, invitations, user/guest CRUD, role management"),
+    ("Task Management", "task_management", "Task CRUD, standalone tasks, NLP date extraction, kickoff forms"),
+    ("Process Management", "process_management", "Workflow process operations, reactivation, kickoff forms"),
+    ("Template Management", "template_management", "Blueprint/template CRUD, step management, cloning"),
+    ("Form Fields", "form_fields", "Dynamic form field management, suggestions, reordering"),
+    ("Search", "search", "Task, process, template, snippet search, plus cross-type search_all"),
+    ("Automation", "automation", "If-then rules, creation, analysis, redundancy detection, consolidation suggestions"),
+    ("Group Management", "group_management", "Team/group CRUD and membership"),
+    ("Comment Management", "comment_management", "Task comments, issue reporting and resolution"),
+    ("Tag Management", "tag_management", "Tag CRUD, template/process tagging"),
+    ("Folder Management", "folder_management", "Folder CRUD, object-folder organization"),
+    ("User Interaction", "user_interaction", "Structured user questions, ranking, and confirmation"),
+    ("Template Mapping Validation", "template_mapping_validation", "Deterministic validation of a drafted template mapping before it is built"),
+    ("Universal API Fallback", "api_fallback", "Catch-all read and write access to any Tallyfy REST API endpoint"),
 ]
+
+_breakdown_cache: list | None = None
+
+
+def _count_tools_in_module(module_name: str) -> int:
+    """Register a tools module against a throwaway mcp and count the result.
+
+    Registration is pure decoration, so running it a second time against a
+    stub has no effect on the real server.
+    """
+    import importlib
+
+    module = importlib.import_module(f"tools.{module_name}")
+    names = set()
+
+    def stub_tool(**kwargs):
+        def decorator(func):
+            names.add(kwargs.get("name", func.__name__))
+            return func
+        return decorator
+
+    stub = MagicMock()
+    stub.tool = stub_tool
+    for attr in dir(module):
+        if attr.startswith("register_") and callable(getattr(module, attr)):
+            getattr(module, attr)(stub)
+    return len(names)
+
+
+def category_breakdown() -> list:
+    """Return [(label, tool_count, description)], counted from the code.
+
+    Memoized — the tool set is static for the life of the process
+    (``ToolsCapability(listChanged=False)``).
+    """
+    global _breakdown_cache
+    if _breakdown_cache is None:
+        _breakdown_cache = [
+            (label, _count_tools_in_module(module), desc)
+            for label, module, desc in CATEGORY_DESCRIPTIONS
+        ]
+    return _breakdown_cache
 
 
 def register_capabilities(mcp):
@@ -44,11 +106,14 @@ def register_capabilities(mcp):
         )
 
         tool_count = len(await mcp.list_tools())
-        num_categories = len(CATEGORY_DESCRIPTIONS)
+        breakdown = category_breakdown()
+        num_categories = len(breakdown)
+        scopes_text = ", ".join(SUPPORTED_SCOPES)
 
         cat_lines = []
-        for label, count, desc in CATEGORY_DESCRIPTIONS:
-            cat_lines.append(f"- **{label}** ({count} tools): {desc}")
+        for label, count, desc in breakdown:
+            noun = "tool" if count == 1 else "tools"
+            cat_lines.append(f"- **{label}** ({count} {noun}): {desc}")
         categories_text = "\n".join(cat_lines)
 
         return f"""# Tallyfy MCP Server Capabilities
@@ -63,15 +128,17 @@ def register_capabilities(mcp):
 
 ## Authentication
 
-- **OAuth 2.1**: Authorization Code Flow + PKCE
+- **OAuth 2.1**: Authorization Code Flow + PKCE, with Dynamic Client Registration
 - **JWT Validation**: RS256 signature verification
-- **Issuer**: https://go.tallyfy.com
-- **Scopes**: USERS_READ, TASKS_READ, TASKS_WRITE, PROCESSES_READ, PROCESSES_WRITE, TEMPLATES_READ, TEMPLATES_WRITE
+- **Issuer**: {MCP_RESOURCE_URL}
+- **Discovery**: `{MCP_RESOURCE_URL}/.well-known/oauth-authorization-server` and
+  `{MCP_RESOURCE_URL}/.well-known/oauth-protected-resource` are authoritative
+- **Scopes**: {scopes_text}
 
 ## Transport
 
 - **Protocol**: MCP (Model Context Protocol) v1.0
-- **Transport**: Streamable HTTP with `/mcp/messages` endpoint
+- **Transport**: Streamable HTTP, served at `/`, `/mcp` and `/mcp/`
 - **Format**: JSON (application/json)
 
 ## Response Constraints

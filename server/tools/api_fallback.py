@@ -1,19 +1,25 @@
-"""Universal Tallyfy API fallback tool — ``tallyfy_api_call``.
+"""Tallyfy API fallback tools — ``tallyfy_api_read`` and ``tallyfy_api_write``.
 
 Gives Claude an escape hatch: if no specific tool matches the user's
 request, Claude can issue a direct HTTP call against any Tallyfy REST
-API endpoint — subject to:
+API endpoint, subject to:
 
 - Feature flag: ``MCP_ENABLE_API_FALLBACK=true`` (OFF by default in prod
   until the per-org whitelist warms up).
 - Path validation against the live OpenAPI spec (``tallyfy_spec_cache``).
 - Block-list of admin / oauth / metrics surfaces (``tallyfy_endpoint_allowlist``).
-- Destructive-action hint (POST/PUT/PATCH/DELETE) — the system prompt
-  instructs Claude to ``ask_user_question`` before calling this tool
-  with a non-GET method.
-- Audit logging for every non-GET call.
+- Audit logging for every write call.
 
-Issue: #171  |  Plan: §VIII / §V.4
+**Why two tools and not one.** This used to be a single ``tallyfy_api_call``
+with a ``method`` parameter accepting GET through DELETE. Anthropic's
+Connectors Directory review rules reject exactly that shape: a tool that
+accepts both safe and unsafe HTTP methods must be split into a read-only
+tool and one or more write tools, and saying so in the description does
+not satisfy the rule. Splitting also lets the annotations tell the truth,
+so the read tool can run without a confirmation prompt while the write
+tool always asks. See https://claude.com/docs/connectors/building/review-criteria
+
+Issues: #171 (original), #651 (the split)  |  Plan: §VIII / §V.4
 """
 from __future__ import annotations
 
@@ -47,7 +53,15 @@ _audit_logger = logging.getLogger("tallyfy_api_call_audit")
 _ENABLED = os.getenv("MCP_ENABLE_API_FALLBACK", "false").lower() == "true"
 
 
-HttpMethod = Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+# Deliberately split. Never merge these back into one union on one tool:
+# a single tool exposing both sets is an automatic rejection from the
+# Anthropic Connectors Directory (see the module docstring and #651).
+ReadMethod = Literal["GET"]
+WriteMethod = Literal["POST", "PUT", "PATCH", "DELETE"]
+
+# The public Tallyfy API reference. Anthropic's review rules require a tool
+# that accepts caller-built endpoint paths to name or link its target API.
+TALLYFY_API_DOCS_URL = "https://api.tallyfy.com/docs/index"
 
 
 ApiCallPath = Annotated[str, Field(
@@ -66,8 +80,8 @@ ApiCallPath = Annotated[str, Field(
 ApiCallBody = Annotated[Optional[Dict[str, Any]], Field(
     default=None,
     description=(
-        "JSON request body for POST/PUT/PATCH. MUST be omitted for GET and "
-        "DELETE unless the endpoint genuinely accepts a body there."
+        "JSON request body for POST/PUT/PATCH. MUST be omitted for DELETE "
+        "unless the endpoint genuinely accepts a body there."
     ),
 )]
 
@@ -105,6 +119,7 @@ def _serialize_response(resp: httpx.Response) -> Dict[str, Any]:
 
 def _audit(
     *,
+    tool: str,
     method: str,
     path: str,
     status: int,
@@ -115,7 +130,7 @@ def _audit(
     """One structured audit log per API call."""
     _audit_logger.info(
         json.dumps({
-            "tool": "tallyfy_api_call",
+            "tool": tool,
             "method": method,
             "path": path,
             "status": status,
@@ -126,39 +141,179 @@ def _audit(
     )
 
 
+async def _execute(
+    *,
+    tool_name: str,
+    method: str,
+    path: str,
+    body: Optional[Dict[str, Any]],
+    query: Optional[Dict[str, Any]],
+) -> ToolResult:
+    """Shared implementation behind both fallback tools.
+
+    Read and write differ only in which methods their signature accepts.
+    Everything after that (spec validation, the block-list, the HTTP call,
+    audit logging) is identical by construction rather than by imitation,
+    so the two tools cannot drift apart.
+    """
+    if not _ENABLED:
+        raise ToolError(
+            f"{tool_name} is disabled. Set MCP_ENABLE_API_FALLBACK=true "
+            "to enable it for this deployment."
+        )
+
+    api_key, org_id = get_authenticated_credentials()
+    user_id = get_user_id_from_token()
+    method_u = method.upper()
+
+    # Substitute {org} before spec lookup so the template match works.
+    resolved_path = _substitute_path_params(path, org_id)
+
+    # Spec validation — loaded at startup; refreshed hourly.
+    # On-demand load as fallback: if the startup event didn't fire in time,
+    # refresh now (blocking this call once) rather than failing immediately.
+    if not SPEC_CACHE.is_loaded():
+        await SPEC_CACHE.refresh_once()
+    if not SPEC_CACHE.is_loaded():
+        raise ToolError(
+            "Tallyfy OpenAPI spec cache is not yet loaded. Retry in a moment."
+        )
+    endpoint = SPEC_CACHE.get_endpoint(method_u, resolved_path)
+    if endpoint is None:
+        raise ToolError(
+            f"No {method_u} {resolved_path} in Tallyfy OpenAPI spec. "
+            f"Paths are case-sensitive and include base path '/'. "
+            f"Confirm the endpoint exists at {TALLYFY_API_DOCS_URL}"
+        )
+
+    # Allowlist + scope gate.
+    gate = allowlist_check(method_u, resolved_path, jwt_scopes=())
+    if not gate.allowed:
+        if gate.reason == "blocked":
+            raise ToolError(
+                f"Path {resolved_path} is in the block-list "
+                "(/admin, /support, /oauth, /metrics, etc.)"
+            )
+        raise ToolError(
+            f"Access denied: {gate.reason}. Required scope: {gate.required_scope}"
+        )
+
+    # Issue the HTTP call.
+    url = f"{TALLYFY_API_BASE_URL}{resolved_path}"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Tallyfy-Client": "APIClient",
+        "Accept": "application/json",
+    }
+    if body is not None and method_u in ("POST", "PUT", "PATCH"):
+        headers["Content-Type"] = "application/json"
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.request(
+                method_u,
+                url,
+                headers=headers,
+                json=body if method_u in ("POST", "PUT", "PATCH") else None,
+                params=query,
+            )
+    except httpx.RequestError as e:
+        logger.warning("%s network error: %s", tool_name, e)
+        raise ToolError(f"Network error calling Tallyfy API: {e}") from e
+
+    if gate.is_destructive:
+        _audit(
+            tool=tool_name,
+            method=method_u,
+            path=resolved_path,
+            status=resp.status_code,
+            org_id=org_id,
+            user_id=user_id,
+            destructive=True,
+        )
+
+    return ToolResult(
+        content=_serialize_response(resp),
+        structured_content=None,
+    )
+
+
+_SHARED_RULES = (
+    "Paths under /admin, /support, /auth, /oauth, /metrics, /health, "
+    "/ready, /debug are BLOCKED and return an error. The path MUST exist "
+    "in the live Tallyfy OpenAPI spec (auto-refreshed hourly); confirm it "
+    f"at {TALLYFY_API_DOCS_URL}. The '{{org}}' placeholder is substituted "
+    "with the authenticated org_id, so pass it literally. Other path "
+    "params (template_id, user_id) you supply yourself. "
+    "Returns {status_code, headers, body}."
+)
+
+
 def register_api_fallback_tool(mcp):
-    """Register ``tallyfy_api_call`` with the MCP server."""
+    """Register the read and write API fallback tools with the MCP server."""
 
     @mcp.tool(
-        name="tallyfy_api_call",
+        name="tallyfy_api_read",
         description=(
-            "UNIVERSAL FALLBACK — call ANY Tallyfy REST API endpoint when "
-            "no specific tool fits. Path MUST exist in the live OpenAPI "
-            "spec (auto-refreshed hourly). The ``{org}`` placeholder is "
-            "auto-substituted with the authenticated org_id.\n\n"
-            "USAGE RULES (MANDATORY):\n"
-            "1. Prefer specific tools (search_*, get_*, create_*, etc.) "
-            "whenever one matches — only reach for this tool after "
-            "confirming no specific tool works.\n"
-            "2. For POST/PUT/PATCH/DELETE, call ``ask_user_question`` "
-            "FIRST to confirm the destructive action with the user. Never "
-            "issue a write without explicit user confirmation.\n"
-            "3. Paths under /admin, /support, /auth, /oauth, /metrics, "
-            "/health, /ready, /debug are BLOCKED and will return an error.\n"
-            "4. The body argument is raw JSON for the endpoint — shape it "
-            "per the Tallyfy API docs.\n"
-            "5. Returns {status_code, headers, body}.\n\n"
-            "EXAMPLE PATHS (illustrative only — confirm against the live spec):\n"
-            "- GET /organizations/{org}/runs — list processes\n"
-            "- GET /organizations/{org}/checklists/{template_id} — fetch template\n"
-            "- GET /organizations/{org}/users/{user_id}/tasks — user's tasks\n"
-            "- POST /organizations/{org}/runs — launch process (write — confirm first)\n"
-            "- GET /organizations/{org}/checklists/{template_id}/steps/{step_id}/captures — step form fields\n"
-            "Note: {org} is auto-substituted; pass the literal placeholder. Other path params (template_id, user_id, etc.) you provide explicitly."
+            "READ-ONLY FALLBACK. Issues a GET against any Tallyfy REST API "
+            "endpoint when no specific tool fits. This tool cannot modify "
+            "anything; use tallyfy_api_write for that.\n\n"
+            "Prefer a specific tool (search_*, get_*) whenever one matches. "
+            "Only reach for this after confirming none does.\n\n"
+            f"{_SHARED_RULES}\n\n"
+            "EXAMPLE PATHS (illustrative; confirm against the live spec):\n"
+            "- /organizations/{org}/runs (list processes)\n"
+            "- /organizations/{org}/checklists/{template_id} (fetch template)\n"
+            "- /organizations/{org}/users/{user_id}/tasks (a user's tasks)\n"
+            "- /organizations/{org}/checklists/{template_id}/steps/{step_id}/captures "
+            "(step form fields)"
         ),
-        tags={"fallback", "generic", "advanced"},
+        tags={"fallback", "generic", "advanced", "read-only"},
         annotations=ToolAnnotations(
-            title="Universal Tallyfy API fallback",
+            title="Read any Tallyfy API endpoint",
+            readOnlyHint=True,
+            destructiveHint=False,
+            openWorldHint=True,
+            idempotentHint=True,
+        ),
+        output_schema=None,
+    )
+    @track_tool_execution("tallyfy_api_read")
+    @handle_tallyfy_errors("fallback API read")
+    async def tallyfy_api_read(
+        path: ApiCallPath,
+        query: ApiCallQuery = None,
+        method: ReadMethod = "GET",
+    ) -> ToolResult:
+        """Fallback: GET an arbitrary Tallyfy API endpoint."""
+        return await _execute(
+            tool_name="tallyfy_api_read",
+            method=method,
+            path=path,
+            body=None,
+            query=query,
+        )
+
+    @mcp.tool(
+        name="tallyfy_api_write",
+        description=(
+            "WRITE FALLBACK. Issues a POST, PUT, PATCH or DELETE against any "
+            "Tallyfy REST API endpoint when no specific tool fits. This tool "
+            "CHANGES OR DELETES DATA. To read, use tallyfy_api_read.\n\n"
+            "MANDATORY: call ask_user_question FIRST and confirm the exact "
+            "action with the user. Never issue a write without explicit "
+            "confirmation. Prefer a specific tool (create_*, update_*, "
+            "delete_*) whenever one matches.\n\n"
+            "The body argument is raw JSON for the endpoint; shape it per the "
+            "Tallyfy API docs. Every call here is audit-logged.\n\n"
+            f"{_SHARED_RULES}\n\n"
+            "EXAMPLE PATHS (illustrative; confirm against the live spec):\n"
+            "- POST /organizations/{org}/runs (launch a process)\n"
+            "- PUT /organizations/{org}/checklists/{template_id} (update a template)"
+        ),
+        tags={"fallback", "generic", "advanced", "write"},
+        annotations=ToolAnnotations(
+            title="Write to any Tallyfy API endpoint",
             readOnlyHint=False,
             destructiveHint=True,
             openWorldHint=True,
@@ -166,91 +321,19 @@ def register_api_fallback_tool(mcp):
         ),
         output_schema=None,
     )
-    @track_tool_execution("tallyfy_api_call")
-    @handle_tallyfy_errors("fallback API call")
-    async def tallyfy_api_call(
-        method: HttpMethod,
+    @track_tool_execution("tallyfy_api_write")
+    @handle_tallyfy_errors("fallback API write")
+    async def tallyfy_api_write(
+        method: WriteMethod,
         path: ApiCallPath,
         body: ApiCallBody = None,
         query: ApiCallQuery = None,
     ) -> ToolResult:
-        """Fallback: call an arbitrary Tallyfy API endpoint."""
-        if not _ENABLED:
-            raise ToolError(
-                "tallyfy_api_call is disabled. Set MCP_ENABLE_API_FALLBACK=true "
-                "to enable it for this deployment."
-            )
-
-        api_key, org_id = get_authenticated_credentials()
-        user_id = get_user_id_from_token()
-        method_u = method.upper()
-
-        # Substitute {org} before spec lookup so the template match works.
-        resolved_path = _substitute_path_params(path, org_id)
-
-        # Spec validation — loaded at startup; refreshed hourly.
-        # On-demand load as fallback: if the startup event didn't fire in time,
-        # refresh now (blocking this call once) rather than failing immediately.
-        if not SPEC_CACHE.is_loaded():
-            await SPEC_CACHE.refresh_once()
-        if not SPEC_CACHE.is_loaded():
-            raise ToolError(
-                "Tallyfy OpenAPI spec cache is not yet loaded. Retry in a moment."
-            )
-        endpoint = SPEC_CACHE.get_endpoint(method_u, resolved_path)
-        if endpoint is None:
-            raise ToolError(
-                f"No {method_u} {resolved_path} in Tallyfy OpenAPI spec. "
-                f"Paths are case-sensitive and include base path '/'. "
-                f"Confirm the endpoint exists at https://api.tallyfy.com/docs/index"
-            )
-
-        # Allowlist + scope gate.
-        gate = allowlist_check(method_u, resolved_path, jwt_scopes=())
-        if not gate.allowed:
-            if gate.reason == "blocked":
-                raise ToolError(
-                    f"Path {resolved_path} is in the block-list "
-                    "(/admin, /support, /oauth, /metrics, etc.)"
-                )
-            raise ToolError(
-                f"Access denied: {gate.reason}. Required scope: {gate.required_scope}"
-            )
-
-        # Issue the HTTP call.
-        url = f"{TALLYFY_API_BASE_URL}{resolved_path}"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "X-Tallyfy-Client": "APIClient",
-            "Accept": "application/json",
-        }
-        if body is not None and method_u in ("POST", "PUT", "PATCH"):
-            headers["Content-Type"] = "application/json"
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.request(
-                    method_u,
-                    url,
-                    headers=headers,
-                    json=body if method_u in ("POST", "PUT", "PATCH") else None,
-                    params=query,
-                )
-        except httpx.RequestError as e:
-            logger.warning("tallyfy_api_call network error: %s", e)
-            raise ToolError(f"Network error calling Tallyfy API: {e}") from e
-
-        if gate.is_destructive:
-            _audit(
-                method=method_u,
-                path=resolved_path,
-                status=resp.status_code,
-                org_id=org_id,
-                user_id=user_id,
-                destructive=True,
-            )
-
-        return ToolResult(
-            content=_serialize_response(resp),
-            structured_content=None,
+        """Fallback: POST/PUT/PATCH/DELETE an arbitrary Tallyfy API endpoint."""
+        return await _execute(
+            tool_name="tallyfy_api_write",
+            method=method,
+            path=path,
+            body=body,
+            query=query,
         )

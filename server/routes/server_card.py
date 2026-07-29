@@ -72,8 +72,13 @@ _SERVER_CARD = {
         "tasks": False,
     },
     "summary": {
-        "toolCount": 108,
-        "toolCategories": 12,
+        # Kept static deliberately — Smithery's scanner reads this as a fixed
+        # document. Drift is prevented by a test, not by computing it here:
+        # tests/unit/server/routes/test_server_card.py asserts these values
+        # against routes.capabilities.category_breakdown(), which counts the
+        # tools each module actually registers. Update both or neither.
+        "toolCount": 109,
+        "toolCategories": 14,
         "categories": [
             "user_management",
             "task_management",
@@ -87,6 +92,8 @@ _SERVER_CARD = {
             "tag_management",
             "folder_management",
             "user_interaction",
+            "template_mapping_validation",
+            "api_fallback",
         ],
     },
 }

@@ -1,4 +1,6 @@
-"""Allowlist + block-list gating for ``tallyfy_api_call``.
+"""Allowlist + block-list gating for the API fallback tools.
+
+``tallyfy_api_read`` and ``tallyfy_api_write`` both route through this gate.
 
 Policy:
 - **Block-list is ABSOLUTE**: any path matching a block pattern is rejected

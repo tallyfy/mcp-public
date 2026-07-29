@@ -34,7 +34,7 @@ Transport is streamable HTTP and authentication is OAuth against your Tallyfy ac
 
 ## What it can do
 
-108 tools across the Tallyfy domain, grouped by area:
+109 tools across the Tallyfy domain, grouped by area:
 
 | Area | Examples |
 |------|----------|
@@ -45,6 +45,7 @@ Transport is streamable HTTP and authentication is OAuth against your Tallyfy ac
 | Automation | inspect and manage automated actions / rules |
 | People & access | users, groups, guests, organization membership |
 | Organization | tags, folders, comments, search across the org |
+| API fallback | read from or write to any Tallyfy REST endpoint that has no dedicated tool |
 
 Every tool calls the public Tallyfy API on behalf of the authenticated user. There are no write operations the signed-in user could not perform in the Tallyfy app directly.
 

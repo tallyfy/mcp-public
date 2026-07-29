@@ -248,7 +248,7 @@ for _mcp_alias in ('/mcp', '/mcp/'):
 
 
 # Kick off the Tallyfy OpenAPI spec refresh at ASGI startup.
-# Background task will refresh hourly; ``tallyfy_api_call`` depends on this.
+# Background task will refresh hourly; the API fallback tools depend on this.
 async def _start_spec_cache():
     try:
         await SPEC_CACHE.start_refresh_task()

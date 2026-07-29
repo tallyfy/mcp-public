@@ -5,8 +5,9 @@ every ``_REFRESH_SECONDS`` seconds in the background. Exposes helpers
 for path-template matching (so ``/organizations/ABC/custom-branding``
 is matched to the spec path ``/organizations/{org}/custom-branding``).
 
-Used by the universal API fallback tool (``tallyfy_api_call``) to
-validate paths against what the live Tallyfy API actually exposes.
+Used by the universal API fallback tools (``tallyfy_api_read`` and
+``tallyfy_api_write``) to validate paths against what the live Tallyfy
+API actually exposes.
 
 Graceful degradation:
 - If the initial fetch fails at startup, we start with an empty spec

@@ -450,7 +450,7 @@ REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'st
 
     @mcp.tool(
         name="archive_process",
-        description="Archive a completed process (run). REQUIRED: 'run_id' (32-char hex). CAUTION: Archived processes are HIDDEN from default views but NOT deleted — all data, tasks, comments, and form-field captures are preserved. Use reactivate_process(run_id) to restore an archived process to active status. To permanently delete a process you must use the universal API fallback (tallyfy_api_call) since no first-class delete tool is exposed. Archived processes can be retrieved via get_organization_runs(archived='only'). Never call this without run_id.",
+        description="Archive a completed process (run). REQUIRED: 'run_id' (32-char hex). CAUTION: Archived processes are HIDDEN from default views but NOT deleted — all data, tasks, comments, and form-field captures are preserved. Use reactivate_process(run_id) to restore an archived process to active status. To permanently delete a process you must use the universal write fallback (tallyfy_api_write) since no first-class delete tool is exposed. Archived processes can be retrieved via get_organization_runs(archived='only'). Never call this without run_id.",
         tags={"processes", "workflow", "runs", "write", "archive"},
         annotations=ToolAnnotations(
             title="Archive process",
