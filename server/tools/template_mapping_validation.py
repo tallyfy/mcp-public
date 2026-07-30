@@ -182,6 +182,17 @@ Returns: {valid: bool, errors: [str], warnings: [str], summary: {steps, kickoff_
             readOnlyHint=True,
             destructiveHint=False,
             idempotentHint=True,
+            # False, and stated explicitly rather than left to default: this
+            # tool makes no network calls at all, so its domain really is
+            # closed. Omitting a hint is NOT the same as declaring it False.
+            # OpenAI's submission portal HARD-BLOCKS the MCP step on any tool
+            # that does not declare all three of readOnlyHint, destructiveHint
+            # and openWorldHint: "validate_template_mapping did not include an
+            # annotation for openWorldHint. Add the annotation in the MCP
+            # server metadata, then rescan before submitting." This was the
+            # only one of 109 tools missing any annotation, and on its own it
+            # blocked the entire ChatGPT directory submission. See #568.
+            openWorldHint=False,
         ),
         output_schema=None,
     )
