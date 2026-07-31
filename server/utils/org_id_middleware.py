@@ -3,7 +3,9 @@ Organization ID Middleware
 Extracts org_id from request headers and stores it per-user for session persistence.
 
 Implements RFC 6750 Bearer Token error responses with WWW-Authenticate headers
-for OAuth 2.1 compatibility with ChatGPT and other MCP clients.
+for OAuth 2.1 compatibility with ChatGPT and other MCP clients, including the
+RFC 9728 section 5.1 `resource_metadata` pointer the MCP authorization spec
+requires on a 401.
 """
 
 import logging
@@ -32,24 +34,54 @@ WELL_KNOWN_ENDPOINTS = {"/.well-known/oauth-protected-resource", "/.well-known/o
 # Supported org_id header names (lowercase bytes)
 ORG_ID_HEADERS = {b'x-organization-id', b'x-org-id', b'organization-id', b'org-id', b'x-tallyfy-org-id'}
 
+# Path of the RFC 9728 Protected Resource Metadata document served by
+# routes/oauth.py. Kept here as well so the 401 challenge and the route that
+# answers it can never drift apart.
+PROTECTED_RESOURCE_METADATA_PATH = "/.well-known/oauth-protected-resource"
+
+
+def protected_resource_metadata_url() -> str:
+    """Absolute URL of this server's RFC 9728 Protected Resource Metadata document.
+
+    Built from ``MCP_RESOURCE_URL`` (the canonical identifier for this resource),
+    which is also what the ``realm`` carries. The Cloud Run mirror pins the same
+    canonical URL, so both deployments advertise one discovery document.
+    """
+    return f"{MCP_RESOURCE_URL.rstrip('/')}{PROTECTED_RESOURCE_METADATA_PATH}"
+
 
 def build_www_authenticate_header(
     error: str = "invalid_token",
     error_description: str = None,
-    scope: str = None
+    scope: str = None,
+    resource_metadata: str = None,
 ) -> str:
     """
     Build RFC 6750 compliant WWW-Authenticate header for Bearer token errors.
+
+    The challenge also carries the RFC 9728 section 5.1 ``resource_metadata``
+    parameter. The MCP authorization spec requires it on a 401 so a client can
+    discover which authorization server issues tokens for this resource instead
+    of guessing at well-known paths.
 
     Args:
         error: One of: invalid_request, invalid_token, insufficient_scope
         error_description: Human-readable error description
         scope: Required scope(s) if error is insufficient_scope
+        resource_metadata: Absolute URL of the Protected Resource Metadata
+            document. Defaults to this server's own document. Pass an empty
+            string to omit the parameter.
 
     Returns:
         WWW-Authenticate header value
     """
     parts = [f'Bearer realm="{MCP_RESOURCE_URL}"']
+
+    if resource_metadata is None:
+        resource_metadata = protected_resource_metadata_url()
+
+    if resource_metadata:
+        parts.append(f'resource_metadata="{resource_metadata}"')
 
     if error:
         parts.append(f'error="{error}"')

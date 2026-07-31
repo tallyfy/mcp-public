@@ -33,7 +33,7 @@ from tools.api_fallback import register_api_fallback_tool
 from tools.template_mapping_validation import register_template_mapping_validation_tools
 from utils.org_id_middleware import OrgIdMiddleware
 from utils.tallyfy_spec_cache import SPEC_CACHE
-from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ENFORCE_AUDIENCE
+from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ENFORCE_AUDIENCE, SERVER_VERSION
 
 # Load environment variables from .env file
 load_dotenv()
@@ -185,8 +185,19 @@ Tallyfy steps are sequential. To model parallel paths from a flowchart, use visi
 For docs or help: https://tallyfy.com/products/pro/integrations/mcp-server/
 """
 
+# `version=` is NOT optional in practice. FastMCP's constructor does
+#     version=_coerce_version(version) or fastmcp.__version__
+# (fastmcp/server/server.py), and that value becomes `serverInfo.version` in
+# the MCP `initialize` response. Omitting it therefore published the FRAMEWORK
+# version as ours: a live initialize against production returned
+# `serverInfo.version: "3.4.2"` while server.json declared 1.1.2. Every MCP
+# client, every directory reviewer, and our own tool manifest saw the wrong
+# number. SERVER_VERSION (server/constants.py) is the single source of truth;
+# server.json and the server card are pinned to it by
+# tests/unit/server/test_server_version.py. See #654.
 mcp = FastMCP(
     "Tallyfy MCP Server",
+    version=SERVER_VERSION,
     auth=auth_handler,
     instructions="",
     website_url="https://tallyfy.com/products/pro/integrations/mcp-server/"

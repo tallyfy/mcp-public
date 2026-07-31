@@ -203,11 +203,31 @@ FASTMCP_SETTINGS = {
 # Server Metadata
 # ============================================================================
 
-# Server version (used in Prometheus metrics, the server card, and server.json).
-# Keep this in step with server.json — the MCP registry reads that file, and the
-# three copies had already drifted (server.json 1.0.1 vs 1.0.0 here and in the
-# server card) before they were reconciled. server_card.py now imports this
-# rather than repeating the literal.
+# THE single source of truth for the server's own version.
+#
+# Everything the server reports reads THIS constant: the MCP `initialize`
+# handshake (server.py passes it as FastMCP's `version=`), the static server
+# card (routes/server_card.py), and the Prometheus build-info label
+# (metrics.py). The repo-root server.json, the record the MCP Registry
+# publishes, is pinned to it by tests/unit/server/test_server_version.py, so
+# the two cannot drift into a merge.
+#
+# server.json is deliberately NOT the runtime source: it lives at the repo
+# root, while the server image is built with `server/` as its Docker context
+# (`build: .` + `COPY . .`), so the file is not present in the running
+# container. A runtime read would fall back exactly where accuracy matters
+# most. Bump this constant and server.json in the same commit.
+#
+# Do not drop `version=` from the FastMCP(...) call. FastMCP substitutes its
+# OWN package version when the argument is omitted, which is how production
+# came to advertise `serverInfo.version: "3.4.2"` (the framework) instead of
+# 1.1.2 (us). See #654.
+#
+# History: server.json 1.0.1 vs 1.0.0 here and in the server card had already
+# drifted once before, which is why server_card.py imports this rather than
+# repeating the literal.
+#
+# Changelog:
 # 1.1.0: launch_process prerun/roles now take an ID-keyed object, a breaking
 # change to the advertised tool schema.
 # 1.1.1: contract-correctness bug fixes (no tool-count change) - stop
