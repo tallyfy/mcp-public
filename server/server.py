@@ -14,7 +14,7 @@ from fastmcp import FastMCP
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from sentry_config import init_sentry_server
-from utils.tallyfy_auth_provider import TallyfyAuthProvider
+from utils.tallyfy_auth_provider import build_auth_provider
 from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware
 from routes import register_all_routes
 from tools.user_management import register_user_management_tools
@@ -33,7 +33,7 @@ from tools.api_fallback import register_api_fallback_tool
 from tools.template_mapping_validation import register_template_mapping_validation_tools
 from utils.org_id_middleware import OrgIdMiddleware
 from utils.tallyfy_spec_cache import SPEC_CACHE
-from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ENFORCE_AUDIENCE, SERVER_VERSION
+from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ENFORCE_AUDIENCE, SERVER_VERSION
 
 # Load environment variables from .env file
 load_dotenv()
@@ -102,37 +102,30 @@ for logger_name, level_name in SUPPRESSED_LOGGERS.items():
 # - Org ID extracted via OrgIdMiddleware
 # - Tools use get_authenticated_credentials() for credentials
 
-# Get Tallyfy public key for JWT validation
-public_key = TALLYFY_PUBLIC_KEY
-if not public_key:
-    raise ValueError("TALLYFY_PUBLIC_KEY environment variable is required")
-
-# Validate public key format at startup to catch configuration errors early
-try:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.backends import default_backend
-
-    serialization.load_pem_public_key(
-        public_key.encode('utf-8'),
-        backend=default_backend()
-    )
-except ImportError:
-    logging.warning("cryptography library not available; skipping public key format validation")
-except (ValueError, TypeError) as e:
-    raise ValueError(
-        f"TALLYFY_PUBLIC_KEY is not a valid PEM-encoded RSA public key: {e}"
-    ) from e
-
-# Create custom auth handler with audience verification
-# This validates:
-# - JWT signature (RS256 with Tallyfy public key)
+# Resolve the RS256 verification key and build the auth handler.
+#
+# Every request to an MCP tool is authenticated, in all configurations. What
+# changes here is only WHERE the verification key comes from:
+#   - TALLYFY_PUBLIC_KEY set   -> that pinned key (production; a malformed value raises)
+#   - unset                    -> Tallyfy's published JWKS, fetched lazily over TLS
+#                                 from the same TALLYFY_JWKS_BASE that
+#                                 routes/oauth.py already proxies
+#   - neither resolvable       -> a verifier that rejects every token
+#
+# Startup no longer depends on the key being present, which is what lets a fresh
+# clone of the public mirror build, boot, and answer /health without credentials
+# (#657). It does NOT let such a deployment reach Tallyfy data: an unverifiable
+# token is rejected exactly as an invalid one is.
+#
+# The handler validates:
+# - JWT signature (RS256 with Tallyfy's public key)
 # - Token expiration
-# - Issuer
 # - MCP resource claim (MCP_JWT_AUDIENCE) - enforced if ENFORCE_JWT_AUDIENCE=true
-auth_handler = TallyfyAuthProvider(
-    public_key=public_key,
+auth_handler = build_auth_provider(
+    public_key=TALLYFY_PUBLIC_KEY,
     expected_audience=MCP_JWT_AUDIENCE,
     expected_issuer=TALLYFY_ISSUER,
+    jwks_uri=TALLYFY_JWKS_URI,
 )
 
 # Create MCP server with explicit capability declaration and server metadata

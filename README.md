@@ -53,16 +53,24 @@ Every tool calls the public Tallyfy API on behalf of the authenticated user. The
 
 ## Run it yourself
 
-You can build and run the server from this mirror with Docker:
+You can build and run the server from this mirror with Docker. No configuration is required to start it:
 
 ```bash
 cd server
-cp ../.env.example .env      # then fill in the values you need
 docker build -t tallyfy-mcp-server .
-docker run --rm -p 9000:9000 --env-file .env tallyfy-mcp-server
+docker run --rm -p 9000:9000 tallyfy-mcp-server
+curl http://localhost:9000/health      # {"status":"healthy"}
 ```
 
-The server listens on port `9000` and speaks streamable HTTP at `/`. See [`.env.example`](./.env.example) for configuration. Python 3.11 is required if you prefer to run it without Docker (`pip install -r server/requirements.txt`, then `uvicorn server:app` from inside `server/`).
+The server listens on port `9000` and speaks streamable HTTP at `/` (and at `/mcp`). Python 3.13 is required if you prefer to run it without Docker (`pip install -r server/requirements.txt`, then `uvicorn server:app` from inside `server/`).
+
+To configure it, copy [`.env.example`](./.env.example) to `.env` and pass it with `--env-file .env`. Every value in there is optional; the defaults point at Tallyfy production.
+
+### About authentication
+
+Every MCP request needs a Tallyfy-issued OAuth 2.1 bearer token (RS256). The server verifies that signature on every call, so an unauthenticated client gets a `401` challenge and reaches no Tallyfy data. Only `/health` and the OAuth discovery documents are open.
+
+The verification key is resolved for you. Left alone, the server reads Tallyfy's published JWKS at `https://account.tallyfy.com/.well-known/jwks.json` and picks up key rotations automatically. Set `TALLYFY_PUBLIC_KEY` to a PEM public key if you would rather pin it and avoid the network lookup. If neither source resolves, the server still starts, and rejects every token.
 
 ## Listed on
 

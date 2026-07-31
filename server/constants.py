@@ -25,7 +25,15 @@ TALLYFY_API_BASE_URL = os.getenv("TALLYFY_API_BASE_URL", "https://api.tallyfy.co
 
 INTERNAL_API_KEY = os.getenv('INTERNAL_API_KEY')
 
+# PEM-encoded RS256 public key used to verify Tallyfy-issued JWTs.
+# Optional: when unset, the server verifies against the issuer's published JWKS
+# instead (see utils/tallyfy_auth_provider.build_auth_provider). Setting it pins
+# the key and removes the runtime network dependency, which is what production does.
 TALLYFY_PUBLIC_KEY = os.getenv('TALLYFY_PUBLIC_KEY')
+
+# Optional override for the JWKS document used when TALLYFY_PUBLIC_KEY is unset.
+# Defaults to {TALLYFY_ISSUER}/.well-known/jwks.json.
+TALLYFY_JWKS_URI = os.getenv('TALLYFY_JWKS_URI')
 
 ENFORCE_AUDIENCE = os.getenv("ENFORCE_JWT_AUDIENCE", "false").lower()
 

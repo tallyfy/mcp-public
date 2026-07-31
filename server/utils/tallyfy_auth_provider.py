@@ -10,6 +10,12 @@ Note: Tallyfy's authorization server does not include an 'iss' claim in JWT payl
 Token authenticity is guaranteed by RS256 signature verification — only Tallyfy holds
 the private key that corresponds to the configured public key.
 
+Key resolution (see `build_auth_provider` below): the RS256 verification key comes
+from `TALLYFY_PUBLIC_KEY` when it is set, and otherwise from Tallyfy's published
+JWKS document at `{TALLYFY_JWKS_BASE}/.well-known/jwks.json`. Either way a token
+must carry a valid RS256 signature; there is no mode in which an unsigned or
+unverifiable token is accepted.
+
 IMPORTANT: The standard JWT `aud` claim is owned by Laravel Passport and must remain
 the integer OAuth client ID. The MCP resource identifier is carried in the custom
 `mcp_resource` claim instead. See tallyfy/api-v2#9089 for the full rationale.
@@ -26,11 +32,19 @@ import logging
 import threading
 import time
 from collections import OrderedDict
+from urllib.parse import urlparse
 import jwt
 from typing import Optional, Dict, List, Union
 from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.auth import TokenVerifier
 from mcp.server.auth.provider import AccessToken
-from constants import MCP_JWT_AUDIENCE, TALLYFY_ENVIRONMENT, TALLYFY_ISSUER, ENFORCE_AUDIENCE
+from constants import (
+    MCP_JWT_AUDIENCE,
+    TALLYFY_ENVIRONMENT,
+    TALLYFY_ISSUER,
+    TALLYFY_JWKS_BASE,
+    ENFORCE_AUDIENCE,
+)
 from metrics import record_jwt_validation
 logger = logging.getLogger(__name__)
 
@@ -79,20 +93,29 @@ class TallyfyAuthProvider(JWTVerifier):
 
     def __init__(
         self,
-        public_key: str,
+        public_key: Optional[str] = None,
         expected_audience: Optional[Union[str, List[str]]] = None,
         expected_issuer: Optional[str] = None,
+        jwks_uri: Optional[str] = None,
         **kwargs
     ):
         """
         Initialize the auth provider.
 
+        Exactly one key source must be given, and the parent JWTVerifier enforces
+        that: it raises if both `public_key` and `jwks_uri` are missing, and also
+        if both are supplied. There is no keyless construction.
+
         Args:
-            public_key: RSA public key for JWT signature verification
+            public_key: PEM-encoded RSA public key for JWT signature verification
             expected_audience: Expected MCP resource value. If None, uses MCP_JWT_AUDIENCE
             expected_issuer: Expected issuer for the JWT. If None, uses TALLYFY_ISSUER
+            jwks_uri: URL of Tallyfy's JWKS document, used instead of `public_key`.
+                Keys are fetched lazily on the first token verification (never at
+                construction), so a server configured this way still starts offline
+                and simply rejects every token until the JWKS can be read.
         """
-        super().__init__(public_key=public_key, **kwargs)
+        super().__init__(public_key=public_key, jwks_uri=jwks_uri, **kwargs)
         self.expected_audience = expected_audience or MCP_JWT_AUDIENCE
         self.expected_issuer = expected_issuer or TALLYFY_ISSUER
 
@@ -174,6 +197,181 @@ class TallyfyAuthProvider(JWTVerifier):
         record_jwt_validation('success')
         return access_token
 
+
+class NoVerificationKeyVerifier(TokenVerifier):
+    """Fail-closed verifier used when no RS256 verification key can be resolved.
+
+    This exists so the process can START without a key, not so it can WORK
+    without one. It rejects every bearer token unconditionally, which is
+    strictly more restrictive than a configured verifier: there is no code
+    path through this class that can return an AccessToken. A deployment that
+    lands here can serve `/health` and the unauthenticated OAuth discovery
+    routes, and nothing else - every MCP request is answered with the usual
+    401 challenge, so no Tallyfy data is reachable.
+
+    Reached only when `TALLYFY_PUBLIC_KEY` is unset AND no usable https JWKS
+    URL can be derived from the configured base. See `build_auth_provider`.
+    """
+
+    def __init__(self, reason: str, **kwargs):
+        super().__init__(**kwargs)
+        self.reason = reason
+        self._warned = False
+
+    async def verify_token(self, token: str) -> Optional[AccessToken]:
+        """Reject every token. Never returns an AccessToken."""
+        if not self._warned:
+            # Log the cause once per process; the per-request path stays quiet
+            # so a scanner cannot flood the logs.
+            logger.error(
+                "Rejecting all bearer tokens: no JWT verification key is configured (%s). "
+                "Set TALLYFY_PUBLIC_KEY, or point TALLYFY_JWKS_BASE (or TALLYFY_JWKS_URI) "
+                "at an https:// location that publishes /.well-known/jwks.json.",
+                self.reason,
+            )
+            self._warned = True
+        record_jwt_validation('failed')
+        return None
+
+
+def https_url_or_none(url: Optional[str]) -> Optional[str]:
+    """Return the stripped URL when it is a usable https URL, else None.
+
+    Every URL we would fetch signing keys from goes through here, whether it was
+    derived from a base or handed to us whole. Fetching a key over plaintext http
+    would let a network attacker substitute their own key and mint tokens we would
+    then accept, so a non-https URL is refused and the caller falls back to
+    rejecting every token.
+    """
+    if not url:
+        return None
+    candidate = url.strip()
+    try:
+        parsed = urlparse(candidate)
+    except ValueError:
+        return None
+    if parsed.scheme != "https" or not parsed.netloc:
+        return None
+    return candidate
+
+
+def derive_jwks_uri(base: Optional[str]) -> Optional[str]:
+    """Derive a JWKS URL from a base origin, or None when it cannot be trusted.
+
+    Returns ``{base}/.well-known/jwks.json`` - the location Tallyfy's own
+    OAuth authorization-server metadata advertises, the one api-v2's
+    ``MCP\\OAuthController::jwks`` serves, and the same URL this server's own
+    ``routes/oauth.py`` already proxies.
+
+    Only ``https`` bases are accepted, per :func:`https_url_or_none`.
+    """
+    checked = https_url_or_none(base)
+    if not checked:
+        return None
+    return f"{checked.rstrip('/')}/.well-known/jwks.json"
+
+
+def build_auth_provider(
+    public_key: Optional[str] = None,
+    expected_audience: Optional[Union[str, List[str]]] = None,
+    expected_issuer: Optional[str] = None,
+    jwks_uri: Optional[str] = None,
+    jwks_base: Optional[str] = None,
+) -> TokenVerifier:
+    """Build the server's token verifier from whatever key material is available.
+
+    Resolution order, most explicit first:
+
+    1. ``TALLYFY_PUBLIC_KEY`` - the production configuration. A key that is set
+       but malformed raises, because a typo in a configured key is an operator
+       error that should be loud rather than silently downgraded.
+    2. An explicit ``TALLYFY_JWKS_URI``, else ``{jwks_base}/.well-known/jwks.json``.
+       BOTH must be https: an override that skipped that check would reopen the
+       plaintext-MITM hole through a different env var, so a non-https override
+       drops straight to branch 3 rather than being ignored or substituted.
+       ``jwks_base`` defaults to ``TALLYFY_JWKS_BASE``, which is already
+       environment-aware and is already what ``routes/oauth.py`` proxies for the
+       same document, so the verifier and the proxy cannot disagree about where
+       Tallyfy's keys live. Signature verification is unchanged; the key is
+       simply fetched over TLS instead of being pasted into the environment.
+       Nothing is fetched at construction, so this cannot block or fail startup.
+    3. :class:`NoVerificationKeyVerifier` - rejects every token.
+
+    Every branch verifies an RS256 signature or refuses the token. None of them
+    disables authentication, and none of them accepts an unsigned token.
+    """
+    if public_key:
+        _assert_pem_public_key(public_key)
+        return TallyfyAuthProvider(
+            public_key=public_key,
+            expected_audience=expected_audience,
+            expected_issuer=expected_issuer,
+        )
+
+    # An explicit override must clear the SAME https bar as a derived URL.
+    # Skipping it here would reopen the plaintext-MITM hole the derivation
+    # closes, just through a different env var.
+    #
+    # Bugbot's autofix for this finding zeroed the override and fell through to
+    # the derived base. That is equally safe against the MITM, but it silently
+    # swaps in a DIFFERENT key document than the operator named, and this file
+    # already sets the opposite precedent one branch up: a TALLYFY_PUBLIC_KEY
+    # that is set but malformed raises rather than being quietly downgraded. So
+    # a set-but-unusable override refuses here too. The server still boots; it
+    # just authenticates nobody until the config is fixed.
+    if jwks_uri and not https_url_or_none(jwks_uri):
+        return NoVerificationKeyVerifier(
+            reason=f"TALLYFY_JWKS_URI {jwks_uri!r} is not an https URL"
+        )
+
+    resolved_jwks_uri = https_url_or_none(jwks_uri) or derive_jwks_uri(
+        jwks_base or TALLYFY_JWKS_BASE or expected_issuer or TALLYFY_ISSUER
+    )
+    if resolved_jwks_uri:
+        logger.warning(
+            "TALLYFY_PUBLIC_KEY is not set. Falling back to Tallyfy's published "
+            "JWKS at %s for RS256 verification. Tokens are still signature-verified; "
+            "if that document cannot be fetched, every token is rejected. Set "
+            "TALLYFY_PUBLIC_KEY to pin the key and remove the network dependency.",
+            resolved_jwks_uri,
+        )
+        return TallyfyAuthProvider(
+            jwks_uri=resolved_jwks_uri,
+            expected_audience=expected_audience,
+            expected_issuer=expected_issuer,
+        )
+
+    return NoVerificationKeyVerifier(
+        reason=f"TALLYFY_PUBLIC_KEY unset and no https JWKS URL derivable from "
+               f"base {jwks_base or TALLYFY_JWKS_BASE or expected_issuer or TALLYFY_ISSUER!r}"
+    )
+
+
+def _assert_pem_public_key(public_key: str) -> None:
+    """Raise ValueError unless `public_key` parses as a PEM public key.
+
+    Catches a truncated or mangled key at startup rather than on the first
+    request. Silently skipped when `cryptography` is unavailable, matching the
+    behaviour this check has had since it was introduced.
+    """
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.backends import default_backend
+    except ImportError:
+        logger.warning(
+            "cryptography library not available; skipping public key format validation"
+        )
+        return
+
+    try:
+        serialization.load_pem_public_key(
+            public_key.encode('utf-8'),
+            backend=default_backend()
+        )
+    except (ValueError, TypeError) as e:
+        raise ValueError(
+            f"TALLYFY_PUBLIC_KEY is not a valid PEM-encoded RSA public key: {e}"
+        ) from e
 
 
 def store_org_id_for_user(user_id: str, org_id: str) -> None:
