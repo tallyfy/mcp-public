@@ -84,10 +84,39 @@ def register_automation_tools(mcp):
         "not_empty": "is_not_empty",
     }
 
-    # Valid statement values for step operations (operation alone defines trigger).
+    # Step-condition operations. For these, `statement` is a TIME CLAUSE, not a
+    # value to compare against — the operation alone names the event.
     _STEP_OPERATIONS = {
         "completed", "reopened", "approved", "rejected",
         "acknowledged", "expired", "not_assigned",
+    }
+
+    # The four time clauses api-v2 switches on. StepCondition::timeClauseFulfilled()
+    # returns false for anything it does not recognise — INCLUDING null — so a step
+    # condition with no statement is permanently unsatisfiable and its automation
+    # silently never fires (mcp#571, api-v2#9636). The web UI writes the 'any_time'
+    # sentinel into every step condition it creates; we emit the same thing so an
+    # API-built automation behaves identically to a hand-built one.
+    _STEP_STATEMENT_ANY_TIME = "any_time"
+    _STEP_TIME_CLAUSES = {"any_time", "on-time", "early_24", "late_24"}
+
+    # Pure spelling variants only. Deliberately NOT mapped: bare "early"/"late",
+    # which could mean either the 24-hour clause or simply before/after the
+    # deadline — an ambiguity we pass through rather than guess at.
+    _STEP_TIME_CLAUSE_ALIASES = {
+        "on_time": "on-time",
+        "ontime": "on-time",
+        "early-24": "early_24",
+        "early24": "early_24",
+        "late-24": "late_24",
+        "late24": "late_24",
+    }
+
+    # What an LLM sends when it means "no time restriction" — usually by echoing
+    # the operation into the statement slot.
+    _STEP_ANY_TIME_SYNONYMS = {
+        "", "any", "anytime", "always", "complete", "completed",
+        "done", "true", "yes", "none", "null",
     }
 
     # Map LLM-guessed action_type to API-expected values.
@@ -304,15 +333,26 @@ def register_automation_tools(mcp):
                 if resolved_op:
                     cond["operation"] = resolved_op
 
-            # For step operations, statement must be a scalar or null.
-            # LLMs often send "complete"/"any_time" — clear to null if nonsensical.
+            # For step operations, `statement` is the TIME CLAUSE. Emit the
+            # 'any_time' sentinel the web UI emits rather than null: api-v2's
+            # StepCondition::timeClauseFulfilled() falls through to false on a
+            # null statement, which makes the whole condition unsatisfiable and
+            # the automation silently never fires. This normalizer used to clear
+            # 'any_time' TO null, which is what produced 162 dead conditions for
+            # one customer (mcp#571).
             final_op = cond.get("operation", "")
             if final_op in _STEP_OPERATIONS:
                 stmt = cond.get("statement")
-                if isinstance(stmt, str) and stmt.lower() in (
-                    "complete", "any_time", "any", "true", "yes", "done",
-                ):
-                    cond["statement"] = None
+                normalized = str(stmt).strip().lower() if stmt is not None else ""
+
+                if normalized in _STEP_TIME_CLAUSES:
+                    cond["statement"] = normalized
+                elif normalized in _STEP_TIME_CLAUSE_ALIASES:
+                    cond["statement"] = _STEP_TIME_CLAUSE_ALIASES[normalized]
+                elif normalized in _STEP_ANY_TIME_SYNONYMS:
+                    cond["statement"] = _STEP_STATEMENT_ANY_TIME
+                # Anything else passes through untouched — api-v2 stays the
+                # authority on values we cannot prove we understand.
 
             # 'conditions.*.statement' => 'present' in AutomatedActionRequest.
             # Laravel's `present` requires the KEY to exist (null is fine), so a
