@@ -19,6 +19,7 @@ from utils.fastmcp_types import (
     CommentId,
     GenericList,
     GenericDict,
+    OptionalProcessId,
     OptionalString,
     UserIdList,
 )
@@ -304,6 +305,9 @@ def register_comment_management_tools(mcp):
 REQUIRED: 'task_id' (32-char hex).
 Optional: 'run_id' (32-char hex process ID) — provide it if you have it to avoid an extra lookup.
 
+'run_id' identifies the PROCESS the task belongs to, so it is a DIFFERENT id from 'task_id'.
+If you only have the task id, omit 'run_id' entirely rather than repeating the task id there.
+
 If run_id is omitted, it is resolved automatically from the task. Never call this without task_id.""",
         tags=["tasks", "comments", "threads", "read-only", "collaboration"],
         annotations=ToolAnnotations(
@@ -317,19 +321,36 @@ If run_id is omitted, it is resolved automatically from the task. Never call thi
     )
     @track_tool_execution("get_task_comments")
     @handle_tallyfy_errors("get task comments")
-    def get_task_comments(task_id: TaskId, run_id: OptionalString = None) -> GenericList:
+    def get_task_comments(task_id: TaskId, run_id: OptionalProcessId = None) -> GenericList:
         """
         Get all comments on a specific task.
 
         Args:
             task_id: Task ID to retrieve comments for (REQUIRED - 32-character hex string)
-            run_id: Process (run) ID the task belongs to — optional. If omitted, resolved
-                automatically via a task lookup (costs one extra API call).
+            run_id: Process (run) ID the task belongs to. Optional. If omitted, resolved
+                automatically via a task lookup (costs one extra API call). Passing the
+                task id here is treated as if run_id had been omitted (see #696).
 
         Returns:
             List of comment objects with content, author, and timestamps
         """
         api_key, org_id = get_authenticated_credentials()
+
+        # #696: a caller that supplies the SAME value for both is telling us it has one id,
+        # not two. This is the ONLY comment tool that forwards run_id into a URL path
+        # (organizations/{org}/runs/{run_id}/tasks/{task_id}), so a task id in the run slot
+        # produces a legitimate 404 that reaches the user as "Resource not found". Treating
+        # the duplicate as absent hands the call to the resolver below, which looks the real
+        # run_id up and lets the call SUCCEED. Recovering beats raising: the user gets their
+        # comments instead of an error they cannot act on.
+        if run_id is not None and run_id == task_id:
+            logger.info(
+                "get_task_comments: run_id matched task_id (%s), ignoring the duplicate "
+                "and resolving run_id from the task instead",
+                task_id,
+            )
+            run_id = None
+
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             resolved_run_id = run_id
             if not resolved_run_id:

@@ -5,7 +5,7 @@ Standardized error handling patterns for MCP tools
 
 import re
 from functools import wraps
-from typing import Any
+from typing import Any, Optional
 from fastmcp.exceptions import ToolError
 from tallyfy import TallyfyError
 import logging
@@ -161,6 +161,16 @@ def _extract_primary_message(error: TallyfyError) -> str:
     """
     response_data = getattr(error, "response_data", None)
 
+    # Same envelope unwrap as _extract_api_message. This is a no-op on every
+    # live 403 shape today (only the 409 seat gate nests its message), and is
+    # here so the two readers of response_data cannot drift apart: if api-v2
+    # ever nests a 403, a reader that saw no message would classify it as
+    # auth-style and re-append the misleading "re-authenticate" hint that #592
+    # removed.
+    envelope = _structured_error_envelope(response_data)
+    if envelope is not None and envelope.get("message"):
+        return _sanitize_api_error(envelope["message"])
+
     if isinstance(response_data, dict) and "message" in response_data:
         return _sanitize_api_error(response_data["message"])
 
@@ -192,6 +202,49 @@ def _is_auth_style_message(error: TallyfyError) -> bool:
     return any(marker in lowered for marker in _AUTH_STYLE_MARKERS)
 
 
+def _structured_error_envelope(response_data: Any) -> Optional[dict]:
+    """
+    Return api-v2's structured ``{"error": {...}}`` payload, or None.
+
+    Guarded rather than assumed: `error` is a common key and some responses
+    carry it as a bare string. Only a dict is an envelope.
+    """
+    if not isinstance(response_data, dict):
+        return None
+    envelope = response_data.get("error")
+    return envelope if isinstance(envelope, dict) else None
+
+
+# Codes whose ``details`` carry something the caller can act on. Keep this
+# narrow: a hint is only useful if it names the fix, and an unrecognised code
+# must fall through to the plain API message rather than guessing at one.
+_ACTIONABLE_ERROR_HINTS = {
+    # Allocated-seats billing v2 (api-v2 #9206). The org is at its committed
+    # seat cap, so the invite / role-change / enable was refused. `pool_type`
+    # says WHICH pool, which is the whole difference between "buy light seats"
+    # and "buy full seats".
+    "SEAT_POOL_EXHAUSTED": (
+        "The organization has no {pool_type} seats left in its committed pool. "
+        "An organization admin can purchase more seats in Settings > Billing, "
+        "or free one by disabling an existing {pool_type} member."
+    ),
+}
+
+
+def _structured_error_hint(envelope: dict) -> str:
+    """Build an actionable suffix for a recognised structured error code."""
+    template = _ACTIONABLE_ERROR_HINTS.get(envelope.get("code"))
+    if not template:
+        return ""
+
+    details = envelope.get("details")
+    details = details if isinstance(details, dict) else {}
+    # `pool_type` is documented as always present, but a hint that renders
+    # "no None seats left" is worse than a slightly vaguer one.
+    pool_type = details.get("pool_type") or "available"
+    return template.format(pool_type=pool_type)
+
+
 def _extract_api_message(error: TallyfyError) -> str:
     """
     Extract a clean, user-facing message from a TallyfyError.
@@ -202,10 +255,20 @@ def _extract_api_message(error: TallyfyError) -> str:
     If response_data contains a 'message' key, prefer that, and append the
     per-field ``errors`` block when present so the caller can self-correct.
 
+    api-v2's newer structured errors nest everything one level deeper, as
+    ``{"error": {"code", "message", "details"}}`` — the seat-pool gate
+    (SEAT_POOL_EXHAUSTED) is the first of these to reach a tool. A top-level
+    ``message`` lookup misses it entirely and falls through to the SDK's
+    generic "API request failed with status 409" string, so the human-readable
+    reason AND the actionable ``details`` are both discarded. Unwrap the
+    envelope generically rather than special-casing one code: every future
+    structured error inherits the fix.
+
     Internal system details (SQL queries, stack traces, file paths) are
     stripped before returning — the full error is already in logs/Sentry.
     """
     response_data = getattr(error, "response_data", None)
+    envelope = _structured_error_envelope(response_data)
 
     # The per-field ``errors`` block is the only part that names the offending
     # field, so it must survive regardless of which source supplies the message.
@@ -215,7 +278,12 @@ def _extract_api_message(error: TallyfyError) -> str:
     if isinstance(response_data, dict):
         field_errors = _format_field_errors(response_data.get("errors"))
 
-    if isinstance(response_data, dict) and "message" in response_data:
+    if envelope is not None and envelope.get("message"):
+        message = _sanitize_api_error(envelope["message"])
+        hint = _structured_error_hint(envelope)
+        if hint:
+            message = f"{message} {hint}"
+    elif isinstance(response_data, dict) and "message" in response_data:
         message = _sanitize_api_error(response_data["message"])
     else:
         # Strip the SDK's "API request failed with status NNN: " prefix
@@ -275,11 +343,18 @@ def handle_tallyfy_errors(operation_name: str):
                 #        how to fix it.
                 #   401/403: expired/invalid JWT tokens
                 #   404: resource was deleted (LLM referenced stale ID)
+                #   409: a business rule refused the write — currently the
+                #        allocated-seats gate (SEAT_POOL_EXHAUSTED, api-v2 #9206),
+                #        which fires whenever an org invites / promotes / enables
+                #        past its committed seat pool. That is the gate working as
+                #        designed, on customer-controlled state we cannot fix, so
+                #        every seat-capped org would otherwise page us on each
+                #        attempt. The user-facing message names the remedy.
                 #   422: request validation failed (e.g. missing field for approval task)
                 # These should not create Sentry issues. Only true server errors (5xx)
                 # and unexpected client errors are logged at ERROR.
                 status = getattr(e, "status_code", None)
-                if status in (400, 401, 403, 404, 422):
+                if status in (400, 401, 403, 404, 409, 422):
                     logger.warning(f"{operation_name} returned {status}: {e}")
                 else:
                     # Set Sentry tags so LoggingIntegration event has context

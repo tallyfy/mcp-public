@@ -76,12 +76,18 @@ GuestName = Annotated[str, Field(
 )]
 
 # Task-related types
+#
+# NOTE (#696): TaskId and ProcessId are structurally identical (32-char hex), so the
+# ONLY thing that tells an LLM them apart in the JSON Schema is the description and the
+# example. They shared the example value `a1b2c3d4e5f6789012345678901234ef` until #696,
+# which is one of the two reasons `get_task_comments` was being called with the task id
+# in the run_id slot. Keep these two example values DISTINCT.
 TaskId = Annotated[str, Field(
     min_length=32,
     max_length=32,
     description="Unique task identifier",
     pattern="^[a-f0-9]{32}$",
-    examples=["a1b2c3d4e5f6789012345678901234ef"]
+    examples=["f4a1c2b39e7d48a6b0c15e2d3f6a8b90"]
 )]
 
 # api-v2: CreateOneOffTaskRequest.php:19 / UpdateTasksRequest.php:61 -> 'max:600'
@@ -106,12 +112,41 @@ NaturalLanguageInput = Annotated[str, Field(
 )]
 
 # Process-related types
+# The example here MUST differ from TaskId's. See the note above TaskId (#696).
 ProcessId = Annotated[str, Field(
     min_length=32,
     max_length=32,
     description="Unique process (run) identifier",
     pattern="^[a-f0-9]{32}$",
-    examples=["a1b2c3d4e5f6789012345678901234ef"]
+    examples=["c7d8e9f0a1b2c3d4e5f60718293a4b5c"]
+)]
+
+# Optional counterpart to ProcessId (#696).
+#
+# Use this, never OptionalString, for an optional run/process id parameter. OptionalString
+# publishes `{"type": ["string","null"], "description": "Optional string parameter"}`, which
+# carries no format, no length and no semantics, so a model holding a task id will happily
+# put it in that slot. This annotation publishes the same 32-hex pattern as ProcessId plus a
+# description that says outright it is not the task id.
+#
+# The EMPTY STRING must stay valid, and that is not cosmetic. On develop this
+# parameter was OptionalString, so `run_id=""` was falsy, the #189 resolver ran
+# and the call succeeded. Adding `min_length=32` made Pydantic reject it before
+# the function body, and FastMCP validates the signature BEFORE the body runs,
+# so no in-body guard can rescue it. An LLM that emits "" rather than omitting
+# an optional field is common, so that would have broken a working path in the
+# name of tightening it. The pattern therefore permits empty or 32-hex, and
+# nothing in between; `max_length` alone bounds the length.
+OptionalProcessId = Annotated[Optional[str], Field(
+    default=None,
+    max_length=32,
+    pattern="^(?:[a-f0-9]{32})?$",
+    description=(
+        "Process (run) ID that the task belongs to, as a 32-character hex string. "
+        "This identifies the PROCESS, not the task: never pass the same value here "
+        "as task_id. Omit it entirely if you do not have it and it will be looked up."
+    ),
+    examples=["c7d8e9f0a1b2c3d4e5f60718293a4b5c"]
 )]
 
 # api-v2: CreateRunRequest.php:38 / UpdateRunRequest.php:26 -> 'string|max:550'
