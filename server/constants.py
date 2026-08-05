@@ -265,7 +265,30 @@ PYTHON_VERSION = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.versio
 SENTRY_ENABLED = os.getenv("SENTRY_ENABLED", "true").lower()
 SENTRY_DSN = os.getenv("SENTRY_DSN")
 SENTRY_ENVIRONMENT = os.getenv("SENTRY_ENVIRONMENT", 'production')
-SENTRY_RELEASE = os.getenv("SENTRY_RELEASE", "mcp-server-unknown")
+def _resolve_sentry_release() -> str:
+    """Build the Sentry release identifier, preferring the deployed commit.
+
+    ``MCP_GIT_SHA`` wins because it is the only input here that changes per
+    deploy. ``SENTRY_RELEASE`` lives in the droplet's env file, which nobody
+    edits: both MCP Sentry projects carried ``*@1.2.0`` from 2026-04-29 through
+    2026-08-05 across dozens of deploys, so no event could be attributed to the
+    deploy that caused it. Checking whether a fix had shipped meant SSHing to
+    the droplet and grepping the running container.
+
+    Order: MCP_GIT_SHA, then SENTRY_RELEASE verbatim, then the legacy default.
+    """
+    git_sha = (os.getenv("MCP_GIT_SHA") or "").strip()
+    if git_sha:
+        return f"mcp-server@{git_sha}"
+
+    env_release = (os.getenv("SENTRY_RELEASE") or "").strip()
+    if env_release:
+        return env_release
+
+    return "mcp-server-unknown"
+
+
+SENTRY_RELEASE = _resolve_sentry_release()
 # Errors-only Sentry mode: both rates default to 0.0 so no transactions, no
 # spans, no profile_duration units, no profiles reach Sentry. Only error
 # events (via LoggingIntegration / FastApiIntegration) flow. Env vars still

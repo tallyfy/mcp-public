@@ -10,6 +10,103 @@ from constants import SENTRY_ENABLED, SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_REL
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Exception-tree helpers.
+#
+# These exist because `ignore_errors` and any `exc_info[0].__name__` check are
+# both blind to an ExceptionGroup, and this server produces them routinely: an
+# ASGI/anyio task group wraps whatever its children raised.
+#
+# Measured, because the naive fix looks correct and does nothing. With
+# `ignore_errors=["ClientDisconnect"]` configured:
+#
+#     bare ClientDisconnect               -> 0 events   (suppressed)
+#     ExceptionGroup[ClientDisconnect]    -> 1 event    (NOT suppressed)
+#     unrelated RuntimeError              -> 1 event    (control)
+#
+# `Client._is_ignored_error` reads `exc_info[0]` only, which for a raised group
+# is the group itself. MCP-SERVER-5M arrives with
+# `mechanism.is_exception_group: true` and `ClientDisconnect` as a CHILD, so an
+# `ignore_errors` entry would never have matched it.
+# ---------------------------------------------------------------------------
+
+# Exception type names that are never actionable. Matched by name rather than by
+# import so this module does not have to import anyio or starlette just to build
+# a denylist, and so a dependency shuffle cannot turn a suppression into a
+# silent import error.
+NOISE_EXCEPTION_TYPES = frozenset({
+    # Client closed the browser tab, navigated away, or the tunnel dropped the
+    # connection mid-stream. Normal for an SSE server.
+    "ClientDisconnect",   # starlette.requests
+    "ClosedResourceError",  # anyio
+})
+
+
+def iter_exception_tree(exc):
+    """Yield ``exc`` and every exception nested inside it, groups included."""
+    seen = set()
+    stack = [exc]
+    found = []
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        stack.extend(getattr(current, "exceptions", None) or ())
+    return found
+
+
+def leaf_exceptions(exc):
+    """The exceptions that actually failed, with grouping containers removed.
+
+    An ``ExceptionGroup`` is packaging, not a fault, so it must not be the thing
+    a suppression decision is made about.
+    """
+    return [
+        e for e in iter_exception_tree(exc)
+        if not isinstance(e, BaseExceptionGroup)
+    ]
+
+
+def is_pure_noise(exc) -> bool:
+    """True only when EVERY leaf is a known-noise type.
+
+    Deliberately ``all`` rather than ``any``. A group carrying a real failure
+    alongside a disconnect is a real failure, and dropping it because one child
+    was noise would be a silent loss. An empty leaf list returns False, so an
+    exception shape this cannot decode stays visible.
+    """
+    leaves = leaf_exceptions(exc)
+    if not leaves:
+        return False
+    return all(type(e).__name__ in NOISE_EXCEPTION_TYPES for e in leaves)
+
+
+def is_unknown_tool_call(exc) -> bool:
+    """True when a client asked for a tool this server does not expose.
+
+    FastMCP raises ``NotFoundError`` from its own middleware chain, before any
+    of our decorators run, so nothing in `utils/fastmcp_errors.py` ever sees it
+    and it reaches Sentry as an unhandled-looking error. It is a CALLER fault
+    of exactly the class #694 says not to page on: an external client, usually
+    a directory listing that is out of date, calling a tool we removed.
+
+    Narrow on purpose. It matches only FastMCP's own ``NotFoundError`` carrying
+    an "Unknown tool" message, so a ``NotFoundError`` meaning "this template does
+    not exist" is untouched.
+    """
+    for e in leaf_exceptions(exc):
+        cls = type(e)
+        if cls.__name__ != "NotFoundError":
+            continue
+        if not (cls.__module__ or "").startswith("fastmcp"):
+            continue
+        if "unknown tool" in str(e).lower():
+            return True
+    return False
+
+
 def filter_metrics_transactions(event, hint):
     """
     Filter out /metrics endpoint transactions from Sentry.
@@ -117,13 +214,60 @@ def scrub_tool_arguments(event, hint):
         if "Error calling tool" in msg:
             return None
 
-    # Drop ClosedResourceError — raised by anyio when a client closes the
-    # browser tab or loses the connection mid-stream. This is expected noise
-    # in an SSE server; there are no DB/Redis clients in this codebase that
-    # could produce the same exception from a real error.
+    # Drop the uvicorn lifespan shutdown traceback. On SIGTERM uvicorn cancels
+    # the lifespan task, and Starlette's `lifespan` is sitting in `await
+    # receive()`, so the CancelledError unwinds through uvicorn's own error
+    # logger at ERROR level. It is what an orderly shutdown looks like.
+    #
+    # It is a LATENT path, not ongoing noise. Measured 2026-08-05: 2 events
+    # total, 6 seconds apart on 2026-07-21, both belonging to the single
+    # deploy that replaced the pre-#591 container; 28 successful staging
+    # deploys since produced none. So a quiet dashboard is not evidence this
+    # guard works. It is here because the shutdown path is unchanged.
+    #
+    # This has to be matched HERE rather than via `ignore_errors`, and the
+    # reason is not the ExceptionGroup problem above. MCP-SERVER-5Q carries
+    # `hasException: 0`: uvicorn formats the traceback into the log MESSAGE, so
+    # there is no `exc_info` in the hint for `ignore_errors` to inspect at all.
+    # Adding "CancelledError" to that list would change nothing.
+    #
+    # Deliberately narrow: uvicorn's logger, plus BOTH the lifespan frame and
+    # the CancelledError. A CancelledError from anywhere else, or any other
+    # uvicorn error, still reaches Sentry.
+    #
+    # Note the asymmetry with `host/sentry_config.py`, which DOES list
+    # "CancelledError" in `ignore_errors` (MCP-45). That is not copied here on
+    # purpose: it was added for the host's own `periodic_cleanup()` task, and a
+    # blanket cancellation filter on this process would also hide cancellations
+    # during real request handling.
+    if event.get("logger") == "uvicorn.error":
+        msg = (event.get("logentry") or {}).get("message") or event.get("message", "")
+        if "CancelledError" in msg and "in lifespan" in msg:
+            return None
+
+    # Drop client-disconnect noise: ClosedResourceError (anyio) and
+    # ClientDisconnect (starlette), raised when a client closes the tab or the
+    # connection drops mid-stream. Expected in an SSE server; no DB or Redis
+    # client in this codebase produces either from a real error.
+    #
+    # Walks the exception TREE rather than reading exc_info[0].__name__. The old
+    # check did the latter and is blind to an ExceptionGroup, which is the shape
+    # these actually arrive in: MCP-SERVER-5M carries
+    # `mechanism.is_exception_group: true` with ClientDisconnect as a child, so
+    # a name check on the outermost type never matches. `ignore_errors` has the
+    # identical blind spot, which is why this is here and not in that list.
     exc_info = hint.get("exc_info") if hint else None
-    if exc_info and exc_info[0] is not None:
-        if exc_info[0].__name__ == "ClosedResourceError":
+    raised = exc_info[1] if exc_info and len(exc_info) > 1 else None
+    if raised is not None:
+        if is_pure_noise(raised):
+            return None
+
+        # A client calling a tool this server does not expose is the caller's
+        # fault, not an outage. Dropped here rather than demoted because
+        # FastMCP raises it inside its own middleware, upstream of every
+        # decorator that could have lowered a log level. The signal is not lost:
+        # the call still fails for the caller and FastMCP still logs it.
+        if is_unknown_tool_call(raised):
             return None
 
     # Scrub tool arguments in extra context
