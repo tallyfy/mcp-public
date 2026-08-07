@@ -103,6 +103,62 @@ def serialize_dataclass(obj: Any, *, _sanitize: bool = True) -> Any:
     return serialized
 
 
+def compact_dict_list_field(
+    result: Dict[str, Any],
+    list_key: str,
+    *,
+    item_label: str = "items",
+) -> Dict[str, Any]:
+    """
+    Trim ``result[list_key]`` until the whole dict encodes under MAX_RESULT_BYTES.
+
+    Returns ``result`` unchanged when it already fits, when ``list_key`` is
+    missing or is not a list, or when the list is empty (nothing to trim, so a
+    ``_truncated`` marker would be a false statement).
+
+    Otherwise a binary search finds the longest prefix that fits WITH the
+    marker included in every trial, and the result gains
+    ``_truncated: "Showing N of M <item_label>"``. Every other key is preserved
+    verbatim, which is what lets a caller keep a true total (e.g. the fan-out's
+    ``task_count``) alongside a trimmed list.
+
+    This is the ONE implementation. It exists because the same binary search was
+    written a third time inline in ``tools/task_management.py``; see rule 16 in
+    the repo CLAUDE.md, where four copies of an option normalizer drifted apart
+    and the durable fix was a shared helper rather than four correct copies.
+    """
+    if not isinstance(result, dict):
+        return result
+
+    items = result.get(list_key)
+    if not isinstance(items, list) or not items:
+        return result
+
+    if len(json.dumps(result, separators=(",", ":"), default=str)) <= MAX_RESULT_BYTES:
+        return result
+
+    total_count = len(items)
+    lo, hi = 1, total_count
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        trial = {
+            **result,
+            list_key: items[:mid],
+            "_truncated": f"Showing {mid} of {total_count} {item_label}",
+        }
+        if len(json.dumps(trial, separators=(",", ":"), default=str)) <= MAX_RESULT_BYTES:
+            lo = mid
+        else:
+            hi = mid - 1
+
+    logger.info("Compacted %s: %d -> %d %s", list_key, total_count, lo, item_label)
+    return {
+        **result,
+        list_key: items[:lo],
+        "_truncated": f"Showing {lo} of {total_count} {item_label}",
+    }
+
+
 def compact_result(result: Any) -> Any:
     """
     Ensure a serialized tool result stays under the CLI size limit.
@@ -116,20 +172,7 @@ def compact_result(result: Any) -> Any:
 
     # For dict results with a "data" list, trim the list
     if isinstance(result, dict) and "data" in result and isinstance(result["data"], list):
-        data = result["data"]
-        total_count = len(data)
-        # Binary search for the max items that fit
-        lo, hi = 1, total_count
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            trial = {**result, "data": data[:mid], "_truncated": f"Showing {mid} of {total_count} items"}
-            if len(json.dumps(trial, separators=(",", ":"), default=str)) <= MAX_RESULT_BYTES:
-                lo = mid
-            else:
-                hi = mid - 1
-        result = {**result, "data": data[:lo], "_truncated": f"Showing {lo} of {total_count} items"}
-        logger.info(f"Compacted list result: {total_count} → {lo} items")
-        return result
+        return compact_dict_list_field(result, "data")
 
     # For plain lists, trim and surface a truncation marker so the LLM
     # knows the list was capped (issue #222). The marker has to fit

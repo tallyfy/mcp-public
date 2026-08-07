@@ -11,13 +11,19 @@ Policy:
   flagged destructive — the MCP tool decorator uses this hint to trigger
   Claude's confirmation flow via ``ask_user_question`` (enforced by the
   system prompt, not by this module).
-- **Scope gating** (optional): if the JWT carries a non-empty ``scope``
-  claim, write operations on specific resource prefixes require the
-  matching ``mcp.*:write`` scope. Tokens with an empty scope set (legacy
-  supporter tokens) bypass this check by design — callers supply their
-  own authorization context.
+- **Scope gating, FAIL CLOSED**: a destructive call to a path covered by
+  ``_WRITE_SCOPE_RULES`` requires the matching ``mcp.<resource>.write``
+  scope in the caller's VERIFIED token. A token carrying no scopes has
+  proved no authority, so it is rejected like any other insufficient
+  token. There is no legacy carve-out and no opt-out switch.
 
-Issue: #171
+  This used to read ``if scopes and needed not in scopes``, which
+  short-circuited on an empty set, so the membership test never ran and
+  every rule in ``_WRITE_SCOPE_RULES`` was unreachable. Paired with a
+  hardcoded ``jwt_scopes=()`` at the only call site, the gate could not
+  fire at all. Both halves are fixed; see #746.
+
+Issues: #171 (original), #746 (the gate could never fire)
 """
 from __future__ import annotations
 
@@ -108,10 +114,12 @@ def check(
         needed = required_write_scope(path)
         if needed:
             scopes = frozenset(jwt_scopes or ())
-            # Empty scope set = legacy / supporter tokens — bypass the check.
-            # This matches the behaviour of other tools which also do not
-            # gate on scope for legacy tokens today.
-            if scopes and needed not in scopes:
+            # FAIL CLOSED. An empty scope set is not an exemption: it is a
+            # caller that proved no authority, which is exactly the case this
+            # gate exists to stop. The former `if scopes and ...` made an empty
+            # set unconditionally sufficient, so this branch was dead (#746).
+            # Non-destructive methods never reach here, so reads are untouched.
+            if needed not in scopes:
                 return AllowlistResult(
                     allowed=False,
                     reason=f"scope_missing:{needed}",

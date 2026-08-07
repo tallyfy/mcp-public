@@ -26,6 +26,99 @@ from utils.field_value_encoding import option_pairs
 from metrics import track_tool_execution
 
 
+# The field types this server will CREATE. api-v2's `BaseCapture::$field_types`
+# accepts ten, including `email`; `email` is deliberately excluded here because the
+# client has no renderer for it, so a field made that way is invisible and broken for
+# the customer (issue #439, closed 2026-06-28). Do NOT add it back just because the
+# API tolerates it.
+#
+# Module level on purpose. These were four identical literals inside four functions,
+# which is the copy-per-surface pattern that left #627 broken on its siblings, and it
+# recurred: `_validate_task_form_fields` in `tools/task_management.py` shipped with no
+# whitelist at all, so `email` was creatable on a one-off task while every template
+# path blocked it. A shared constant cannot drift the way four copies did.
+ALLOWED_FIELD_TYPES = {
+    "text", "textarea", "date", "dropdown", "multiselect",
+    "radio", "file", "table", "assignees_form",
+}
+
+# User-friendly names mapped to the canonical API `field_type`. Checked BEFORE the
+# whitelist so a caller may use either.
+FIELD_TYPE_ALIASES = {
+    "assignee": "assignees_form",
+    "assignee_picker": "assignees_form",
+    "member": "assignees_form",
+    "member_picker": "assignees_form",
+}
+
+
+# The ONLY `field_data` keys that can reach Tallyfy on a STEP form field. Both SDK
+# builders copy exactly these out of the payload and DROP everything else:
+# `FormFieldCRUD.add_form_field_to_step` (tallyfy/form_fields_management/crud_operations.py
+# lines 43-58) and `.update_form_field` (lines 101-112), the latter discarding each
+# unknown key with `logger.warning("Ignoring unknown form field: ...")` that no MCP caller
+# ever sees. The write then returns HTTP 200 and the value is simply never stored, which is
+# exactly issue #623: guidance text sent as `description` vanished on every update while
+# `last_updated` advanced, so the tool reported success and the Client UI showed nothing.
+# The two SDK allowlists are identical today, so one constant serves both paths.
+#
+# The SDK half is filed separately as tallyfy/sdk#32 and needs a PyPI release. Rejecting
+# here at the tool boundary is the server-side half: it converts a silent partial write
+# into an error the caller can act on, and it is sufficient for the user-visible bug.
+#
+# This does NOT apply to the kickoff (prerun) paths. Those never touch these builders -
+# `add_kickoff_field` / `update_kickoff_field` put the field dict into the template's
+# `prerun` LIST and PUT it via `update_template_metadata`, whose own allowlist filters
+# TOP-LEVEL template keys and forwards the nested list verbatim. So a kickoff key reaches
+# api-v2 and is answered there, which matches #623's report that kickoff guidance persists
+# correctly. Deliberate asymmetry, not a missed sibling.
+_STEP_FIELD_DATA_KEYS = frozenset({
+    "field_type", "label", "required", "position", "guidance", "options",
+    "default_value", "default_value_enabled", "columns", "collect_time",
+    "use_wysiwyg_editor", "field_validation", "prefix", "suffix", "settings", "list",
+})
+
+# Wrong names callers actually reach for, mapped to the key that does the job. Naming the
+# ONE right key beats making the model pick from sixteen, and `description` is the exact
+# miss in #623 - it was even advertised as accepted by this module's own "nothing to
+# update" error text until that issue.
+_FIELD_DATA_KEY_ALIASES = {
+    "description": "guidance",
+    "help_text": "guidance",
+    "name": "label",
+    "type": "field_type",
+    "validation": "field_validation",
+}
+
+
+def _reject_unknown_field_data_keys(field_data, tool_name):
+    """Raise a ToolError naming every `field_data` key that would be silently discarded.
+
+    Fails BEFORE any API call, on caller-supplied data only, so nothing is written and the
+    caller gets a correction it can apply on the next turn. A non-dict argument passes
+    through untouched - Pydantic already rejects those at the signature.
+    """
+    if not isinstance(field_data, dict):
+        return
+    unknown = sorted(key for key in field_data if key not in _STEP_FIELD_DATA_KEYS)
+    if not unknown:
+        return
+    message = (
+        f"{tool_name}: field_data contains {len(unknown)} key(s) Tallyfy does not accept: "
+        f"{', '.join(unknown)}. Those would be DISCARDED while the write still reported "
+        f"success, so nothing was sent. Accepted keys: "
+        f"{', '.join(sorted(_STEP_FIELD_DATA_KEYS))}."
+    )
+    renames = [
+        f"'{key}' -> '{_FIELD_DATA_KEY_ALIASES[key]}'"
+        for key in unknown
+        if key in _FIELD_DATA_KEY_ALIASES
+    ]
+    if renames:
+        message += " Did you mean " + "; ".join(renames) + "?"
+    raise ToolError(message)
+
+
 def _normalize_option_dicts(options):
     """Normalize option dicts to the ONE shape api-v2 accepts: {id: int, text: str}.
 
@@ -64,12 +157,7 @@ def register_form_fields_tools(mcp):
     # Convenience aliases that map user-friendly field type names to the
     # canonical API field_type values.  Checked before the whitelist so
     # callers can use either the alias or the real name.
-    _FIELD_TYPE_ALIASES = {
-        "assignee": "assignees_form",
-        "assignee_picker": "assignees_form",
-        "member": "assignees_form",
-        "member_picker": "assignees_form",
-    }
+    _FIELD_TYPE_ALIASES = FIELD_TYPE_ALIASES
 
     @mcp.tool(
         name="add_form_field_to_step",
@@ -143,6 +231,10 @@ Never call this without all three parameters.""",
         Returns:
             Created form field object
         """
+        # Structural check first: a key the SDK would drop means the caller's intent is
+        # already partly lost, whatever else the payload gets right (#623).
+        _reject_unknown_field_data_keys(field_data, "add_form_field_to_step")
+
         # Resolve convenience aliases to canonical API field_type names
         ft = field_data.get("field_type", "")
         if ft and ft in _FIELD_TYPE_ALIASES:
@@ -155,7 +247,7 @@ Never call this without all three parameters.""",
         # field, so a field made this way is invisible/broken for the customer. Blocked here
         # on purpose per issue #439 (closed 2026-06-28) until UI parity exists. Do NOT add
         # "email" back just because the API tolerates it.
-        allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
+        allowed_field_types = ALLOWED_FIELD_TYPES
         if ft and ft not in allowed_field_types:
             raise ToolError(
                 f"Invalid field_type '{ft}'. Allowed values: {', '.join(sorted(allowed_field_types))}"
@@ -273,7 +365,21 @@ Never call this without all four parameters.""",
             Updated form field object data
         """
         if not field_data:
-            raise ToolError("field_data must include at least one property to update (e.g. label, required, description)")
+            # `description` used to head this list of examples. It is not a key api-v2
+            # accepts on a capture, so the one worked example this error offered steered
+            # the model straight into the silent drop of #623. Name `guidance`, which is
+            # the key that actually carries help text.
+            raise ToolError(
+                "field_data must include at least one property to update, for example "
+                "'label', 'required', or 'guidance' (the help text shown under a field)."
+            )
+
+        # Reject anything the SDK would silently discard, BEFORE the auto-fill fetch and
+        # before any write (#623). Runs on caller-supplied keys only, which is the whole
+        # point: the auto-fill block below injects label/field_type/required/options/
+        # columns, all of them accepted, so gating here can never fail on data the tool
+        # itself put there.
+        _reject_unknown_field_data_keys(field_data, "update_form_field")
 
         # When the caller explicitly sets field_type, apply the same guards
         # as add_form_field_to_step: resolve aliases and reject types that
@@ -291,7 +397,7 @@ Never call this without all four parameters.""",
             if ft_raw in _FIELD_TYPE_ALIASES:
                 field_data["field_type"] = _FIELD_TYPE_ALIASES[ft_raw]
             ft_val = field_data["field_type"]
-            allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
+            allowed_field_types = ALLOWED_FIELD_TYPES
             if ft_val not in allowed_field_types:
                 raise ToolError(
                     f"Invalid field_type '{ft_val}'. Allowed values: {', '.join(sorted(allowed_field_types))}"
@@ -905,7 +1011,7 @@ Never call this without both parameters.""",
 
         # Same deliberate narrowing as add_form_field_to_step: "email" is valid in api-v2
         # but has no native-UI equivalent, so it stays blocked per issue #439.
-        allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
+        allowed_field_types = ALLOWED_FIELD_TYPES
         if ft not in allowed_field_types:
             raise ToolError(f"Invalid field_type '{ft}'. Allowed values: {', '.join(sorted(allowed_field_types))}")
 
@@ -1001,7 +1107,7 @@ Never call this without all three parameters.""",
             if ft_raw in _FIELD_TYPE_ALIASES:
                 field_data["field_type"] = _FIELD_TYPE_ALIASES[ft_raw]
             ft_val = field_data["field_type"]
-            allowed_field_types = {"text", "textarea", "date", "dropdown", "multiselect", "radio", "file", "table", "assignees_form"}
+            allowed_field_types = ALLOWED_FIELD_TYPES
             if ft_val not in allowed_field_types:
                 raise ToolError(
                     f"Invalid field_type '{ft_val}'. Allowed values: {', '.join(sorted(allowed_field_types))}"

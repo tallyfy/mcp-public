@@ -7,11 +7,17 @@ import os
 import logging
 import jwt
 from typing import Optional, Tuple
+from fastmcp.server.dependencies import get_http_headers
 from mcp.server.auth.middleware.auth_context import get_access_token
 from tallyfy import TallyfyError
-from utils.org_id_middleware import get_org_id, get_jwt_claims
+from utils.org_id_middleware import ORG_ID_HEADERS, get_org_id, get_jwt_claims
 from constants import TALLYFY_API_BASE_URL
 logger = logging.getLogger(__name__)
+
+# The header spellings OrgIdMiddleware accepts, as lowercase str (it holds them
+# as bytes). Imported rather than re-listed so the two cannot drift: a spelling
+# added there is automatically covered by the mismatch check below.
+_ORG_ID_HEADER_NAMES = frozenset(name.decode("ascii") for name in ORG_ID_HEADERS)
 
 
 class MissingOrgIdError(TallyfyError):
@@ -34,6 +40,67 @@ class MissingOrgIdError(TallyfyError):
         super().__init__(message, status_code=400)
 
 
+class OrgIdMismatchError(TallyfyError):
+    """Raised when a request header names a different organization than the token.
+
+    The organization is decided by the ``org_id`` claim on the JWT, which
+    FastMCP's ``JWTVerifier`` has already validated. A header naming a DIFFERENT
+    organization is a client trying to act outside the consent its token was
+    issued for, so the request is refused outright rather than quietly resolved
+    either way — header-switching breaks visibly here instead of silently
+    reading or writing another tenant's data (#744).
+
+    Why a named class rather than raising ``TallyfyError(msg, status_code=400)``
+    directly: ``TallyfyError.__init__`` takes ``status_code`` as a defaulted
+    keyword, so a bare raise depends on every future call site remembering to
+    pass 400 — the exact regression ``MissingOrgIdError`` overrides ``__init__``
+    to prevent. A distinct type also lets callers and tests tell "two different
+    organizations were named" apart from "no organization could be resolved",
+    which one shared type cannot.
+
+    Carries MissingOrgIdError's 400 shape so ``handle_tallyfy_errors`` demotes
+    it to WARNING: a contradictory header is malformed client input, not a
+    server bug, and should not page.
+    """
+
+    def __init__(self, token_org_id: str, header_org_id: str):
+        super().__init__(
+            f"Organization mismatch: this request's organization header names "
+            f"'{header_org_id}', but your access token was issued for "
+            f"organization '{token_org_id}'. The organization in the verified "
+            f"token always wins, so the request was refused rather than acted "
+            f"on in '{header_org_id}'. To resolve, do one of: "
+            f"(1) drop the organization header from this request, or "
+            f"(2) authenticate with a token issued for '{header_org_id}'.",
+            status_code=400,
+        )
+        self.token_org_id = token_org_id
+        self.header_org_id = header_org_id
+
+
+def _client_supplied_org_id() -> Optional[str]:
+    """The organization id THIS request's headers carry, or None.
+
+    Deliberately not ``get_org_id()``. That ContextVar is set by
+    ``OrgIdMiddleware`` from EITHER an explicit header OR the persistent
+    user->org cache populated by an earlier authenticated request, so it cannot
+    answer "did the client send a header on this request". Treating a cached
+    value as a header would refuse a legitimate request from a user who has
+    since been issued a token for a different organization, and keep refusing it
+    for the whole 24 h cache TTL.
+
+    ``get_http_headers()`` never raises; it returns ``{}`` when no HTTP request
+    is in context. That can only cost the loud error, never the security
+    property — the verified claim wins whether or not a header is visible here.
+    """
+    org_id = None
+    for name, value in get_http_headers().items():
+        # Last match wins, mirroring OrgIdMiddleware._extract_from_headers.
+        if name in _ORG_ID_HEADER_NAMES and value:
+            org_id = value
+    return org_id
+
+
 def get_authenticated_credentials() -> Tuple[str, str]:
     """
     Extract API key (JWT token) and org_id from the authenticated request context.
@@ -42,20 +109,41 @@ def get_authenticated_credentials() -> Tuple[str, str]:
     the token is trusted. The persistent user→org cache is written here (not in
     OrgIdMiddleware) to prevent pre-auth cache poisoning (P1-G).
 
+    Organization resolution order (#744):
+
+    1. The ``org_id`` claim on the VERIFIED token wins outright. It names the
+       organization the OAuth consent was granted for, and it is the only
+       statement of organization in the request that anything has checked.
+    2. If the request ALSO carries an organization header naming a different
+       organization, it is refused with ``OrgIdMismatchError`` rather than
+       silently resolved either way.
+    3. The request-scoped org id — an explicit header, or this user's
+       organization persisted by an earlier authenticated request — is
+       consulted only when the token carries no ``org_id`` claim at all. That
+       is the header's legitimate use (a token valid for several organizations
+       picking one) and it keeps working.
+    4. ``TALLYFY_ORG_ID`` env var, last, unchanged.
+
+    Before #744 this order was inverted: the client-supplied header was
+    preferred over the verified claim, and whatever won was written into the
+    persistent user→org cache, so a header could steer later requests that
+    carried no header at all. ``org_id_middleware`` says in three separate
+    docstrings that the header is observability-only and "MUST NEVER influence
+    any authorization decision"; this function is what makes that true.
+
     Returns:
         Tuple of (api_key, org_id)
 
     Raises:
-        MissingOrgIdError: If no org_id can be resolved from header, JWT claim,
-            persistent user→org cache, or TALLYFY_ORG_ID env var.
+        OrgIdMismatchError: If a request header names a different organization
+            than the verified token's ``org_id`` claim.
+        MissingOrgIdError: If no org_id can be resolved from the JWT claim,
+            header, persistent user→org cache, or TALLYFY_ORG_ID env var.
         Exception: If no access token is present (auth middleware misconfigured).
     """
     access_token = get_access_token()
     if not access_token:
         raise Exception("No authenticated user found. Please authenticate with a valid JWT token.")
-
-    # Prefer org_id from explicit header (set by OrgIdMiddleware in the request-scoped ContextVar)
-    org_id = get_org_id()
 
     # Reuse claims already decoded by OrgIdMiddleware. Safe here because
     # get_access_token() confirms JWTVerifier validated the RS256 signature
@@ -67,11 +155,30 @@ def get_authenticated_credentials() -> Tuple[str, str]:
         except jwt.DecodeError:
             token_claims = {}
 
-    if not org_id:
-        org_id = token_claims.get('org_id')
+    claim_org_id = token_claims.get('org_id')
+    # Header OR this user's persisted organization — OrgIdMiddleware cannot
+    # tell the two apart in this ContextVar, so neither can we.
+    context_org_id = get_org_id()
 
-    if not org_id:
-        org_id = os.getenv("TALLYFY_ORG_ID")
+    if claim_org_id:
+        header_org_id = _client_supplied_org_id()
+        if header_org_id and header_org_id != claim_org_id:
+            raise OrgIdMismatchError(claim_org_id, header_org_id)
+        if context_org_id and context_org_id != claim_org_id:
+            # Not a client header — that case raised above. This is the user's
+            # own organization persisted by an earlier request, now superseded
+            # by a token issued for a different one. The claim wins; log it,
+            # because this is the only place the divergence is visible.
+            logger.warning(
+                "Request-scoped org=%s superseded by verified token claim org=%s",
+                context_org_id,
+                claim_org_id,
+            )
+        org_id = claim_org_id
+    else:
+        # No org claim on the token, so the header (or this user's persisted
+        # organization, or the env var) is the only thing that can resolve one.
+        org_id = context_org_id or os.getenv("TALLYFY_ORG_ID")
 
     if not org_id:
         raise MissingOrgIdError(
@@ -82,7 +189,10 @@ def get_authenticated_credentials() -> Tuple[str, str]:
         )
 
     # Persist org_id for this user so subsequent requests (which may omit
-    # the X-Organization-ID header) can look it up.
+    # the X-Organization-ID header) can look it up. This is always the org
+    # actually returned above — the verified claim, or a header/env value
+    # accepted only because the token named no organization at all. A header
+    # that lost to a claim is never written here.
     user_id = token_claims.get('sub') or token_claims.get('user_id')
     if user_id and org_id:
         from utils.tallyfy_auth_provider import store_org_id_for_user
@@ -110,3 +220,38 @@ def get_user_id_from_token() -> Optional[str]:
         return claims.get('sub') or claims.get('user_id')
     except jwt.DecodeError:
         return None
+
+
+def get_jwt_scopes() -> Tuple[str, ...]:
+    """OAuth scopes carried by the VERIFIED access token for this request.
+
+    Sibling of ``get_user_id_from_token``: a small read of the already-verified
+    request context, so a caller that needs to make an authorization decision
+    does not re-implement the auth plumbing at its own call site.
+
+    Reads ``AccessToken.scopes``, which fastmcp's ``JWTVerifier`` populates from
+    the token's ``scope`` / ``scp`` claim AFTER the RS256 signature has been
+    checked. Deliberately NOT taken from ``get_jwt_claims()``: those come from
+    an UNVERIFIED decode and are documented there as observability-only, so
+    they must never drive an authorization decision.
+
+    Returns:
+        The scopes as a tuple. An empty tuple means this caller PROVED no
+        scope — either no access token is present or the token carries none.
+        Callers must treat that as "no authority" and fail CLOSED; see
+        ``utils.tallyfy_endpoint_allowlist.check`` and #746.
+
+    Note:
+        ``AccessToken.scopes`` is a required ``list[str]`` on the shipped model,
+        so the defensive read below is for a duck-typed or subclassed provider,
+        not for a shape the current SDK can produce.
+    """
+    access_token = get_access_token()
+    if access_token is None:
+        return ()
+
+    scopes = getattr(access_token, "scopes", None)
+    if not scopes:
+        return ()
+
+    return tuple(str(scope) for scope in scopes)

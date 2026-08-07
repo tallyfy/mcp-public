@@ -37,6 +37,7 @@ from pydantic import Field
 from constants import TALLYFY_API_BASE_URL
 from utils.auth_context import (
     get_authenticated_credentials,
+    get_jwt_scopes,
     get_user_id_from_token,
 )
 from utils.fastmcp_errors import handle_tallyfy_errors
@@ -186,8 +187,10 @@ async def _execute(
             f"Confirm the endpoint exists at {TALLYFY_API_DOCS_URL}"
         )
 
-    # Allowlist + scope gate.
-    gate = allowlist_check(method_u, resolved_path, jwt_scopes=())
+    # Allowlist + scope gate. The scopes come from the VERIFIED access token
+    # for this request. They used to be a hardcoded empty tuple here, which
+    # meant the gate never saw the caller at all (#746).
+    gate = allowlist_check(method_u, resolved_path, jwt_scopes=get_jwt_scopes())
     if not gate.allowed:
         if gate.reason == "blocked":
             raise ToolError(

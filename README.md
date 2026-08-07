@@ -75,6 +75,7 @@ The verification key is resolved for you. Left alone, the server reads Tallyfy's
 ## Listed on
 
 - [Official MCP Registry](https://registry.modelcontextprotocol.io) (`com.tallyfy/mcp-server`)
+- [GitHub MCP Registry](https://github.com/mcp/com.tallyfy/mcp-server)
 - [Smithery](https://smithery.ai/server/@tallyfy-inc/mcp-server)
 - [Glama](https://glama.ai/mcp/connectors/com.tallyfy/mcp-server)
 - [PulseMCP](https://www.pulsemcp.com/servers/tallyfy)

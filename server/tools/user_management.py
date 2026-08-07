@@ -83,6 +83,13 @@ USE THIS TOOL when user asks:
 Returns user data including numeric 'id', 'email', 'first_name', 'last_name'.
 Use the returned 'id' field when you need to call get_user_tasks(user_id=...).
 
+SCOPE: returns ALL members regardless of status (active, invited, and disabled),
+so meta.total is the FULL member roster, not an active-member count. Each record
+carries a 'status' of 'active', 'invited' or 'disabled'; filter on it yourself
+when the user wants only active people. Guests are not members and are never
+returned here. This total will normally be LARGER than the 'users_count'
+reported by get_organization, which counts active members only.
+
 Optional: Set with_groups=true to include group membership information.
 PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for subsequent pages. meta.total_pages shows how many pages exist.""",
         tags={"users", "organization", "read-only"},
@@ -101,12 +108,19 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for subsequent
         """
         Get organization members with full profile data.
 
+        Returns every member regardless of status. No status filter is sent, and
+        api-v2's OrganizationUsersRepository::query() is the unfiltered
+        get_tenant()->users() relation, so active, invited and disabled members
+        are all included. Compare with get_organization's 'users_count', which
+        counts active members only.
+
         Args:
             with_groups: Include user groups data (default: False)
             page: Page number to fetch (default: 1)
 
         Returns:
-            Dict with 'data' (list of users) and 'meta' (pagination info)
+            Dict with 'data' (list of users, each carrying a 'status' of
+            'active', 'invited' or 'disabled') and 'meta' (pagination info)
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -616,7 +630,30 @@ CORRECT usage:
 
     @mcp.tool(
         name="get_organization",
-        description="Get organization details. No parameters required — organization is determined from authentication context.",
+        description="""Get organization details. No parameters required; the organization is determined from the authentication context.
+
+Returns the organization profile, including 'users_count'.
+
+IMPORTANT: 'users_count' IS AN ACTIVE-MEMBER COUNT, NOT TOTAL HEADCOUNT.
+It counts only members with a verified email, an approved membership, an
+accepted invite or a prior sign-in, and no disabled flag.
+
+EXCLUDED from 'users_count' but PRESENT in get_organization_users, which is
+exactly why the two numbers differ:
+- members invited who never accepted and never signed in (status 'invited')
+- disabled members (status 'disabled')
+- members whose email address is still unverified
+- bot and system accounts
+
+Absent from BOTH: guests (they are not members at all) and members who were
+removed from the organization.
+
+Do NOT report 'users_count' as the total number of people in the organization.
+It will normally be SMALLER than the number of records returned by
+get_organization_users, which returns every member of every status. That gap is
+correct behaviour, not a data bug, and it is not a reason to retry either tool.
+When the user asks for total headcount or a breakdown by status, call
+get_organization_users and count its records by their per-record 'status'.""",
         tags={"organization", "read-only"},
         annotations=ToolAnnotations(
             title="Get organization",
@@ -634,7 +671,16 @@ CORRECT usage:
         Get organization details.
 
         Returns:
-            Organization object with details
+            Organization object with details. Its 'users_count' is an
+            ACTIVE-member count (api-v2 OrganizationTransformer.php:40 calls
+            Organization::totalActiveUsers(), which counts
+            Organization::activeUsers() at Organization.php:530). Invited,
+            disabled and email-unverified members plus bot accounts are
+            excluded, so it is smaller than the record count from
+            get_organization_users. Guests and removed members are absent from
+            both, since Organization::users() at Organization.php:269-296 is a
+            members-only relation already filtered on
+            organizations_users.deleted_at.
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:

@@ -376,7 +376,8 @@ REQUIRED: 'task_id' (32-char hex) and 'content' (comment text).
 Optional:
 - 'run_id': process/run ID — pass it if you have it; you'll need it to call 'get_task_comments' later
 - 'label': "comment" (default) | "problem" | "resolve" | "improvement" | "advice"
-- 'state': "open" (default) | "hide-for-guests" | "collapsed"
+- 'state': "hide-for-guests" (Tallyfy's default) | "open" | "collapsed".
+  This server adds no default; omit it and guests will NOT see the comment.
 - 'sent_to': numeric user IDs to @mention. Look up IDs via get_organization_users first.
 
 @MENTIONS: a user is notified ONLY when the stored body contains @[<user_id>] markup,
@@ -426,7 +427,12 @@ Never call this without both required parameters.""",
             run_id: Process/run ID — not used by this endpoint but accepted so callers retain
                 it in context for a subsequent get_task_comments call (optional)
             label: Comment type — "comment" | "problem" | "resolve" | "improvement" | "advice" (default: "comment")
-            state: Visibility — "open" | "hide-for-guests" | "collapsed" (default: "open")
+            state: Visibility — "hide-for-guests" (default) | "open" | "collapsed".
+                This server substitutes no default of its own: when the caller omits
+                'state' it is forwarded as None and the value is chosen by api-v2,
+                which falls back to Thread::HIDE ("hide-for-guests") in
+                TasksMessagingService::postComment. Pass "open" explicitly when the
+                comment must be visible to guests.
             sent_to: List of numeric user IDs to @mention (optional). Rendered into
                 the body as @[<user_id>] markup — the API has no request-side
                 sent_to parameter, body markup is what notifies.

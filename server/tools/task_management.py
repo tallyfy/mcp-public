@@ -18,6 +18,7 @@ from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_U
 from utils.fastmcp_types import (
     OptionalUserId,
     OptionalGuestId,
+    OptionalProcessId,
     ProcessId,
     TaskId,
     TaskTitle,
@@ -27,12 +28,327 @@ from utils.fastmcp_types import (
     OptionalBool,
     PageNumber,
 )
-from utils.sdk_serializer import serialize_dataclass, serialize_task
+from utils.sdk_serializer import (
+    serialize_dataclass,
+    serialize_task,
+    compact_dict_list_field,
+)
 from utils.pagination import fetch_single_page
+from tools.form_fields import (
+    ALLOWED_FIELD_TYPES,
+    FIELD_TYPE_ALIASES,
+    _normalize_option_dicts,
+    _normalize_column_dicts,
+)
 from metrics import track_tool_execution
 
 
 _OWNER_BUCKETS = ("users", "guests", "groups")
+
+# Mirrors tallyfy.task_management.creation.TaskCreation.TASK_TYPES. We POST the
+# one-off-task endpoint directly (see _create_one_off_task), so the SDK's own
+# guard no longer runs and this tool would otherwise degrade a clear local error
+# into a remote 422.
+_TASK_TYPES = frozenset({"task", "approval", "expiring", "email", "expiring_email"})
+
+_CHOICE_FIELD_TYPES = ("dropdown", "radio", "multiselect")
+
+# Fan-out read-back paging. api-v2 defaults this endpoint to 10 rows
+# (`TasksController.php:769`), which silently undercounts any fan-out wider than
+# ten. 100 per page x 20 pages is 2000 tasks, far past any realistic fan-out,
+# and the cap only exists so a misbehaving API cannot loop forever.
+_FANOUT_PAGE_SIZE = 100
+_FANOUT_MAX_PAGES = 20
+
+
+def _validate_task_form_fields(form_fields: Any) -> None:
+    """Validate caller-supplied one-off-task `form_fields` before they are POSTed.
+
+    api-v2 `CreateOneOffTaskRequest` enforces `label`, `field_type` and `required`
+    on every entry, so checking them here only turns a remote 422 into a local
+    message that names the offending index.
+
+    `options` is the one that MUST be checked here, because api-v2 does NOT
+    enforce it on this endpoint. The rule reads
+    `'form_fields.*.options' => 'required_if:field_type,radio,dropdown,multiselect'`,
+    and `required_if` resolves `field_type` at the ROOT of the payload, where no
+    such key exists on a task create. The condition therefore never matches and
+    the rule never fires. Verified live against production on 2026-08-06: a
+    `dropdown` field carrying no options was accepted and the task created, which
+    leaves an unanswerable choice field on a real task. The sibling single-field
+    endpoint (`CaptureRequestValidator`) does enforce it, because there
+    `field_type` genuinely is at the root, which is exactly the asymmetry repo
+    rule 16 warns about.
+
+    Only caller-supplied data is validated. Nothing here is read back, merged or
+    auto-filled, so this cannot fail on data the caller did not touch (rule 16's
+    `_caller_set_X` principle).
+    """
+    if form_fields is None:
+        return
+    if not isinstance(form_fields, list):
+        raise ToolError("form_fields must be a list of field definition objects.")
+
+    for index, field in enumerate(form_fields):
+        if not isinstance(field, dict):
+            raise ToolError(
+                f"form_fields[{index}] must be an object, got {type(field).__name__}."
+            )
+        if not field.get("label"):
+            raise ToolError(f"form_fields[{index}] must include a non-empty 'label'.")
+
+        field_type = field.get("field_type")
+        if not field_type:
+            raise ToolError(
+                f"form_fields[{index}] must include 'field_type' "
+                "(text, textarea, dropdown, radio, multiselect, date, file, table, ...)."
+            )
+
+        # Resolve the friendly aliases the template paths already accept, then
+        # whitelist. Both come from `tools.form_fields` so this cannot drift from
+        # its siblings. api-v2 accepts `email` here, but the client cannot render
+        # it, so a field created that way is invisible and broken for the customer
+        # (#439). Without this check `email` was creatable on a one-off task while
+        # every template path blocked it, which is exactly the rule 16 asymmetry.
+        if field_type in FIELD_TYPE_ALIASES:
+            field_type = FIELD_TYPE_ALIASES[field_type]
+            field["field_type"] = field_type
+        if field_type not in ALLOWED_FIELD_TYPES:
+            raise ToolError(
+                f"form_fields[{index}] has invalid field_type '{field_type}'. "
+                f"Allowed values: {', '.join(sorted(ALLOWED_FIELD_TYPES))}"
+            )
+
+        if field_type == "table" and not field.get("columns"):
+            raise ToolError(
+                f"form_fields[{index}] has field_type 'table', which requires a "
+                "'columns' list. Without columns the table has nothing to fill in."
+            )
+
+        # Presence, not truthiness: `required=False` is a legitimate value and
+        # must not be mistaken for a missing key. api-v2 rejects the key's
+        # absence, and the SDK's form-field paths silently defaulted it to True
+        # before #614, so never guess it.
+        if "required" not in field:
+            raise ToolError(
+                f"form_fields[{index}] must include 'required' (bool): whether the "
+                "field is mandatory. Pass required=False for an optional field; "
+                "there is no default."
+            )
+
+        if field_type in _CHOICE_FIELD_TYPES:
+            options = field.get("options") or []
+            if not options:
+                raise ToolError(
+                    f"form_fields[{index}] has field_type '{field_type}', which "
+                    "requires a non-empty 'options' list. api-v2 does not enforce "
+                    "this on task form fields, so without options the field is "
+                    "created but can never be answered."
+                )
+            for option in options:
+                if isinstance(option, dict) and "text" not in option and "label" not in option:
+                    raise ToolError(
+                        f"Each option for form_fields[{index}] (field_type "
+                        f"'{field_type}') must have a 'text' (or 'label') field."
+                    )
+            if field_type == "radio" and len(options) < 2:
+                raise ToolError(
+                    f"form_fields[{index}] has field_type 'radio', which requires "
+                    "at least 2 options."
+                )
+
+        # Same shared normalizers the template/step form-field paths use, so the
+        # `label` alias and missing option ids cannot behave differently here.
+        _normalize_option_dicts(field.get("options"))
+        _normalize_column_dicts(field.get("columns"))
+
+
+def _create_one_off_task(sdk, org_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """POST a one-off task and return the created task dict.
+
+    Deliberately NOT routed through `sdk.tasks.create_task`. That method's
+    signature carries none of `run_id`, `form_fields` or
+    `separate_task_for_each_assignee`, and its request body hardcodes
+    `"separate_task_for_each_assignee": False`, so the fan-out flag is not merely
+    absent from the signature, it is pinned off on every call. `sdk._make_request`
+    is this repo's established escape hatch for exactly that situation (13 call
+    sites across 6 tool modules) and keeps the SDK's session, auth headers, retry
+    logic and the Prometheus instrumentation applied by
+    `utils/sdk_metrics_patch.py`, all of which a hand-rolled httpx call would lose.
+    """
+    response = sdk._make_request("POST", f"organizations/{org_id}/tasks", data=payload)
+    if isinstance(response, dict) and isinstance(response.get("data"), dict):
+        return response["data"]
+    return response if isinstance(response, dict) else {}
+
+
+def _get_task_with_form_fields(sdk, endpoint: str) -> Dict[str, Any]:
+    """GET a task with its form fields and submitted answers, and KEEP them.
+
+    Deliberately not routed through `sdk.tasks.get_task`. Passing `with_` to the
+    SDK does put `?with=form_fields` on the wire, and api-v2 does return the
+    include, but `tallyfy.models.Task` declares no `form_fields` attribute, so
+    `Task.from_dict()` silently drops it and the caller sees a task with no
+    questions and no answers. Measured 2026-08-06: the raw response carried the
+    field, `hasattr(Task.from_dict(...), "form_fields")` was False.
+
+    That is the whole failure class this repo keeps meeting: the request
+    parameter lands, the value never arrives, and nothing errors. Asserting that
+    `with_` was passed does NOT prove the fields come back, so the test for this
+    asserts on the returned payload.
+
+    The include is Fractal-wrapped as `form_fields.data`; it is unwrapped here so
+    callers get a plain list. Each entry carries `field_value`, which is where the
+    submitted answer lives (NOT `value`).
+    """
+    response = sdk._make_request("GET", endpoint, params={"with": "form_fields"})
+    raw = response.get("data", response) if isinstance(response, dict) else response
+    if not isinstance(raw, dict):
+        return {}
+
+    raw = dict(raw)
+    fields = raw.get("form_fields")
+    if isinstance(fields, dict):
+        raw["form_fields"] = fields.get("data") or []
+
+    return serialize_task(raw)
+
+
+def _task_after_write(sdk, endpoint: str, task_id: str) -> Dict[str, Any]:
+    """Re-read a task after a write that already succeeded, never fatally.
+
+    This adds ONE thing to `_get_task_with_form_fields` and delegates everything
+    else to it: the guard below. It is not a second reader.
+
+    Why a re-read is needed at all. `sdk.tasks.update_task` and
+    `update_standalone_task` both end in `Task.from_dict(response['data'])` and
+    discard the raw body, so the object they hand back CANNOT carry `summary` -
+    `tallyfy.models.Task` declares no such attribute and `from_dict` never reads
+    one. Measured 2026-08-06 against the installed SDK: feeding a body carrying
+    `summary` and `original_summary` through `Task.from_dict` leaves both
+    `hasattr` False and `serialize_task` on the result omits them, while
+    `serialize_task` on the SAME raw dict returns both. That is rule 24 in the
+    root CLAUDE.md, and it is the whole of #633: the write lands, the app UI
+    shows it, and no update response can ever echo it back.
+
+    `?with=summary` is NOT the fix and is deliberately not sent. Verified live
+    2026-08-06 against production, masquerading into a real org: a plain
+    `GET .../runs/{run}/tasks/{task}` already returns `summary`, as does the
+    same endpoint with `?with=form_fields`, as does `.../tasks/{task}` for a
+    one-off task. Both negative controls fired - a wrong bearer token gave 401
+    where the real one gave 200, and a bogus 32-hex task id gave 404. So the
+    include the READ path already sends is sufficient, and reusing that one call
+    keeps the update response shaped exactly like `get_task`'s.
+
+    **The guard is the reason this wrapper exists.** On the read tools a failed
+    GET IS the failure and must propagate. Here the PUT has already returned
+    2xx, so raising would report a landed change as a failure and invite a retry
+    of a write that already happened. A failed re-read therefore degrades to the
+    pre-fix payload - the SDK-typed shape, `summary` absent - which is never
+    worse than the behaviour this replaces.
+    """
+    try:
+        return _get_task_with_form_fields(sdk, endpoint)
+    except Exception as exc:  # noqa: BLE001 - degraded read, never fatal
+        logger.warning("Post-write read-back failed for task %s: %s", task_id, exc)
+        return {}
+
+
+def _read_back_fanout(sdk, org_id: str, run_id: str) -> Optional[Dict[str, Any]]:
+    """Read every task in the container run produced by a fan-out create.
+
+    The API returns only ONE task from a `separate_task_for_each_assignee` create
+    (`OneOffTasksController::create` hands a whole collection to
+    `respondWithItem`), so the caller cannot see, count or verify the fan-out from
+    the response alone. Verified live 2026-08-06: a three-assignee create returned
+    a single task while the run held three.
+
+    Returns None when the read fails. A failed read must not be reported as an
+    empty fan-out, so the caller falls back to the single task the POST returned
+    rather than implying nothing else was created.
+
+    **It MUST paginate.** `TasksController.php:769` reads
+    `'per_page' => $request['per_page'] ?? 10`, so a bare GET returns 10 rows.
+    A bare read therefore reported `task_count: 10` for a 12-assignee fan-out
+    while all 12 tasks existed, and did it while looking like a complete success.
+    Measured live 2026-08-06 before this fix. Ten is well inside a realistic fan
+    out: any group with more than ten members hits it, and the whole point of the
+    feature is that the count is trustworthy.
+
+    The loop stops on the first EMPTY page rather than on a short one, so it stays
+    correct if the API applies a per_page of its own choosing. Ids already seen are
+    skipped, so if `page` were ever ignored the loop terminates instead of
+    duplicating rows forever.
+    """
+    endpoint = f"organizations/{org_id}/runs/{run_id}/tasks"
+    tasks: List[Dict[str, Any]] = []
+    seen: set = set()
+
+    for page in range(1, _FANOUT_MAX_PAGES + 1):
+        try:
+            response = sdk._make_request(
+                "GET", endpoint, params={"per_page": _FANOUT_PAGE_SIZE, "page": page}
+            )
+        except Exception as exc:  # noqa: BLE001 - degraded read, never fatal
+            logger.warning("Fan-out read-back failed for run %s: %s", run_id, exc)
+            return None
+
+        batch = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(batch, list):
+            logger.warning("Fan-out read-back for run %s returned no task list", run_id)
+            return None
+
+        fresh = [
+            task for task in batch
+            if not (isinstance(task, dict) and task.get("id") in seen)
+        ]
+        for task in fresh:
+            if isinstance(task, dict) and task.get("id"):
+                seen.add(task["id"])
+        tasks.extend(fresh)
+
+        if not batch or not fresh:
+            break
+    else:
+        logger.warning(
+            "Fan-out read-back for run %s hit the %d page cap; count may be short",
+            run_id, _FANOUT_MAX_PAGES,
+        )
+
+    if not tasks:
+        # An empty list here is a FAILED read, not an empty fan-out. The POST has
+        # already succeeded, so at least one task provably exists; the run-tasks
+        # listing is served by a read replica that can lag a create. Returning
+        # `task_count: 0` would be a measurably false statement, and because the
+        # dict is not None the caller would skip its single-task fallback and
+        # report that nothing was created. Same principle as the exception and
+        # non-list arms above: when the read cannot be trusted, hand back the task
+        # the POST returned rather than a count we know is wrong.
+        logger.warning(
+            "Fan-out read-back for run %s returned zero tasks after a successful "
+            "create; treating as a failed read", run_id
+        )
+        return None
+
+    serialized_tasks = [serialize_task(task) for task in tasks]
+
+    # `{run_id, task_count, tasks}` carries no "data" key, so `compact_result`
+    # falls through to its "cannot auto-compact" arm and returns the payload
+    # whole. A big fan-out would then blow the 25 KB cap and the CLI would hide
+    # the entire result behind <persisted-output>. Trim the list instead, and
+    # keep `task_count` at the TRUE total: the count is the answer to "did
+    # everyone get one?", so it must never shrink with the display list. That is
+    # the same undercount the per_page fix above removed, and reintroducing it
+    # here would be just as invisible.
+    return compact_dict_list_field(
+        {
+            "run_id": run_id,
+            "task_count": len(serialized_tasks),
+            "tasks": serialized_tasks,
+        },
+        "tasks",
+        item_label="tasks",
+    )
 
 
 def _task_fields(sdk, endpoint: str) -> list:
@@ -593,7 +909,12 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
                 sdk.tasks.get_tasks_for_process,
                 org_id,
                 page=page,
-                compact_fields=["step", "taskdata"],
+                # `taskdata` holds every submitted form-field answer, so stripping it
+                # made the per-task tracker view show WHO has a task but never WHAT
+                # they answered. `step` stays stripped: it is the template-side step
+                # definition, it is large, and it is not an answer. The 25 KB cap in
+                # fetch_single_page still bounds the page.
+                compact_fields=["step"],
                 process_id=resolved_process_id,
                 status=status,
                 sort=sort,
@@ -629,30 +950,38 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         name="create_standalone_task",
         description="""Create a standalone (one-off) task with explicit structured fields.
 
-NOTE: Tallyfy internally creates a lightweight process container for every standalone task — this is
-expected platform behaviour and the task will still appear as a one-off task (is_oneoff_task: true).
+NOTE: Tallyfy creates a lightweight process container for every standalone task. The
+task still appears as a one-off task (is_oneoff_task: true).
 
-REQUIRED FIELDS: title, deadline, and at least one assignee.
+REQUIRED: title, deadline, at least one assignee.
 
-DEADLINE: Accepts natural language — e.g. "April 12 2026 at 3pm", "next Monday at noon",
+DEADLINE: natural language, e.g. "April 12 2026 at 3pm", "next Monday at noon",
 "tomorrow at 5pm". Resolved to UTC using the org timezone automatically.
 
-TASK TYPE: Accepted values:
-- "task" (default) — standard task
-- "approval" — approval/reject task
-- "expiring" — expiring task
-- "email" — email draft task
-- "expiring_email" — auto-send email task
+TASK TYPE: task (default) | approval | expiring | email | expiring_email
 
-ASSIGNEES: Provide one or more of:
-- user_names: member full names (e.g. ["John Doe"])
-- user_emails: member email addresses
-- guest_emails: guest email addresses
-- group_names: group names
+ASSIGNEES: one or more of user_names, user_emails, guest_emails, group_names.
+
+FAN OUT TO MANY PEOPLE (separate_task_for_each_assignee=True):
+Use whenever the user wants the SAME thing from SEVERAL people AND wants to track
+who has done it: "ask 6 people to submit timesheets by Friday 5pm", a survey, a
+poll, a compliance attestation. Creates ONE process holding ONE task per assignee,
+so anyone can see who is done and who is not. Groups expand to one task per member.
+Returns {run_id, task_count, tasks}. WITHOUT this flag you get one SHARED task and
+cannot tell the people apart.
+
+run_id: 32-char hex process ID. Attaches this ad-hoc task to an EXISTING process
+(e.g. a later round of the same fan-out) instead of a new container. That process
+must allow ad-hoc tasks or the API refuses it.
+
+form_fields: questions to put on the task. Each entry needs label, field_type and
+required (pass it explicitly, there is no default). dropdown/radio/multiselect
+also need options, radio needs 2 or more. Read answers back with get_task.
+  form_fields=[{"label": "Hours worked", "field_type": "text", "required": True}]
 
 CORRECT usage:
 - create_standalone_task(title="Review budget", deadline="tomorrow at 3pm", user_emails=["john@example.com"])
-- create_standalone_task(title="QA test", task_type="approval", deadline="April 12 2026", user_names=["Jane Smith"], description="Routine QA validation")
+- create_standalone_task(title="Submit your timesheet", deadline="Friday at 5pm", user_emails=["a@x.com","b@x.com"], separate_task_for_each_assignee=True)
 
 If the user doesn't specify a deadline or assignee, ASK them before calling the tool.""",
         tags={"tasks", "workflow", "create", "write"},
@@ -678,6 +1007,13 @@ If the user doesn't specify a deadline or assignee, ASK them before calling the 
         group_names: Optional[List[str]] = None,
         max_assignable: OptionalInt = None,
         prevent_guest_comment: OptionalBool = None,
+        separate_task_for_each_assignee: OptionalBool = None,
+        # OptionalProcessId, not OptionalString: the latter publishes
+        # {"type":["string","null"],"description":"Optional string parameter"} with no
+        # pattern, and a slot described that way sitting next to ids the model already
+        # holds gets filled with the wrong one. That is the #696 failure exactly.
+        run_id: OptionalProcessId = None,
+        form_fields: Optional[List[Dict[str, Any]]] = None,
     ) -> ToolResult:
         """
         Create a standalone task with explicit structured fields.
@@ -694,9 +1030,18 @@ If the user doesn't specify a deadline or assignee, ASK them before calling the 
             group_names: Group names to assign (optional)
             max_assignable: Maximum number of assignees (optional)
             prevent_guest_comment: Prevent guests from commenting (optional)
+            separate_task_for_each_assignee: Create ONE process holding one task per
+                assignee instead of one shared task, so completion is trackable per
+                person. Groups are expanded to one task per member (optional)
+            run_id: 32-char hex process (run) ID to attach this ad-hoc task to an
+                EXISTING process instead of a new container (optional)
+            form_fields: Field definitions to put on the task. Each entry needs
+                'label', 'field_type' and 'required'; choice types also need
+                'options' (optional)
 
         Returns:
-            Created Task as a dictionary
+            Created Task as a dictionary, or {run_id, task_count, tasks} when
+            separate_task_for_each_assignee is set
         """
         if isinstance(user_names, str):
             user_names = [user_names]
@@ -729,19 +1074,54 @@ If the user doesn't specify a deadline or assignee, ASK them before calling the 
             groups=group_ids or [],
         )
 
-        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            task = sdk.tasks.create_task(
-                org_id=org_id,
-                title=title.strip(),
-                deadline=parsed_deadline,
-                owners=owners,
-                description=description.strip() if description else None,
-                task_type=task_type or "task",
-                max_assignable=max_assignable,
-                prevent_guest_comment=prevent_guest_comment,
+        resolved_task_type = task_type or "task"
+        if resolved_task_type not in _TASK_TYPES:
+            raise ToolError(
+                f"task_type must be one of: {', '.join(sorted(_TASK_TYPES))}"
             )
+        if max_assignable is not None and max_assignable <= 0:
+            raise ToolError("max_assignable must be a positive integer")
 
-        result = serialize_task(task) if task else {}
+        _validate_task_form_fields(form_fields)
+
+        # Field-for-field the body tallyfy 1.3.10 builds, so the default path is
+        # unchanged, plus the three parameters its signature cannot carry.
+        payload: Dict[str, Any] = {
+            "title": title.strip(),
+            "deadline": parsed_deadline,
+            "owners": {
+                "users": owners.users or [],
+                "guests": owners.guests or [],
+                "groups": owners.groups or [],
+            },
+            "task_type": resolved_task_type,
+            "separate_task_for_each_assignee": bool(separate_task_for_each_assignee),
+            "status": "not-started",
+            "everyone_must_complete": False,
+            "is_soft_start_date": True,
+        }
+        if description:
+            payload["summary"] = description.strip()
+        if max_assignable is not None:
+            payload["max_assignable"] = max_assignable
+        if prevent_guest_comment is not None:
+            payload["prevent_guest_comment"] = prevent_guest_comment
+        if run_id:
+            payload["run_id"] = run_id
+        if form_fields:
+            payload["form_fields"] = form_fields
+
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            created = _create_one_off_task(sdk, org_id, payload)
+
+            fanout = None
+            if separate_task_for_each_assignee and created.get("run_id"):
+                fanout = _read_back_fanout(sdk, org_id, created["run_id"])
+
+        if fanout is not None:
+            return ToolResult(content=fanout, structured_content=None)
+
+        result = serialize_task(Task.from_dict(created)) if created else {}
         _format_local_deadline(result, parsed_deadline, effective_timezone, utc_fallback)
 
         return ToolResult(content=result, structured_content=None)
@@ -1012,7 +1392,12 @@ Never call this without run_id and task_id.""",
             webhook: Webhook URL to notify on task updates
 
         Returns:
-            Updated task object
+            Updated task object. When `summary` was supplied, the task is
+            re-read so the response carries the STORED `summary` and
+            `original_summary` rather than the values sent; the SDK's Task
+            dataclass has no field for either, so nothing else could show them
+            (#633). Updates that do not touch `summary` issue no extra request
+            and are unchanged.
         """
         if owners is not None and not isinstance(owners, dict):
             raise ToolError(
@@ -1053,14 +1438,23 @@ Never call this without run_id and task_id.""",
                 task_type=task_type,
                 webhook=webhook,
             )
-            return ToolResult(
-                content=serialize_task(result) if result else {},
-                structured_content=None
-            )
+            content = serialize_task(result) if result else {}
+            # Rule 12: a 2xx does not mean the value landed - read it back. Here
+            # the caller structurally CANNOT, because the object the SDK returns
+            # has no `summary` attribute to read (#633; see _task_after_write).
+            # Gated on the caller having supplied a summary, so every other
+            # update issues exactly the requests it issued before.
+            if summary is not None and content:
+                content.update(_task_after_write(
+                    sdk,
+                    f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}",
+                    task_id,
+                ))
+            return ToolResult(content=content, structured_content=None)
 
     @mcp.tool(
         name="get_task",
-        description="Get a single task from a process by ID. REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex). Never call this without both parameters.",
+        description="Get a single task from a process by ID, including any form fields (questions) on it and the answers submitted so far. REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex). Never call this without both parameters.",
         tags={"tasks", "workflow", "read-only"},
         annotations=ToolAnnotations(
             title="Get task",
@@ -1082,19 +1476,22 @@ Never call this without run_id and task_id.""",
             task_id: Task ID to retrieve (REQUIRED - 32-character hex string)
 
         Returns:
-            Task object with full details
+            Task object with full details, including `form_fields` when the task
+            has any
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.tasks.get_task(org_id, run_id, task_id)
-            return ToolResult(
-                content=serialize_task(result) if result else {},
-                structured_content=None
+            # `form_fields` is a Fractal $availableIncludes on TaskTransformer, so a
+            # plain GET returns NO fields and no submitted answers. Without this the
+            # assistant can put questions on a task and then never read the replies.
+            result = _get_task_with_form_fields(
+                sdk, f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}"
             )
+            return ToolResult(content=result, structured_content=None)
 
     @mcp.tool(
         name="get_standalone_task",
-        description="Get a standalone (one-off) task by ID. REQUIRED: 'task_id' (32-char hex). Never call this without task_id.",
+        description="Get a standalone (one-off) task by ID, including any form fields (questions) on it and the answers submitted so far. REQUIRED: 'task_id' (32-char hex). Never call this without task_id.",
         tags={"tasks", "workflow", "read-only", "standalone"},
         annotations=ToolAnnotations(
             title="Get standalone task",
@@ -1115,15 +1512,18 @@ Never call this without run_id and task_id.""",
             task_id: Standalone task ID (REQUIRED - 32-character hex string)
 
         Returns:
-            Task object with full details
+            Task object with full details, including `form_fields` when the task
+            has any
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.tasks.get_standalone_task(org_id, task_id)
-            return ToolResult(
-                content=serialize_task(result) if result else {},
-                structured_content=None
+            # Sibling of get_task (repo rule 16). A fan-out task is BOTH a run task
+            # and a one-off task, so both read tools must surface the answers or the
+            # one the agent happens to pick decides whether it can see them.
+            result = _get_task_with_form_fields(
+                sdk, f"organizations/{org_id}/tasks/{task_id}"
             )
+            return ToolResult(content=result, structured_content=None)
 
     @mcp.tool(
         name="update_standalone_task",
@@ -1205,7 +1605,8 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
             webhook: Webhook URL to notify on task updates
 
         Returns:
-            Updated task object
+            Updated task object. Same `summary` read-back as `update_task`, for
+            the same reason and on the one-off endpoint (#633).
         """
         if owners is not None and not isinstance(owners, dict):
             raise ToolError(
@@ -1252,10 +1653,15 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
                 task_type=task_type,
                 webhook=webhook,
             )
-            return ToolResult(
-                content=serialize_task(result) if result else {},
-                structured_content=None
-            )
+            content = serialize_task(result) if result else {}
+            # Sibling of update_task (rule 16). Same SDK dataclass, same dropped
+            # `summary`, same read-back - and the one-off ENDPOINT, because the
+            # run-scoped path 404s for a task that belongs to no run.
+            if summary is not None and content:
+                content.update(_task_after_write(
+                    sdk, f"organizations/{org_id}/tasks/{task_id}", task_id
+                ))
+            return ToolResult(content=content, structured_content=None)
 
 
     @mcp.tool(
