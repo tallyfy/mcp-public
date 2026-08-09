@@ -35,6 +35,46 @@ TALLYFY_PUBLIC_KEY = os.getenv('TALLYFY_PUBLIC_KEY')
 # Defaults to {TALLYFY_ISSUER}/.well-known/jwks.json.
 TALLYFY_JWKS_URI = os.getenv('TALLYFY_JWKS_URI')
 
+# Whether the `mcp_resource` comparison in tallyfy_auth_provider.py runs at all.
+#
+# ⚠️ TWO SIMILARLY-NAMED FLAGS EXIST AND THEIR DEFAULTS ARE OPPOSITE. Naming
+# them together here because the alternative has been measured twice: a reader
+# checks the wrong one and concludes enforcement is on when it is off, or off
+# when it is on. Both errors were live in this repo's docs for over a year, in
+# opposite directions.
+#
+#   ENFORCE_JWT_AUDIENCE      (THIS one, the SERVER)  default "false"
+#   MCP_ENFORCE_JWT_AUDIENCE  (the HOST, host/core/jwt_audience.py)
+#                                                     default "true"
+#
+# Measured 2026-08-09 from the running containers: this one is EXPLICITLY set to
+# "false" in production and staging (rc=0, so configured off rather than merely
+# defaulting), while the host's is unset and therefore enforcing. The whole
+# audience block below is dead code in every environment we run.
+#
+# Do not flip this by hand. Turning it on is tallyfy/mcp#743's job, gated on the
+# shadow census (mcp_server_jwt_audience_class_total, see
+# utils/tallyfy_auth_provider.classify_audience).
+#
+# ⚠️ WHICH CLASSES GATE WHICH STEP. The cutover is THREE steps, and each one
+# rejects a DIFFERENT set of classes. Reading "the census must read zero" without
+# saying zero for WHAT is how the wrong step gets taken:
+#
+#   Step 1 - flip THIS flag to "true".
+#            Rejects: `vault`, `none`, `unclassified`.
+#            Still accepted: `resource_url`, `legacy_mcp_host`,
+#            `first_party_client` (the last two are exactly the classes an
+#            earlier version of this comment named as the gate, which was
+#            backwards - they are what SURVIVES step 1).
+#   Step 2 - delete the `elif str(aud) == "1"` arm in verify_token.
+#            Additionally rejects: `first_party_client`, which is
+#            chat.tallyfy.com's live authentication path today.
+#   Step 3 - drop MCP_JWT_AUDIENCE from ACCEPTED_MCP_RESOURCES.
+#            Additionally rejects: `legacy_mcp_host`.
+#
+# So step 1 waits on `vault` + `none` + `unclassified` reading zero for a full
+# week, step 2 on `first_party_client`, step 3 on `legacy_mcp_host`. A class at
+# zero for a week is the evidence; a class you did not name is an outage.
 ENFORCE_AUDIENCE = os.getenv("ENFORCE_JWT_AUDIENCE", "false").lower()
 
 

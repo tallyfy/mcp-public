@@ -41,12 +41,13 @@ from mcp.server.auth.provider import AccessToken
 from constants import (
     ACCEPTED_MCP_RESOURCES,
     MCP_JWT_AUDIENCE,
+    MCP_RESOURCE_URL,
     TALLYFY_ENVIRONMENT,
     TALLYFY_ISSUER,
     TALLYFY_JWKS_BASE,
     ENFORCE_AUDIENCE,
 )
-from metrics import record_jwt_validation
+from metrics import record_jwt_validation, record_jwt_audience_class
 logger = logging.getLogger(__name__)
 
 # Bounded LRU + TTL cache of {user_id -> org_id} for session-resume convenience.
@@ -99,6 +100,173 @@ def normalise_accepted_resources(
     if isinstance(expected_audience, str):
         return frozenset({expected_audience})
     return frozenset(expected_audience)
+
+
+# ---------------------------------------------------------------------------
+# Shadow audience census (tallyfy/mcp#743 AC1)
+# ---------------------------------------------------------------------------
+#
+# AC1 says an inventory of who relies on the `aud == "1"` arm must come from
+# production, not from reasoning, and that nothing else on #743 should ship
+# until it exists. This is that inventory. It changes no behaviour: every
+# caller counts and then returns exactly what it would have returned.
+#
+# The vocabulary is CLOSED and is asserted as a complete set in
+# tests/unit/server/test_audience_census.py. A value leaving this tuple is the
+# direction neither a green run nor a diff review surfaces, so it is pinned by
+# name rather than sampled.
+AUDIENCE_CLASSES = (
+    "resource_url",         # mcp_resource == MCP_RESOURCE_URL (canonical RFC 8707 id)
+    "legacy_mcp_host",      # mcp_resource == MCP_JWT_AUDIENCE (the "mcp-host" literal)
+    "first_party_client",   # aud == "1", the Passport client id: chat.tallyfy.com
+    "vault",                # aud == "tallyfy-vault", api-v2's VaultSessionService
+    "none",                 # carries neither claim at all
+    "unclassified",         # a shape nobody anticipated - see below
+)
+
+# api-v2's VaultSessionService signs this with the SAME key and the SAME kid as
+# every other Tallyfy token, so a Vault session token verifies cryptographically
+# here and reaches the accept block. It is a real population, not a curiosity,
+# and folding it silently into `unclassified` would hide it inside the one
+# bucket that is supposed to mean "we do not know what this is".
+VAULT_AUDIENCE = "tallyfy-vault"
+
+# The Laravel Passport OAuth CLIENT id. Not a resource identifier - it names the
+# caller, not this server - which is exactly why #743 wants it gone.
+PASSPORT_CLIENT_AUD = "1"
+
+
+# Substrings that make a claim NAME look like it is trying to be an audience or
+# resource identifier. Deliberately narrow: these three catch a rename
+# (`mcp_resource_v2`, `resource`, `mcp_audience`, `aud_v2`) without matching the
+# claims Tallyfy tokens genuinely carry today - sub, exp, iat, nbf, jti, scopes,
+# org_id, mcp_scopes, client_id, azp - none of which contains any of them.
+_AUDIENCE_SHAPED_KEY_MARKERS = ("resource", "audience", "aud")
+
+
+def _has_audience_shaped_key(claims: dict) -> bool:
+    """True if some claim NAME looks audience-shaped but is not one we read.
+
+    Kept separate from classify_audience so the rename tripwire can be asserted
+    on directly, and so it is obvious that only keys are inspected.
+    """
+    for key in claims:
+        if not isinstance(key, str):
+            continue
+        if key in ("aud", "mcp_resource"):
+            continue
+        lowered = key.lower()
+        if any(marker in lowered for marker in _AUDIENCE_SHAPED_KEY_MARKERS):
+            return True
+    return False
+
+
+def classify_audience(claims, accepted_resources: FrozenSet[str]) -> str:
+    """Name the audience class of one token's claims. Pure; never raises.
+
+    **Precedence mirrors the accept block in `verify_token`, and that is the
+    whole value of this function.** There, `mcp_resource` is checked first and
+    `aud == "1"` is only a fallback, so a token carrying BOTH is admitted by the
+    resource arm and would survive the removal of the legacy one. Classifying it
+    as `first_party_client` would overstate the population that breaks when
+    tallyfy/mcp#743 deletes that arm, and the census exists precisely to size
+    that population. Read top to bottom: the first arm that matches wins, in the
+    same order the real check tries them.
+
+    **Mirroring means mirroring the FALL-THROUGH too, which is the half that is
+    easy to get wrong.** The real check is `if <resource arm> ... elif str(aud)
+    == "1"`, so a token whose `mcp_resource` is present but NOT accepted - a
+    foreign URL, an empty string, a list - does not stop at the resource arm. It
+    falls through and is admitted by the legacy arm. An earlier cut of this
+    function returned `unclassified` for exactly those shapes, which under-counted
+    `first_party_client` by every token that names something we do not accept
+    while carrying `aud: "1"` - and each of those 401s the day the arm is
+    deleted, which is the one number this census exists to produce. So the
+    resource arm here returns only on a MATCH, never on a miss.
+
+    `unclassified` is load-bearing rather than a dumping ground. A token that
+    carries an audience-shaped claim we do not recognise - a renamed claim, a
+    new issuer, a list where a string belongs - must be visible as its own
+    number, because the failure this whole census guards against is a claim
+    rename downstream silently zeroing every bucket. A census reading zero
+    everywhere is indistinguishable from a healthy one unless something says
+    "these tokens arrived and I could not name them".
+
+    Args:
+        claims: Decoded JWT claims, or None if the token could not be decoded.
+            Values are attacker-supplied, so every branch is type-guarded and
+            no claim value ever becomes a metric label.
+        accepted_resources: The provider's own accept-set, passed in rather than
+            imported so the census cannot drift from the check it describes.
+
+    Returns:
+        One of AUDIENCE_CLASSES. Always a str, so the caller can label safely.
+    """
+    if not isinstance(claims, dict):
+        return "unclassified"
+
+    mcp_resource = claims.get("mcp_resource")
+    aud = claims.get("aud")
+
+    # `isinstance` before the set test for the same reason the accept block does
+    # it: `mcp_resource` can arrive as a list or a dict, and `unhashable in
+    # frozenset` raises TypeError. A census that can 500 the auth path is worse
+    # than no census.
+    # ---- Arm 1: the resource arm, tried first exactly as verify_token does.
+    # Returns ONLY on a match. Every miss falls through to arm 2 below, because
+    # the real check is an `elif`, not a second `if`.
+    if isinstance(mcp_resource, str):
+        # MCP_RESOURCE_URL first. If an operator has misconfigured the two env
+        # vars to the same string, the token is reported under the canonical
+        # name, which is the truthful answer to "was this an RFC 8707 token".
+        if mcp_resource == MCP_RESOURCE_URL:
+            return "resource_url"
+        if mcp_resource == MCP_JWT_AUDIENCE:
+            return "legacy_mcp_host"
+        # In the accept-set but matching neither constant: an operator has
+        # widened it by hand. Accepted by the real check, so count it as a
+        # resource-named token rather than pretending we do not understand it.
+        if mcp_resource in accepted_resources:
+            return "resource_url"
+
+    # ---- Arm 2: the legacy `aud == "1"` arm.
+    # `str(aud)` matches the live arm character for character, so the count of
+    # `first_party_client` is exactly the population that 401s the day the arm
+    # is deleted - INCLUDING tokens that also carry an unaccepted `mcp_resource`,
+    # which reach here by the fall-through described in the docstring. `str(None)`
+    # is `"None"` and matches neither literal, so an absent claim needs no guard.
+    aud_str = str(aud)
+    if aud_str == PASSPORT_CLIENT_AUD:
+        return "first_party_client"
+
+    # ---- Neither arm accepts. Everything below is a class that a flip of
+    # ENFORCE_JWT_AUDIENCE to "true" REJECTS today, which is the opposite half
+    # of the gate and the half that is easy to leave undocumented.
+    if aud_str == VAULT_AUDIENCE:
+        return "vault"
+
+    if mcp_resource is not None or aud is not None:
+        # It named SOMETHING - a resource we do not accept, a non-string shape
+        # nobody anticipated, or an `aud` matching neither literal (an RFC 7519
+        # array audience stringifies to exactly this). Not "none", and not a
+        # class we can act on: `unclassified` is the honest answer.
+        return "unclassified"
+
+    # Neither claim we read is present. Before calling that "none", check
+    # whether the token carries an audience-shaped claim under a name we do
+    # not read - which is the single failure this whole census exists to
+    # survive. If api-v2 renames `mcp_resource`, every MCP token starts
+    # arriving with neither claim, and a classifier that answers "none"
+    # reports a clean, confident, entirely wrong zero for the population
+    # #743 is about to 401. Answering "unclassified" instead makes the
+    # rename visible as a number on the day it happens.
+    #
+    # KEY NAMES ONLY, never values: a label is derived from the fixed
+    # vocabulary regardless, and reading a value here would be the first
+    # step toward the cardinality bug the counter's declaration warns about.
+    if _has_audience_shaped_key(claims):
+        return "unclassified"
+    return "none"
 
 
 class TallyfyAuthProvider(JWTVerifier):
@@ -232,6 +400,25 @@ class TallyfyAuthProvider(JWTVerifier):
             logger.warning("Failed to decode JWT claims")
             record_jwt_validation('failed')
             return None
+
+        # SHADOW CENSUS (tallyfy/mcp#743 AC1). Counts, changes nothing.
+        #
+        # ⚠️ This sits OUTSIDE the `if ENFORCE_AUDIENCE == "true":` block below,
+        # deliberately and load-bearingly. That flag is explicitly "false" in
+        # production AND staging (measured 2026-08-09 from the running
+        # containers), so anything inside that block executes nowhere we run and
+        # a census placed there would report a confident zero forever. Moving
+        # these two lines inside it silently destroys the measurement while
+        # leaving the counter present in /metrics, which is worse than deleting
+        # it. `test_census_runs_when_enforcement_is_off` goes red if it moves.
+        #
+        # The population counted is every token that has passed RS256 signature
+        # verification and yielded decodable claims: the tokens whose acceptance
+        # #743 proposes to narrow. Tokens rejected before this point were never
+        # candidates for that narrowing.
+        record_jwt_audience_class(
+            classify_audience(claims, self.accepted_resources)
+        )
 
         # Accept two token types:
         # 1. MCP-issued tokens, whose `mcp_resource` claim names this server -

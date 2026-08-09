@@ -91,6 +91,27 @@ jwt_validation_total = Counter(
     ['status']  # status: success, failed, invalid_token
 )
 
+# Shadow census of WHO is presenting tokens here (tallyfy/mcp#743 AC1).
+#
+# Counted on every signature-verified token REGARDLESS of ENFORCE_JWT_AUDIENCE,
+# which is the entire point: that flag is "false" in production and staging
+# (measured 2026-08-09), so the accept/reject block it guards never runs and
+# `jwt_validation_total` therefore reports nothing but `status="success"`. A
+# quiet metric is equally consistent with a healthy population and with a
+# control that is switched off, so this counter answers the question the other
+# one cannot.
+#
+# The label vocabulary is CLOSED - the six values in AUDIENCE_CLASSES and
+# nothing else. `claims` is decoded from an attacker-supplied JWT, so a label
+# derived from a claim VALUE would let any caller mint unbounded time series
+# and exhaust Prometheus memory. classify_audience() maps to a fixed set
+# instead, capping cardinality at 6 per environment.
+jwt_audience_class_total = Counter(
+    'mcp_server_jwt_audience_class_total',
+    'Verified JWTs by audience class, counted regardless of ENFORCE_JWT_AUDIENCE',
+    ['audience_class']  # see utils.tallyfy_auth_provider.AUDIENCE_CLASSES
+)
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -361,3 +382,17 @@ def record_jwt_validation(status: str):
         status: Validation status (success, failed, invalid_token)
     """
     jwt_validation_total.labels(status=status).inc()
+
+
+def record_jwt_audience_class(audience_class: str):
+    """
+    Record the audience class of one signature-verified JWT.
+
+    Changes no behaviour: the caller counts and then returns exactly what it
+    would have returned anyway. See the counter's declaration above for why
+    the label vocabulary must stay closed.
+
+    Args:
+        audience_class: One of utils.tallyfy_auth_provider.AUDIENCE_CLASSES
+    """
+    jwt_audience_class_total.labels(audience_class=audience_class).inc()
