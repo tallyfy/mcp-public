@@ -33,15 +33,26 @@ logger = logging.getLogger(__name__)
 # @mention parsing (W-bug6 / issue #173)
 # ---------------------------------------------------------------------------
 #
-# THE ONLY THING THAT FIRES A MENTION NOTIFICATION IS ``@[<user_id>]`` MARKUP
-# INSIDE THE COMMENT BODY.
+# A MENTION NOTIFICATION IS FIRED ONLY BY ``@[...]`` MARKUP INSIDE THE STORED
+# COMMENT BODY — and the id inside the brackets may be a USER id or a GROUP id.
 #
-# api-v2 parses mentions out of the stored content — ``atmentioned_users()``
-# (app/Helpers/email.php:500) feeds ``atmentioned_users_ids()``
-# (app/Helpers/email.php:458-460), which is literally
-# ``preg_match_all('/@\[(\d+)]/', $content, $matches)``. The resulting users
-# are what ``App\Messaging\Comment::postOn()`` (app/Messaging/Comment.php:70)
-# dispatches ``users.at_mentioned`` for.
+# api-v2 parses mentions out of the stored content. ``atmentioned_users()``
+# (app/Helpers/email.php) merges TWO sources, and this note used to name only
+# the first:
+#   - ``atmentioned_users_ids()``       ``preg_match_all('/@\[(\d+)]/', ...)``
+#     digits only, so it matches user ids.
+#   - ``atmentioned_group_user_ids()``  ``preg_match_all('/@\[([a-z0-9]+)]/', ...)``
+#     the SAME bracket syntax, alphanumeric. It subtracts the digit-only ids it
+#     just saw and treats the remainder as group ids, expanding each one to every
+#     ``groups_members.user_id`` in the org.
+# The union of both is what ``App\Messaging\Comment::postOn()`` dispatches
+# ``users.at_mentioned`` for, so ``@[<group_id>]`` notifies every member of that
+# group.
+#
+# No functional gap here: ``_MARKUP_MENTION_RE`` below is digit-only, so a
+# 32-hex group mention already written by the caller passes through the rewrite
+# untouched and reaches api-v2 intact. What this tool cannot do is RESOLVE a
+# group by name into ``@[<group_id>]``; pass the group id yourself.
 #
 # There is NO request-side ``sent_to`` parameter. PostCommentRequest
 # (app/Http/Requests/Tasks/PostCommentRequest.php) validates only
@@ -380,11 +391,12 @@ Optional:
   This server adds no default; omit it and guests will NOT see the comment.
 - 'sent_to': numeric user IDs to @mention. Look up IDs via get_organization_users first.
 
-@MENTIONS: a user is notified ONLY when the stored body contains @[<user_id>] markup,
-so 'sent_to' entries are rendered into the body as that. You can also write the mention
-straight into 'content' — @[20059], @20059, @alice@acme.com, @"Alice Smith" and @alice
-all resolve and are normalised to @[20059]. An unresolvable token stays plain text and
-notifies nobody, so prefer a numeric ID. Mentioning someone also grants them task access.
+@MENTIONS: notification fires ONLY on @[<id>] markup in the stored body; the id may be a
+user id or a group id (a group notifies every member). 'sent_to' is rendered into the body
+as that, and you may write mentions into 'content' — @[20059], @20059, @alice@acme.com,
+@"Alice Smith" and @alice all normalise to @[20059]. An unresolvable token stays plain text
+and notifies nobody, so prefer a numeric ID. A mention only NOTIFIES and usually grants no
+access, so never report that it did; a +email@domain mention DOES add an assignee.
 
 LABEL='resolve' SEMANTICS (issue #172):
 - If the task HAS an unresolved label='problem' thread, this clears that flag via the resolve endpoint, matching the native app. Pass 'run_id' to avoid an extra lookup.
@@ -395,9 +407,7 @@ CORRECT usage:
   add_task_comment(task_id="abc123...", content="Everything is on track")
   add_task_comment(task_id="abc123...", run_id="def456...", content="Blocked on approval", label="problem")
   add_task_comment(task_id="abc123...", run_id="def456...", content="Issue resolved", label="resolve")
-  add_task_comment(task_id="abc123...", content="Please review", sent_to=[20059])
-
-Never call this without both required parameters.""",
+  add_task_comment(task_id="abc123...", content="Please review", sent_to=[20059])""",
         tags=["tasks", "comments", "threads", "write", "collaboration"],
         annotations=ToolAnnotations(
             title="Add task comment",

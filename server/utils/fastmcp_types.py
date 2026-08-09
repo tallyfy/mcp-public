@@ -75,6 +75,17 @@ GuestName = Annotated[str, Field(
     examples=["John", "Smith"]
 )]
 
+# Names are OPTIONAL on a guest (#622 item 8). api-v2's CreateGuestRequest declares
+# 'first_name' => 'nullable|max:200|string' and requires only 'email', so a mandatory
+# GuestName made an email-only guest legal at the API and impossible through the tool.
+# No min_length: a blank name is treated as "not supplied" and its key is omitted.
+OptionalGuestName = Annotated[Optional[str], Field(
+    default=None,
+    max_length=200,
+    description="Guest's first or last name (optional, max 200 characters)",
+    examples=["John", "Smith"]
+)]
+
 # Task-related types
 #
 # NOTE (#696): TaskId and ProcessId are structurally identical (32-char hex), so the

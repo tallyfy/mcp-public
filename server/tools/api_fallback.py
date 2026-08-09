@@ -195,7 +195,7 @@ async def _execute(
         if gate.reason == "blocked":
             raise ToolError(
                 f"Path {resolved_path} is in the block-list "
-                "(/admin, /support, /oauth, /metrics, etc.)"
+                "(/support, /auth, /oauth, /metrics, /health, /ready, /debug)"
             )
         raise ToolError(
             f"Access denied: {gate.reason}. Required scope: {gate.required_scope}"
@@ -242,8 +242,14 @@ async def _execute(
 
 
 _SHARED_RULES = (
-    "Paths under /admin, /support, /auth, /oauth, /metrics, /health, "
-    "/ready, /debug are BLOCKED and return an error. The path MUST exist "
+    "Paths under /support, /auth, /oauth, /metrics, /health, /ready and "
+    "/debug are BLOCKED and return an error. This is a PATH-PREFIX block "
+    "list and nothing more: it does NOT restrict administrative actions, "
+    "because api-v2 gates those by middleware on ordinary org-scoped paths "
+    "(user role changes, disable, delete, approve, reject, tag delete, "
+    "organization roles) rather than behind an /admin prefix. Those remain "
+    "reachable here, limited only by the caller's own permissions. The "
+    "path MUST exist "
     "in the live Tallyfy OpenAPI spec (auto-refreshed hourly); confirm it "
     f"at {TALLYFY_API_DOCS_URL}. The '{{org}}' placeholder is substituted "
     "with the authenticated org_id, so pass it literally. Other path "

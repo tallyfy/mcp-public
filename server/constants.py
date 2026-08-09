@@ -51,7 +51,8 @@ TALLYFY_AUTH_SERVER = os.getenv(
 )
 
 # MCP Resource URL (canonical identifier for this protected resource — used in
-# OAuth discovery metadata per RFC 9728). NOT used for JWT audience verification.
+# OAuth discovery metadata per RFC 9728, and accepted in the `mcp_resource` JWT
+# claim — see ACCEPTED_MCP_RESOURCES below).
 MCP_RESOURCE_URL = os.getenv("MCP_RESOURCE_URL", "https://mcp.tallyfy.com")
 
 # MCP JWT audience — the value api-v2 emits in the `mcp_resource` JWT claim.
@@ -60,6 +61,33 @@ MCP_RESOURCE_URL = os.getenv("MCP_RESOURCE_URL", "https://mcp.tallyfy.com")
 # the integer OAuth client ID), so the MCP identifier lives in a custom claim.
 # Default "mcp-host" matches api-v2's config('mcp.oauth.jwt_audience').
 MCP_JWT_AUDIENCE = os.getenv("MCP_JWT_AUDIENCE", "mcp-host")
+
+# The values a token's `mcp_resource` claim may carry and still be accepted as
+# naming THIS server. Two entries, deliberately, and the pair is the whole point
+# of issue #812:
+#
+#   MCP_RESOURCE_URL   the canonical RFC 8707 resource identifier. It is what
+#                      /.well-known/oauth-protected-resource already publishes,
+#                      what api-v2 will emit once tallyfy/api-v2#9802 lands, and
+#                      what any RFC 8707 `resource` parameter would name. Before
+#                      this constant existed we advertised this value and then
+#                      compared against a different one, so a correctly-formed
+#                      token would have been rejected.
+#
+#   MCP_JWT_AUDIENCE   the legacy literal ("mcp-host"). Every token in
+#                      circulation today carries this, so it must stay accepted
+#                      until they have all expired. api-v2's `mcp:mint-token`
+#                      allows a 180-day lifetime (api-v2 config/mcp.php), so the
+#                      floor for removal is 180 days after #9802 ships, not the
+#                      day it ships.
+#
+# LEGACY-REMOVAL (added 2026-08-09): dropping MCP_JWT_AUDIENCE from this set is
+# tallyfy/mcp#743's job, gated on the shadow census reading zero for the legacy
+# class for a full week. Do not narrow it here.
+ACCEPTED_MCP_RESOURCES: FrozenSet[str] = frozenset({
+    MCP_RESOURCE_URL,
+    MCP_JWT_AUDIENCE,
+})
 
 # Allowlist of hostnames that are acceptable to reflect in OAuth discovery URLs.
 # Any X-Forwarded-Host / Host header not in this set is ignored and

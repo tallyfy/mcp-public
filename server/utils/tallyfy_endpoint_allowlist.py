@@ -36,6 +36,12 @@ from typing import FrozenSet, Iterable, Optional, Tuple
 # fallback tool. Patterns are matched against the normalized path (no
 # trailing slash, no query string).
 _BLOCKED_PREFIXES: Tuple[re.Pattern, ...] = (
+    # NOTE (#622 item 9): this pattern currently matches NOTHING. api-v2 has no
+    # prefix('admin') route group — its admin surface is org-scoped and gated by
+    # `Route::middleware('admin')` on ordinary paths (users/{id}/role, /disable,
+    # /delete, /approve, /reject, tag delete, organization-roles). It is kept as a
+    # forward guard in case such a prefix is ever added, NOT as a live restraint,
+    # and the tool descriptions must not advertise it as one.
     re.compile(r"^/admin(/|$)"),
     re.compile(r"^/support(/|$)"),
     re.compile(r"^/webhooks/internal(/|$)"),

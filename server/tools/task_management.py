@@ -9,7 +9,11 @@ from typing import List, Dict, Any, Optional, Union
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
 from tallyfy import TallyfySDK, TaskOwners
-from tallyfy.models import Task
+# `tallyfy.models.Task` is deliberately NOT imported. Every task response in this
+# module is now serialized from the raw api-v2 body through
+# `_serialize_task_response`, because `Task.from_dict` drops any field the
+# dataclass does not enumerate (#784, root cause tallyfy/sdk#33). Re-adding the
+# import is the first step of reintroducing that loss.
 from mcp.types import ToolAnnotations
 from utils.date_utils import DateExtractor
 from utils.fastmcp_errors import handle_tallyfy_errors
@@ -202,6 +206,35 @@ def _get_task_with_form_fields(sdk, endpoint: str) -> Dict[str, Any]:
     submitted answer lives (NOT `value`).
     """
     response = sdk._make_request("GET", endpoint, params={"with": "form_fields"})
+    return _serialize_task_response(response)
+
+
+def _serialize_task_response(response: Any) -> Dict[str, Any]:
+    """Serialize a RAW api-v2 task body, keeping every field the API sent.
+
+    The one place any task response is turned into a payload, so the read paths
+    and the write paths cannot drift apart about what a task looks like (#784).
+
+    **Why the raw dict and not the SDK dataclass.** `tallyfy.models.Task`
+    enumerates 43 fields, and `Task.from_dict` keeps only those. Measured
+    2026-08-07 against `tallyfy==1.3.10`: feeding a body carrying `summary`,
+    `original_summary` and `form_fields` through it drops all three, silently,
+    while `title`, `taskdata` and `status` parse correctly. So the model did read
+    the body; it simply has no attribute to put those keys in. `serialize_task`
+    on the SAME raw dict returns them. That is `tallyfy/sdk#33`, and until it
+    ships every field api-v2 adds is dropped here until someone edits a
+    dataclass, with nothing anywhere reporting the loss.
+
+    Two shapes are handled, both seen in real responses:
+
+    * the Fractal envelope, `{"data": {...}}`, unwrapped to the task itself;
+    * the `form_fields` include, which arrives Fractal-wrapped a second time as
+      `form_fields.data`, unwrapped to a plain list. Each entry carries
+      `field_value`, which is where the submitted answer lives, NOT `value`.
+
+    Anything that is not a dict yields `{}`, because `ToolResult` requires
+    non-None content and an empty payload is the established sentinel.
+    """
     raw = response.get("data", response) if isinstance(response, dict) else response
     if not isinstance(raw, dict):
         return {}
@@ -212,6 +245,58 @@ def _get_task_with_form_fields(sdk, endpoint: str) -> Dict[str, Any]:
         raw["form_fields"] = fields.get("data") or []
 
     return serialize_task(raw)
+
+
+def _complete_task_raw(
+    sdk,
+    org_id: str,
+    run_id: str,
+    task_id: str,
+    is_approved: Optional[bool] = None,
+    override_user: Optional[int] = None,
+) -> Dict[str, Any]:
+    """POST a task completion and keep the whole response body (#784).
+
+    Same endpoint and body as `sdk.tasks.complete_task`, read from its source:
+    `POST organizations/{org}/runs/{run}/completed-tasks` with `{"task_id": ...}`.
+    The ONLY difference is the last line. The SDK ends in
+    `Task.from_dict(response['data'])`, which drops `summary` and
+    `original_summary`, and it exposes no hook to capture the body first.
+
+    Going raw rather than re-reading is what makes this free. A post-write
+    read-back like `_task_after_write` would also recover the fields, at one
+    extra GET on the most frequently called write in the server. `sdk._make_request`
+    is this repo's established escape hatch for exactly this situation (see
+    `_create_one_off_task`), and it keeps the SDK's session, auth headers, retry
+    logic and the Prometheus instrumentation from `utils/sdk_metrics_patch.py`,
+    all of which a hand-rolled httpx call would lose.
+
+    Validation is not lost with it: `run_id` and `task_id` reach this through
+    the `ProcessId` and `TaskId` Pydantic types, which Pydantic enforces before
+    the tool body runs, and those are stricter than the SDK's own checks.
+    """
+    body: Dict[str, Any] = {"task_id": task_id}
+    if is_approved is not None:
+        body["is_approved"] = is_approved
+    if override_user is not None:
+        body["override_user"] = override_user
+
+    return sdk._make_request(
+        "POST", f"organizations/{org_id}/runs/{run_id}/completed-tasks", data=body
+    )
+
+
+def _reopen_task_raw(sdk, org_id: str, run_id: str, task_id: str) -> Any:
+    """DELETE a task completion and keep the whole response body (#784).
+
+    The sibling of `_complete_task_raw`, and it exists for the same reason: the
+    SDK's `reopen_task` ends in `Task.from_dict(...)`. Endpoint read from its
+    source: `DELETE organizations/{org}/runs/{run}/completed-tasks/{task}`.
+    """
+    return sdk._make_request(
+        "DELETE",
+        f"organizations/{org_id}/runs/{run_id}/completed-tasks/{task_id}",
+    )
 
 
 def _task_after_write(sdk, endpoint: str, task_id: str) -> Dict[str, Any]:
@@ -950,8 +1035,8 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         name="create_standalone_task",
         description="""Create a standalone (one-off) task with explicit structured fields.
 
-NOTE: Tallyfy creates a lightweight process container for every standalone task. The
-task still appears as a one-off task (is_oneoff_task: true).
+NOTE: no process is created by default (is_oneoff_task: true), so the task will not appear
+in get_organization_runs. Only the fan-out flag below creates one.
 
 REQUIRED: title, deadline, at least one assignee.
 
@@ -971,7 +1056,7 @@ Returns {run_id, task_count, tasks}. WITHOUT this flag you get one SHARED task a
 cannot tell the people apart.
 
 run_id: 32-char hex process ID. Attaches this ad-hoc task to an EXISTING process
-(e.g. a later round of the same fan-out) instead of a new container. That process
+(e.g. a later round of the same fan-out) rather than standing alone. That process
 must allow ad-hoc tasks or the API refuses it.
 
 form_fields: questions to put on the task. Each entry needs label, field_type and
@@ -1121,7 +1206,11 @@ If the user doesn't specify a deadline or assignee, ASK them before calling the 
         if fanout is not None:
             return ToolResult(content=fanout, structured_content=None)
 
-        result = serialize_task(Task.from_dict(created)) if created else {}
+        # `created` is already the raw response dict -- the two lines above
+        # subscript it. Round-tripping it through Task.from_dict dropped
+        # `summary` (the description this tool just wrote), `original_summary`
+        # and `form_fields`, and saved exactly zero requests by doing so (#784).
+        result = _serialize_task_response(created) if created else {}
         _format_local_deadline(result, parsed_deadline, effective_timezone, utc_fallback)
 
         return ToolResult(content=result, structured_content=None)
@@ -1226,13 +1315,13 @@ Never call this without both required parameters.""",
                     # is_approved is not part of the completion contract, so drop it
                     # rather than send a value the API ignores or misinterprets.
                     forwarded_is_approved = None
-            result = sdk.tasks.complete_task(
-                org_id, run_id, task_id,
+            response = _complete_task_raw(
+                sdk, org_id, run_id, task_id,
                 is_approved=forwarded_is_approved,
                 override_user=override_user,
             )
             return ToolResult(
-                content=serialize_task(result) if result else {},
+                content=_serialize_task_response(response),
                 structured_content=None
             )
 
@@ -1297,12 +1386,12 @@ Never call this without all three required parameters. Always ask the user to pr
             )
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.tasks.reopen_task(org_id, run_id, task_id)
+            response = _reopen_task_raw(sdk, org_id, run_id, task_id)
             sdk.threads.add_task_comment(
                 org_id, task_id, reason.strip()
             )
             return ToolResult(
-                content=serialize_task(result) if result else {},
+                content=_serialize_task_response(response),
                 structured_content=None
             )
 

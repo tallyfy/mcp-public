@@ -33,7 +33,7 @@ from tools.api_fallback import register_api_fallback_tool
 from tools.template_mapping_validation import register_template_mapping_validation_tools
 from utils.org_id_middleware import OrgIdMiddleware
 from utils.tallyfy_spec_cache import SPEC_CACHE
-from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ENFORCE_AUDIENCE, SERVER_VERSION
+from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ACCEPTED_MCP_RESOURCES, ENFORCE_AUDIENCE, SERVER_VERSION
 
 # Load environment variables from .env file
 load_dotenv()
@@ -120,10 +120,18 @@ for logger_name, level_name in SUPPRESSED_LOGGERS.items():
 # The handler validates:
 # - JWT signature (RS256 with Tallyfy's public key)
 # - Token expiration
-# - MCP resource claim (MCP_JWT_AUDIENCE) - enforced if ENFORCE_JWT_AUDIENCE=true
+# - MCP resource claim - the token's `mcp_resource` must name this server, by
+#   either value in ACCEPTED_MCP_RESOURCES. Enforced only if
+#   ENFORCE_JWT_AUDIENCE=true, which as of 2026-08-09 is explicitly "false" in
+#   both production and staging, so this check does not currently run anywhere.
+#
+# Passing the whole accept-set here rather than MCP_JWT_AUDIENCE alone is the
+# point of tallyfy/mcp#812: naming one value at this call site would pin the
+# accept-set back to that one value and silently undo the widening, since an
+# explicit argument is respected verbatim.
 auth_handler = build_auth_provider(
     public_key=TALLYFY_PUBLIC_KEY,
-    expected_audience=MCP_JWT_AUDIENCE,
+    expected_audience=ACCEPTED_MCP_RESOURCES,
     expected_issuer=TALLYFY_ISSUER,
     jwks_uri=TALLYFY_JWKS_URI,
 )

@@ -101,8 +101,9 @@ def register_process_management_tools(mcp):
         description="""Get workflow processes (runs) in the organization. All parameters are optional — call with no parameters to get all runs, or use filters to narrow results.
 
 FILTERS: status, archived, starred, checklist_id (template_id), tag, folder, groups, owners, run_type, me (bool)
-RUN STATUS VALUES: "active", "problem", "delayed", "complete"
-ARCHIVED: Use archived="only" to get archived processes (NOT status="archived").
+RUN STATUS VALUES: "active", "problem", "delayed", "complete", "improvement", "starred", "archived"
+ARCHIVED: archived="only" returns archived processes. status="archived" also works — this tool
+translates it to archived="only" for you.
 RUN TYPE VALUES: "procedure", "form", "document"
 FOLDER: Pass folder ID or folder name (name is auto-resolved to ID).
 OWNERS: Pass numeric user IDs. Filters by collaborator presence (run owner OR task assignee) — NOT by strict process creator/started_by. Use owners= to find runs the user is involved in, not runs they personally launched.
@@ -146,7 +147,9 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
             owners: Filter by numeric user IDs (comma-separated). Matches run owner OR task assignees.
             task_status: Filter by task status ('all', 'in-progress', 'completed')
             groups: Filter by group IDs
-            status: Filter by process status ('active', 'problem', 'delayed', 'complete')
+            status: Filter by process status ('active', 'problem', 'delayed', 'complete',
+                'improvement', 'starred', 'archived'). 'archived' is translated to
+                archived='only' below.
             folder: Filter by folder ID or folder name (names are auto-resolved to IDs)
             checklist_id: Filter by template ID
             starred: Filter by starred status

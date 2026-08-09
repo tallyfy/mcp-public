@@ -14,6 +14,7 @@ from utils.fastmcp_types import (
     UserEmail,
     UserName,
     GuestName,
+    OptionalGuestName,
     UserRole,
     UserId,
     OptionalString,
@@ -263,7 +264,12 @@ If user doesn't provide all required info, ASK them before calling this tool."""
         name="create_guest",
         description="""Create a new guest (external collaborator) in the organization.
 
-REQUIRED: 'email' (valid email), 'first_name', 'last_name'.
+REQUIRED: 'email' (valid email). That is the only required field.
+
+Optional but STRONGLY PREFERRED: 'first_name', 'last_name' (max 200 chars each). The API
+accepts a guest with neither, and a nameless guest shows as just an email address
+everywhere in Tallyfy. Supply them when you know them; do NOT invent placeholders and do
+not stall to interrogate the user for names you were not given.
 
 Optional: 'phone_1' (primary phone, max 20 chars), 'phone_2' (secondary phone,
 max 20 chars), 'company_name' (max 200 chars).
@@ -276,8 +282,7 @@ CORRECT usage:
   create_guest(email="alice@vendor.com", first_name="Alice", last_name="Smith")
   create_guest(email="bob@vendor.com", first_name="Bob", last_name="Jones",
                phone_1="+1 314 555 0100", company_name="Vendor Inc")
-
-Never call this without the three required parameters.""",
+  create_guest(email="carol@vendor.com")   # legal — email is the only required field""",
         tags={"users", "guests", "write"},
         annotations=ToolAnnotations(
             title="Create guest",
@@ -292,8 +297,8 @@ Never call this without the three required parameters.""",
     @handle_tallyfy_errors("create guest")
     def create_guest(
         email: UserEmail,
-        first_name: GuestName,
-        last_name: GuestName,
+        first_name: OptionalGuestName = None,
+        last_name: OptionalGuestName = None,
         phone_1: OptionalString = None,
         phone_2: OptionalString = None,
         company_name: OptionalString = None,
@@ -302,9 +307,9 @@ Never call this without the three required parameters.""",
         Create a new guest in the organization.
 
         Args:
-            email: Guest's email address (REQUIRED)
-            first_name: Guest's first name (REQUIRED)
-            last_name: Guest's last name (REQUIRED)
+            email: Guest's email address (REQUIRED — the only required field)
+            first_name: Guest's first name (optional, max 200 chars; omitted if blank)
+            last_name: Guest's last name (optional, max 200 chars; omitted if blank)
             phone_1: Guest's primary phone number (optional, max 20 chars)
             phone_2: Guest's secondary phone number (optional, max 20 chars)
             company_name: Guest's company name (optional, max 200 chars)
@@ -319,11 +324,14 @@ Never call this without the three required parameters.""",
             # declares phone_1 and phone_2) — so onlyValidatedFields() dropped it and the
             # guest was created phone-less at HTTP 201. Post the correct body directly.
             endpoint = f"organizations/{org_id}/guests"
-            body = {
-                "email": email,
-                "first_name": first_name.strip(),
-                "last_name": last_name.strip(),
-            }
+            body = {"email": email}
+            # Names are nullable at the API (#622 item 8), so omit a blank one entirely
+            # rather than posting "". Sending an empty string would store an empty name
+            # where the customer expects no name at all.
+            if first_name is not None and first_name.strip():
+                body["first_name"] = first_name.strip()
+            if last_name is not None and last_name.strip():
+                body["last_name"] = last_name.strip()
             if phone_1 is not None:
                 body["phone_1"] = phone_1
             if phone_2 is not None:

@@ -34,11 +34,12 @@ import time
 from collections import OrderedDict
 from urllib.parse import urlparse
 import jwt
-from typing import Optional, Dict, List, Union
+from typing import FrozenSet, Iterable, Optional, Dict, List, Union
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.server.auth import TokenVerifier
 from mcp.server.auth.provider import AccessToken
 from constants import (
+    ACCEPTED_MCP_RESOURCES,
     MCP_JWT_AUDIENCE,
     TALLYFY_ENVIRONMENT,
     TALLYFY_ISSUER,
@@ -78,6 +79,28 @@ logger.info(
 )
 
 
+def normalise_accepted_resources(
+    expected_audience: Optional[Union[str, Iterable[str]]],
+) -> FrozenSet[str]:
+    """Turn a caller's ``expected_audience`` into the set the check compares against.
+
+    ``None`` means "no opinion", so the server accepts its own canonical resource
+    identifier alongside the legacy literal (``ACCEPTED_MCP_RESOURCES``). A caller
+    that names values explicitly gets exactly those and nothing added, so an
+    operator can still pin the accept-set to one value.
+
+    A string is one value, not an iterable of characters. That distinction is the
+    whole reason this is a function: ``frozenset("mcp-host")`` is a set of eight
+    letters, which would accept the token whose resource claim is the single
+    character ``"m"`` and reject the real one.
+    """
+    if expected_audience is None:
+        return ACCEPTED_MCP_RESOURCES
+    if isinstance(expected_audience, str):
+        return frozenset({expected_audience})
+    return frozenset(expected_audience)
+
+
 class TallyfyAuthProvider(JWTVerifier):
     """
     Auth provider that extends JWTVerifier with:
@@ -94,7 +117,7 @@ class TallyfyAuthProvider(JWTVerifier):
     def __init__(
         self,
         public_key: Optional[str] = None,
-        expected_audience: Optional[Union[str, List[str]]] = None,
+        expected_audience: Optional[Union[str, Iterable[str]]] = None,
         expected_issuer: Optional[str] = None,
         jwks_uri: Optional[str] = None,
         **kwargs
@@ -108,8 +131,14 @@ class TallyfyAuthProvider(JWTVerifier):
 
         Args:
             public_key: PEM-encoded RSA public key for JWT signature verification
-            expected_audience: Expected MCP resource value. If None, uses MCP_JWT_AUDIENCE
-            expected_issuer: Expected issuer for the JWT. If None, uses TALLYFY_ISSUER
+            expected_audience: The value, or values, a token's `mcp_resource`
+                claim may carry and still name this server. A bare string means
+                exactly that one value. If None, the accept-set is
+                ACCEPTED_MCP_RESOURCES - the canonical resource URL plus the
+                legacy literal.
+            expected_issuer: Recorded, never enforced. See the note in the body:
+                Tallyfy's MCP tokens carry no `iss` claim, so enforcing one would
+                reject every token. Used only to derive a JWKS URL.
             jwks_uri: URL of Tallyfy's JWKS document, used instead of `public_key`.
                 Keys are fetched lazily on the first token verification (never at
                 construction), so a server configured this way still starts offline
@@ -117,6 +146,31 @@ class TallyfyAuthProvider(JWTVerifier):
         """
         super().__init__(public_key=public_key, jwks_uri=jwks_uri, **kwargs)
         self.expected_audience = expected_audience or MCP_JWT_AUDIENCE
+
+        # The set the `mcp_resource` check actually compares against. Kept
+        # separate from `expected_audience` above, which callers and tests read
+        # back verbatim and which must therefore stay whatever was passed in.
+        #
+        # Before this existed the check was `mcp_resource == self.expected_audience`,
+        # a scalar comparison, which had two consequences worth naming because
+        # neither surfaced as an error:
+        #   - the canonical resource URL this server publishes in
+        #     /.well-known/oauth-protected-resource was NOT accepted, so a
+        #     correctly-formed RFC 8707 token would have been rejected; and
+        #   - the `List[str]` this signature has always advertised could never
+        #     match, since a list is never equal to a string.
+        self.accepted_resources: FrozenSet[str] = normalise_accepted_resources(
+            expected_audience
+        )
+
+        # NOT ENFORCED ANYWHERE, and that is deliberate rather than an oversight.
+        # Tallyfy's authorization server mints MCP tokens with no `iss` claim at
+        # all - see api-v2 McpAccessTokenService, whose payload is exactly
+        # aud/jti/iat/nbf/exp/sub/scopes/org_id/mcp_scopes/mcp_resource. So
+        # forwarding `issuer=` to the parent JWTVerifier would reject 100% of
+        # real tokens, not tighten anything. This attribute exists because
+        # callers pass it and build_auth_provider() uses the PARAMETER to derive
+        # a JWKS URL; it is not an input to any check.
         self.expected_issuer = expected_issuer or TALLYFY_ISSUER
 
     async def verify_token(self, token: str) -> Optional[AccessToken]:
@@ -161,7 +215,12 @@ class TallyfyAuthProvider(JWTVerifier):
                 record_jwt_validation('expired')
                 return None
 
-        # Let parent handle signature verification, issuer, audience, scopes
+        # The parent handles SIGNATURE VERIFICATION and EXPIRY. It does not check
+        # issuer, audience or scopes here, because this class constructs it
+        # without `issuer=` or `audience=` - see __init__ for why forwarding
+        # either would reject every real token. The resource check below is the
+        # only audience-shaped check that runs, and scopes are unenforced
+        # pending tallyfy/mcp#559.
         access_token = await super().verify_token(token)
 
         if access_token is None:
@@ -175,21 +234,36 @@ class TallyfyAuthProvider(JWTVerifier):
             return None
 
         # Accept two token types:
-        # 1. MCP-issued tokens: mcp_resource == "mcp-host"
-        # 2. Passport tokens: aud == "1" (Laravel Passport OAuth client ID)
+        # 1. MCP-issued tokens, whose `mcp_resource` claim names this server -
+        #    either by its canonical resource URL or by the legacy literal. See
+        #    ACCEPTED_MCP_RESOURCES in constants.py for why both are live.
+        # 2. Passport tokens: aud == "1" (Laravel Passport OAuth client ID).
+        #
+        # LEGACY-BYPASS (dated 2026-08-09): arm 2 is NOT dead code. It is the
+        # live authentication path for chat.tallyfy.com, Tallyfy's own AI
+        # sidebar, which presents a first-party client-UI JWT carrying no
+        # `mcp_resource` at all. Deleting it 401s that product for every user.
+        # It may be removed only by tallyfy/mcp#743, after the host is migrated
+        # onto a real MCP token and after the audience census reads zero for
+        # this population for a full week. Do not narrow it here.
         if ENFORCE_AUDIENCE == "true":
             mcp_resource = claims.get("mcp_resource")
             aud = claims.get("aud")
-            if mcp_resource == self.expected_audience:
+            # `isinstance` first, and not for tidiness: `claims` is decoded from
+            # an attacker-supplied JWT, so `mcp_resource` can be a list or a
+            # dict. `unhashable in frozenset` raises TypeError, which would turn
+            # a token that should 401 into a 500. Non-strings fall through to
+            # the reject branch.
+            if isinstance(mcp_resource, str) and mcp_resource in self.accepted_resources:
                 pass
             elif str(aud) == "1":
                 pass
             else:
                 logger.warning(
-                    "JWT rejected: mcp_resource='%s' aud='%s' (expected mcp_resource='%s' or aud='1')",
+                    "JWT rejected: mcp_resource=%r aud=%r (expected mcp_resource in %r or aud='1')",
                     mcp_resource,
                     aud,
-                    self.expected_audience,
+                    sorted(self.accepted_resources),
                 )
                 record_jwt_validation('invalid_token')
                 return None
@@ -273,7 +347,7 @@ def derive_jwks_uri(base: Optional[str]) -> Optional[str]:
 
 def build_auth_provider(
     public_key: Optional[str] = None,
-    expected_audience: Optional[Union[str, List[str]]] = None,
+    expected_audience: Optional[Union[str, Iterable[str]]] = None,
     expected_issuer: Optional[str] = None,
     jwks_uri: Optional[str] = None,
     jwks_base: Optional[str] = None,

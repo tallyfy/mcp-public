@@ -64,6 +64,79 @@ def _find_folder_by_name(folders, name: str):
     return None
 
 
+# Keys api-v2's CreateStepRequest carries a rule for, so they survive
+# StepControllerNew::create's onlyValidatedFields() and actually reach the step.
+# 'position' is included because this tool honours it via a follow-up reorder,
+# not because the create endpoint accepts it — it does not.
+_STEP_CREATE_KEYS = frozenset({
+    "title", "summary", "step_type", "webhook", "max_assignable", "position",
+    "assignees", "guests", "groups", "tags",
+    "deadline", "start_date",
+    "allow_guest_owners", "skip_start_process", "can_complete_only_assignees",
+    "everyone_must_complete", "prevent_guest_comment", "is_soft_start_date",
+    "role_changes_every_time", "assign_run_starter", "top_secret",
+    "send_chromeless",
+})
+
+# Keys that reach the API and are then silently dropped, each with the reason and
+# the path that does work. Naming them beats the old behaviour, where the SDK
+# whitelist discarded anything it did not recognise and returned 2xx.
+# 'description' is deliberately absent: it is mapped to 'summary' before the
+# unknown-key check runs, so an entry here would be unreachable.
+_STEP_REJECTED_KEYS = {
+    "alias": (
+        "steps have no settable alias at creation — CreateStepRequest has no rule "
+        "for it, so the API discards it"
+    ),
+    "roles": (
+        "roles cannot be set at step creation — CreateStepRequest has no rule for "
+        "it, so the API discards it"
+    ),
+    "captures": (
+        "use add_form_field_to_step instead, which normalizes option shapes that "
+        "the raw create path does not"
+    ),
+}
+
+
+def _normalize_step_data(step_data: dict) -> dict:
+    """Map caller-friendly aliases onto api-v2's field names and reject the rest.
+
+    'description' is accepted and mapped to 'summary' because the tool documented
+    'description' for a long time and callers learned it from the tool itself.
+    Everything else outside _STEP_CREATE_KEYS raises, naming the offending keys —
+    a key that is silently dropped turns a caller mistake into a successful no-op
+    with an empty step to show for it.
+    """
+    normalized = dict(step_data)
+
+    # 'description' is an accepted alias, not an error — but only when it is not
+    # competing with an explicit 'summary', which would make intent ambiguous.
+    if "description" in normalized:
+        if "summary" in normalized:
+            raise ToolError(
+                "step_data has both 'summary' and 'description'. They are the same "
+                "field; pass only 'summary'."
+            )
+        normalized["summary"] = normalized.pop("description")
+
+    unknown = sorted(set(normalized) - _STEP_CREATE_KEYS)
+    if unknown:
+        details = [
+            f"'{key}': {_STEP_REJECTED_KEYS[key]}" if key in _STEP_REJECTED_KEYS
+            else f"'{key}': not a step field"
+            for key in unknown
+        ]
+        raise ToolError(
+            "step_data contains keys the API will discard, so nothing was sent. "
+            + "; ".join(details)
+            + ". Valid keys: "
+            + ", ".join(sorted(_STEP_CREATE_KEYS))
+        )
+
+    return normalized
+
+
 def register_template_management_tools(mcp):
     """Register all template management tools with the MCP server"""
 
@@ -224,7 +297,14 @@ Use this data to suggest a reasonable deadline by considering:
 - Dependencies and assignee count
 - Whether the step has form fields that require data gathering
 
-Suggest deadlines using: value (number), unit ('minutes', 'hours', 'days', 'weeks'), and option ('from' = relative to process launch).
+DEADLINE SHAPE: all four keys travel together. api-v2 marks value, unit, option and step
+'required_with:deadline', so omitting any one of them is a 422.
+- value: a number.
+- unit: 'minutes', 'hours', 'days', 'weeks' or 'months' (singular forms accepted too).
+- option: the DIRECTION, not the anchor. 'from' = after the anchor, 'prior_to' = before it.
+- step: the ANCHOR. 'start_run' means process launch; any other step ID anchors to that
+  step. Launch-relative is step='start_run', NOT option='from'.
+Default deadline is value=1, unit='day', option='from', step='start_run'.
 
 REQUIRED: Both 'template_id' and 'step_id' must be provided (32-character hex strings). Never call this without both parameters.""",
         tags=["templates", "workflow", "analysis", "deadlines", "read-only"],
@@ -316,9 +396,11 @@ Never call this without all three parameters.""",
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
             step_id: Step ID to add assignees to (REQUIRED - 32-character hex string)
-            assignees: List of numeric user IDs, e.g. [10026, 64878].
-                       Also accepts a dict with 'users' and/or 'guests' keys:
+            assignees: A dict with 'users' and/or 'guests' keys, e.g.
                        {"users": [10026, 64878], "guests": ["alice@example.com"]}.
+                       'users' takes numeric user IDs, 'guests' takes email addresses.
+                       A bare list is REJECTED with a ToolError, so wrap IDs as
+                       {"users": [10026, 64878]} rather than passing [10026, 64878].
 
         Returns:
             Dictionary containing updated step information
@@ -511,8 +593,11 @@ REQUIRED: 'template_id' (32-char hex) and 'step_data' (dict with 'title' field �
 
 step_data keys:
   - 'title': step name (REQUIRED)
-  - 'description': HTML instructions for the step assignee
-  - 'position': 1-based order in the workflow
+  - 'summary': HTML instructions for the step assignee ('description' is accepted as an alias)
+  - 'position': 1-based order in the workflow. Steps always append on creation, so this tool issues a follow-up reorder to place the step. Omit it when adding steps in order.
+  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'after', 'step': 'start_run'}
+  - 'start_date': dict {'value': int, 'unit': 'days'}
+  - 'assignees': member IDs (ints), 'guests': email addresses, 'groups': group IDs
   - 'step_type': one of these 5 values (default 'task'):
       'task'           — standard task, completed by assignee
       'approval'       — approve/reject decision (MUST use this for any approval or review step — enables 'approved'/'rejected' automation conditions)
@@ -551,13 +636,74 @@ Never call this without both parameters.""",
         if not step_data['title']:
             raise ToolError("step_data.title must not be empty")
 
-        # Inject checklist_id — required by the Tallyfy API but not always passed by the caller
-        step_data = {**step_data, 'checklist_id': template_id}
+        step_data = _normalize_step_data(step_data)
+        position = step_data.pop("position", None)
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             result = sdk.templates.add_step_to_template(org_id, template_id, step_data)
-            return ToolResult(content=result, structured_content=None)
+
+            if position is None:
+                return ToolResult(
+                    content=serialize_dataclass(result), structured_content=None
+                )
+
+            # api-v2 discards position at creation TWICE over: CreateStepRequest has
+            # no rule for it, so onlyValidatedFields() strips it, and
+            # StepBuilder::buildBasicStep unsets it explicitly ("when creating a step
+            # it always goes at the end of the step list"). Honour the documented
+            # parameter with the follow-up call the API actually requires.
+            #
+            # This is a no-op in the common case: a template built in order appends
+            # each step at the position it asked for, and set_step_index's UPDATE
+            # carries "where position is distinct from new_position", so no row
+            # changes. It only moves rows when inserting mid-flow, which is exactly
+            # the case that silently failed before.
+            step_id = result.get("id") if isinstance(result, dict) else None
+            if not step_id:
+                return ToolResult(
+                    content=serialize_dataclass(result), structured_content=None
+                )
+
+            try:
+                reordered = sdk.templates.reorder_step(
+                    org_id, template_id, step_id, position
+                )
+            except Exception as exc:
+                # Deliberately not raising: the step EXISTS. Raising here reads as
+                # "the call failed" and invites a retry that creates a duplicate
+                # step. Report the partial success instead so the caller can decide.
+                result = dict(result)
+                result["_position_warning"] = (
+                    f"Step created, but reordering it to position {position} failed "
+                    f"({exc}). The step is at the end of the template. Call "
+                    f"reorder_step to move it."
+                )
+                return ToolResult(
+                    content=serialize_dataclass(result), structured_content=None
+                )
+
+            # Return the REORDER response, not the create response. Both come from
+            # StepTransformer, which emits 'position' => (int) $step->position
+            # unconditionally, so the create payload carries the append-time position
+            # and would report a slot the step no longer occupies — the exact
+            # class of untrue-but-2xx reporting this tool is being fixed for.
+            #
+            # Caveat worth knowing: api-v2 clamps server-side without refreshing the
+            # model. StepService::reorderStep assigns and saves, then the saved hook
+            # runs set_step_index, which clamps via least(greatest(_index,1), n) in
+            # raw SQL. The in-memory model keeps the REQUESTED value, so asking for a
+            # position beyond the step count lands the step at the end while the
+            # response still echoes what was asked for. Filed separately.
+            #
+            # serialize_dataclass on EVERY return arm deliberately: it is the
+            # sanitization chokepoint (#170/#326), translating internal field_type
+            # codes under captures. Applying it to only the reordered arm would make
+            # the returned shape depend on whether the caller passed a position.
+            return ToolResult(
+                content=serialize_dataclass(reordered or result),
+                structured_content=None,
+            )
 
     @mcp.tool(
         name="suggest_kickoff_fields",
@@ -837,7 +983,11 @@ Never call this without template_id.""",
                     raise ToolError(
                         f"Could not read template {template_id} to preserve its existing "
                         f"permissions, so this partial update was not sent. Retry, or pass "
-                        f"title, users and groups explicitly to set them outright."
+                        # The nosec must sit on a line INSIDE the string node, so it
+                        # goes at the end of the last literal rather than after the
+                        # closing paren -- placed outside, it suppresses nothing and
+                        # merely looks like it does.
+                        f"title, users and groups explicitly to set them outright."  # nosec B608 - not SQL; a ToolError message containing the word "update". There is no database in the MCP tools layer.
                     )
                 if "title" not in template_data and getattr(current, "title", None):
                     template_data["title"] = current.title
@@ -859,7 +1009,7 @@ Never call this without template_id.""",
                         raise ToolError(
                             f"Template {template_id} did not return its current "
                             f"'{field}', so a partial update would wipe them. Nothing "
-                            f"was sent. Pass '{field}' explicitly to set it outright."
+                            f"was sent. Pass '{field}' explicitly to set it outright."  # nosec B608 - not SQL either; same shape as the message above.
                         )
                     template_data[field] = list(value)
 
