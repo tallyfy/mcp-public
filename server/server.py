@@ -15,7 +15,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from sentry_config import init_sentry_server
 from utils.tallyfy_auth_provider import build_auth_provider
-from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware
+from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, ToolScopeEnforcementMiddleware
 from routes import register_all_routes
 from tools.user_management import register_user_management_tools
 from tools.task_management import register_task_management_tools
@@ -228,6 +228,21 @@ register_user_interaction_tools(mcp)
 register_api_fallback_tool(mcp)
 register_template_mapping_validation_tools(mcp)
 
+# Enforce the token's mcp_scopes per tool (#559). This is a FastMCP TOOL
+# middleware, so it is added here with mcp.add_middleware() rather than to the
+# ASGI app below -- it authorises a tool NAME, which exists only inside the
+# JSON-RPC body. Registered after the tools so the map it checks against and the
+# tools it guards are established together; ordering relative to the tools does
+# not affect dispatch, but a reader should see them adjacent.
+#
+# A token carrying no mcp_scopes claim passes through untouched, in every mode.
+# That is not leniency -- chat.tallyfy.com and the desktop AI shell forward the
+# user's raw Tallyfy session token, which has no such claim, so failing closed on
+# its absence would 403 Tallyfy's own products. See utils/tool_scopes.py.
+#
+# Mode: MCP_TOOL_SCOPE_ENFORCEMENT = enforce (default) | log | off.
+mcp.add_middleware(ToolScopeEnforcementMiddleware())
+
 # Register all routes and resources
 register_all_routes(mcp)
 
@@ -313,7 +328,7 @@ app.routes.insert(0, Route("/api/tool-names", tool_display_names, methods=["GET"
 # streaming). Intercepts GET/HEAD on "/" for plain browser/monitor requests and
 # returns the landing HTML. MCP client SSE polls (Mcp-Session-Id or
 # Accept: text/event-stream) pass through untouched to the MCP transport.
-from routes.landing import _LANDING_HTML, _render_landing_for_host
+from routes.landing import _LANDING_HTML, _render_landing_for_host  # noqa: E402 - deliberately late: the comment above explains that this middleware is installed after the app and its routes exist
 
 class RootLandingMiddleware:
     def __init__(self, app):

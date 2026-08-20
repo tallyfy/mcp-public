@@ -303,7 +303,21 @@ THE FOLDER'S TYPE MUST MATCH object_type. Folder type is fixed at creation:
 - object_type='template'/'checklist' requires a template folder (the create_folder default).
   Use get_template_folders() to find valid targets.
 
-Returns a relation whose integer id is what remove_object_from_folder takes.
+RETURNS true/false, NOT a relation id. Never invent one.
+
+UNFILING is asymmetric:
+- 'run': linked by a membership row. Get its integer id by LISTING the folder's
+  objects ('id' on each entry), then pass it to remove_object_from_folder.
+- 'template'/'checklist': NO membership row exists. Filing sets folder_id as an
+  attribute on the template. UNFILING A TEMPLATE IS NOT POSSIBLE THROUGH ANY TOOL:
+  remove_object_from_folder needs an integer id that does not exist, and
+  update_template silently DISCARDS folder_id (absent from the SDK's allowed
+  fields, so it returns success having changed nothing). Say so rather than
+  guessing, and never report a template as unfiled. Tracked in mcp#619.
+
+REPEAT CALLS ERROR rather than passing quietly: adding an object already in the
+folder returns 422 "already in this folder". Nothing is duplicated or harmed, so
+treat it as already-done, not as a failure to retry.
 
 Never call this without all three parameters.""",
         tags=["folders", "organization", "write"],
@@ -356,6 +370,15 @@ the 'id' of the entries returned when listing a folder's objects.
 
 CORRECT:   remove_object_from_folder(folder_object_id=12345)
 WRONG:     remove_object_from_folder(folder_object_id="7c9e6679742540de944be07fc1f90ae7")  # that's the process id
+
+PROCESSES ONLY. api-v2 accepts only Run and Task as folder subjects, so a membership
+row exists only for a process. A TEMPLATE is filed by an attribute on the template
+itself, not by a relation, so there is no id to pass here and no way to unfile a
+template through any current tool (see add_object_to_folder). Do not pass a
+template's hex id hoping it works, and do not invent an integer.
+
+add_object_to_folder does NOT return this id. Get it by listing the folder's objects
+and reading the 'id' on each entry.
 
 Never call this without folder_object_id.""",
         tags=["folders", "organization", "write"],

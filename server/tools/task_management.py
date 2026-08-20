@@ -796,11 +796,17 @@ USE THIS TOOL when user asks:
 This tool returns task data including task IDs, run_ids (process IDs), titles, deadlines, and status.
 Use the returned data to answer follow-up questions about "those tasks" without making additional tool calls.
 
-IMPORTANT: Tallyfy has no urgency or priority field. For "urgent" tasks, look for
-status="overdue" or status="hasproblem" in the returned results.
+IMPORTANT: Tallyfy has no urgency or priority field. No task ever carries
+status="overdue" or status="hasproblem"; those are query-side filter values only.
+A task's status is one of: not-started, in-progress, auto-skipped, completed.
+For problem tasks read the has_issues field. For overdue, compare deadline to now.
 
-NOTE: This tool does NOT support status filtering. It returns all tasks for the current user.
-To filter by status, retrieve all tasks and filter the results client-side.
+SCOPE: returns ONLY ACTIVE tasks. api-v2 forces status=active on this endpoint when
+no status is sent, and this tool cannot send one, so completed, archived and
+auto-skipped tasks are removed server-side and never reach you. Filtering the
+results cannot recover them because they are not in the response. For any other
+status, including "what did I complete", call
+get_user_tasks(user_id=..., status="all") instead.
 
 PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. to retrieve subsequent pages.
 meta.total_pages shows how many pages exist. meta.total shows the real count.""",
@@ -820,13 +826,27 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         page: PageNumber = 1,
     ) -> ToolResult:
         """
-        Get tasks assigned to the current user in the organization.
+        Get ACTIVE tasks assigned to the current user in the organization.
+
+        Only active tasks are returned, and that is imposed by api-v2, not by a
+        choice made here. ListUserTasksRequest's constructor runs
+        `request()->mergeIfMissing(['status' => 'active'])`, and the SDK's
+        `get_my_tasks` (tallyfy==1.3.12) takes only org_id/page/per_page, so the
+        key is always missing and the default always applies. Completed and
+        archived tasks are therefore removed before the response is built.
+
+        Measured live 2026-08-12 against production: this endpoint returned 0
+        tasks for an org where `status=all` returned 15.
+
+        Adding a status parameter has to happen in the SDK first; see
+        tallyfy/sdk#76 and mcp#618. Until then `get_user_tasks` is the tool that
+        can filter, because its SDK method does accept `status`.
 
         Args:
             page: Page number to fetch (1-based, default: 1).
 
         Returns:
-            Dict with 'data' (list of tasks) and 'meta' (pagination info).
+            Dict with 'data' (list of ACTIVE tasks) and 'meta' (pagination info).
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -854,10 +874,14 @@ WRONG usage (will fail):
 GUEST USERS: This tool is for org members only. For guest tasks, use
 get_guest_tasks(guest_email="...") or get_guest_tasks(guest_id="...") instead.
 
-For current user's tasks, use get_my_tasks() instead (no user_id needed).
+For the current user's ACTIVE tasks, get_my_tasks() is simpler (no user_id needed).
+But get_my_tasks returns active tasks ONLY, so for the current user's completed or
+archived tasks use this tool with their user_id and status="all".
 
-IMPORTANT: Tallyfy has no "urgent" or "priority" field. For urgent tasks, call with
-no status filter and look for status="overdue" or status="hasproblem" in results.
+IMPORTANT: Tallyfy has no "urgent" or "priority" field. No task ever carries
+status="overdue" or status="hasproblem"; those are query-side filter values only.
+A task's status is one of: not-started, in-progress, auto-skipped, completed.
+For problem tasks read the has_issues field. For overdue, compare deadline to now.
 
 PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.total_pages shows total page count.""",
         tags={"tasks", "workflow", "read-only", "user"},
@@ -1800,10 +1824,12 @@ WRONG usage (will fail):
 - get_guest_tasks() — NO! Must provide at least one identifier
 
 For org member tasks, use get_user_tasks() instead.
-For the current user's tasks, use get_my_tasks() (no identifier needed).
+For the current user's ACTIVE tasks, use get_my_tasks() (no identifier needed).
 
-IMPORTANT: Tallyfy has no "urgent" or "priority" field. For urgent tasks, call with
-no status filter and look for status="overdue" or status="hasproblem" in results.
+IMPORTANT: Tallyfy has no "urgent" or "priority" field. No task ever carries
+status="overdue" or status="hasproblem"; those are query-side filter values only.
+A task's status is one of: not-started, in-progress, auto-skipped, completed.
+For problem tasks read the has_issues field. For overdue, compare deadline to now.
 
 PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.total_pages shows total page count.""",
         tags={"tasks", "workflow", "read-only", "guests"},

@@ -25,9 +25,14 @@ OrganizationId = Annotated[str, Field(
 )]
 
 # User-related types
+# max_length mirrors api-v2: app/Http/Requests/User/InviteUserRequest.php:12 is
+# 'bail|required|string|email:rfc,dns|max:255|banned_host'. Without it an
+# over-length address costs a round trip and comes back as a 422, where a local
+# Pydantic error names the constraint on turn one (#631).
 UserEmail = Annotated[str, Field(
+    max_length=255,
     pattern=r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$",
-    description="Valid email address",
+    description="Valid email address (max 255 characters)",
     examples=["user@example.com"]
 )]
 
@@ -50,6 +55,22 @@ OptionalGuestId = Annotated[Optional[str], Field(
       description="Unique guest identifier string extracted from the guest link URL",
       examples=["MITxZa1z2f5d81bb53f1da7c7fa95a2cfec5cbc2"]
   )]
+
+# Bound comes from api-v2: app/Http/Requests/User/InviteUserRequest.php:16 is
+# 'required|string|max:5000'. A dedicated type rather than OptionalString, per the
+# "OptionalString is a last resort" rule in server/CLAUDE.md (#696) — an untyped
+# optional publishes no format and no bound to the LLM, so an over-long invitation
+# body only failed at the API as a 422 (#631).
+#
+# `required` on the api-v2 side is NOT mirrored here, and that is correct rather than
+# an oversight: the SDK supplies a default before the request is built, so the tool
+# genuinely may omit it.
+InvitationMessage = Annotated[Optional[str], Field(
+    default=None,
+    max_length=5000,
+    description="Custom invitation message (optional, max 5000 characters)",
+    examples=["Welcome to the team. This is where we track our onboarding."]
+)]
 
 UserRole = Annotated[str, Field(
     pattern="^(light|standard|admin)$",
@@ -109,11 +130,11 @@ TaskTitle = Annotated[str, Field(
     examples=["Review quarterly report"]
 )]
 
-TaskDescription = Annotated[str, Field(
-    max_length=2000,
-    description="Detailed task description",
-    examples=["Please review the Q4 financial report and provide feedback"]
-)]
+# TaskDescription was REMOVED in #631. It had zero usages and carried
+# max_length=2000, the same guessed cap that StepDescription carried and that api-v2
+# was measured not to impose. Rather than copy an unverified bound onto a second
+# type, it is gone: a future task-description parameter should derive its bound from
+# the api-v2 FormRequest that governs it, or carry none.
 
 NaturalLanguageInput = Annotated[str, Field(
     min_length=3,
@@ -168,9 +189,20 @@ ProcessTitle = Annotated[str, Field(
     examples=["Employee Onboarding"]
 )]
 
+# Vocabulary is api-v2's, read from app/Models/Run.php:970:
+#   ['active', 'complete', 'problem', 'improvement', 'archived', 'delayed', 'starred']
+# Until #631 this read "^(active|completed|cancelled|paused)$" — only `active`
+# overlapped. `completed`, `cancelled` and `paused` do not exist, and the other six
+# real statuses were missing. It had ZERO usages, which is exactly why it was worth
+# correcting rather than leaving: the next person writing a run-status tool reaches
+# for the type whose name is already right, and inherits a filter that rejects every
+# legal value. A wrong-but-unused shared type is a landmine, not dead code.
 ProcessStatus = Annotated[str, Field(
-    pattern="^(active|completed|cancelled|paused)$",
-    description="Process status (active, completed, cancelled, paused)",
+    pattern="^(active|complete|problem|improvement|archived|delayed|starred)$",
+    description=(
+        "Process (run) status: active, complete, problem, improvement, archived, "
+        "delayed, starred"
+    ),
     examples=["active"]
 )]
 
@@ -191,11 +223,8 @@ TemplateTitle = Annotated[str, Field(
     examples=["New Employee Onboarding Template"]
 )]
 
-TemplateDescription = Annotated[str, Field(
-    max_length=2000,
-    description="Template description",
-    examples=["Standard onboarding process for new employees"]
-)]
+# TemplateDescription was REMOVED in #631, for the same reason as TaskDescription
+# directly above: zero usages, and an unverified max_length=2000.
 
 # Step-related types
 StepId = Annotated[str, Field(
@@ -214,8 +243,16 @@ StepTitle = Annotated[str, Field(
     examples=["Review document", "Complete form"]
 )]
 
+# NO max_length, deliberately. api-v2 imposes none: both
+# app/Http/Requests/Steps/CreateStepRequest.php and UpdateStepRequest.php declare
+# 'summary' => 'nullable', over a `text` column. The 2000-character cap this
+# carried until #631 was a guessed value, and it REJECTED input the API would have
+# stored — a user pasting a 3,000-character SOP excerpt got a Pydantic error naming
+# a limit that does not exist, so the model either truncated their content silently
+# or reported a false constraint. An over-strict type fails in the direction nobody
+# sees, because no server-side error is ever produced. Do not reintroduce a cap here
+# without a real api-v2 rule to cite.
 StepDescription = Annotated[str, Field(
-    max_length=2000,
     description="Step description or summary",
     examples=["Please review the attached document and provide feedback"]
 )]
@@ -230,12 +267,11 @@ FieldId = Annotated[str, Field(
 
 )]
 
-FieldName = Annotated[str, Field(
-    min_length=1,
-    max_length=100,
-    description="Form field name",
-    examples=["employee_name", "start_date"]
-)]
+# FieldName was REMOVED in #631. Zero usages, an unverified max_length=100, and a
+# name that does not correspond to anything api-v2 stores: a capture carries `label`
+# (see FieldLabel above) and an `alias`, not a "name". Its snake_case examples
+# suggested an alias while its description said label, so adopting it would have
+# meant picking one of two contracts at random.
 
 # Mirrors what tools/form_fields.py actually enforces. api-v2's canonical set is
 # BaseCapture::$field_types (BaseCapture.php:183-194) = the 9 below PLUS "email";
@@ -247,9 +283,12 @@ FieldType = Annotated[str, Field(
     examples=["text"]
 )]
 
+# NO max_length. api-v2's CaptureRequestValidator.php:22 is `$prefix.'label' =>
+# 'required'` with no length rule, over a `label text` column. The 200-character cap
+# this carried until #631 was invented. `min_length=1` is kept because `required`
+# genuinely rejects an empty label.
 FieldLabel = Annotated[str, Field(
     min_length=1,
-    max_length=200,
     description="Form field display label",
     examples=["Employee Name", "Start Date"]
 )]
@@ -276,10 +315,45 @@ SearchQuery = Annotated[str, Field(
     examples=["quarterly report", "employee onboarding"]
 )]
 
+# Vocabulary is api-v2's, read from SearchController.php's repo_map (:35-42) and the
+# documented enum at :83: blueprint, process, task, snippet, capture, step.
+#
+# Until #631 this read "^(all|tasks|processes|templates|users)$" — NOT ONE of those
+# five values exists, so any tool adopting the type would have rejected every legal
+# input. The trap is that `tools/search.py::VALID_SEARCH_TYPES` has always held the
+# correct six, so the module reads as verified while this shared type, sitting under
+# a more obvious name, was never reconciled against anything.
+#
+# Kept in sync with that constant deliberately; if the two ever disagree, search.py
+# is the one with live callers and this is the one to fix.
 SearchType = Annotated[str, Field(
-    pattern="^(all|tasks|processes|templates|users)$",
-    description="Type of items to search (all, tasks, processes, templates, users)",
-    examples=["all"]
+    pattern="^(blueprint|process|task|snippet|capture|step)$",
+    description=(
+        "Type of items to search: blueprint, process, task, snippet, capture, step"
+    ),
+    examples=["blueprint"]
+)]
+
+# Tag-related types
+#
+# api-v2's rule is `'color' => 'nullable|string|size:7'`
+# (app/Http/Requests/Tags/CreateTagRequest.php). `size:7` on a string is EXACTLY 7
+# characters, not a maximum, so `#FF5733` is the only shape that fits: 8-char values
+# carrying an alpha channel (`#FF5733AA`), 4-char shorthand (`#F53`) and named colours
+# (`red`) are all rejected by the API. Those three are exactly what a model produces
+# when nothing constrains it, so the bound is enforced here to turn a 422 into a local
+# error that names the required shape (#620).
+#
+# The pattern is narrower than api-v2's rule on purpose. api-v2 checks length only, so
+# `1234567` would satisfy it and store a value no client can render. Requiring the hex
+# shape rejects that too, and no legitimate colour is lost: the only 7-character value
+# Tallyfy's own UI ever writes is `#RRGGBB`.
+TagColor = Annotated[Optional[str], Field(
+    default=None,
+    pattern=r"^#[0-9A-Fa-f]{6}$",
+    description="Hex color, exactly 7 characters as #RRGGBB (e.g. #FF5733). "
+                "Shorthand (#F53), alpha (#FF5733AA) and named colors are rejected.",
+    examples=["#FF5733", "#01803D"]
 )]
 
 # Automation-related types
@@ -299,19 +373,19 @@ RuleName = Annotated[str, Field(
     examples=["Auto-assign manager tasks"]
 )]
 
-RuleCondition = Annotated[str, Field(
-    min_length=1,
-    max_length=500,
-    description="Rule trigger condition",
-    examples=["task.title contains 'urgent'"]
-)]
-
-RuleAction = Annotated[str, Field(
-    min_length=1,
-    max_length=500,
-    description="Rule action to execute",
-    examples=["assign to manager"]
-)]
+# RuleCondition and RuleAction were REMOVED in #631, and these two were the most
+# dangerous of the twelve rather than merely unused.
+#
+# Both typed an automation rule as a free-text STRING, with examples describing a
+# query DSL ("task.title contains 'urgent'", "assign to manager") that Tallyfy does
+# not have. Real automations are STRUCTURED objects: `tools/automation.py` builds
+# conditions and actions as dicts and validates them against api-v2's
+# AutomatedActionRequest vocabularies. A future author reaching for the
+# correctly-named shared type would have been steered into inventing a rule syntax,
+# which no amount of adjusting a max_length would fix.
+#
+# If typed automation parameters are ever wanted, model them on the constants in
+# `tools/template_mapping_validation.py`, which are reconciled against api-v2.
 
 AutomationId = Annotated[str, Field(
     min_length=32,
@@ -341,6 +415,13 @@ UserIdList = Annotated[Optional[List[int]], Field(
     examples=[[12345, 67890]]
 )]
 
+# UserEmailList, UserNameList, TagList and GroupIdList are also unused today, and
+# #631 deliberately KEPT them where it removed five siblings. The distinction is not
+# usage, it is whether the type asserts something that could be false: these four are
+# plain Optional[List[str]] with a description and an example, and carry no bound,
+# pattern or vocabulary. There is nothing in them to be wrong. The five that went
+# each pinned a number or a shape api-v2 does not impose, which is what makes an
+# unused type a landmine rather than dead weight.
 UserEmailList = Annotated[Optional[List[str]], Field(
     description="List of email addresses",
     examples=[["user1@example.com", "user2@example.com"]]

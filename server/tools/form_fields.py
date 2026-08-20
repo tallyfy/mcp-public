@@ -1019,6 +1019,18 @@ Never call this without both parameters.""",
             raise ToolError("field_type 'table' requires a 'columns' list in field_data")
         if ft in ("dropdown", "radio", "multiselect") and not field_data.get("options"):
             raise ToolError(f"field_type '{ft}' requires an 'options' list in field_data")
+        # Every option needs a text (or its `label` alias). This is the guard the other three
+        # option-carrying paths already carry (add_form_field_to_step, update_form_field,
+        # update_kickoff_field) and the one this path was missing - rule 16, swept one sibling
+        # short. Without it a text-less option passes the presence check above, collects an id
+        # from _normalize_option_dicts below, and 422s remotely on `options.0.text field is
+        # required` instead of failing here with a name the caller can act on.
+        if ft in ("dropdown", "radio", "multiselect"):
+            for opt in field_data.get("options") or []:
+                if isinstance(opt, dict) and "text" not in opt and "label" not in opt:
+                    raise ToolError(
+                        f"Each option for field_type '{ft}' must have a 'text' (or 'label') field"
+                    )
         # api-v2 (CaptureRequestValidator.php:73-74) rejects a radio field with < 2 options.
         if ft == "radio" and len(field_data.get("options") or []) < 2:
             raise ToolError("field_type 'radio' requires at least 2 options")

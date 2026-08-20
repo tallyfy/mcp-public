@@ -17,6 +17,7 @@ from utils.fastmcp_types import (
     OptionalGuestName,
     UserRole,
     UserId,
+    InvitationMessage,
     OptionalString,
     OptionalBool,
     PageNumber,
@@ -202,7 +203,7 @@ If user doesn't provide all required info, ASK them before calling this tool."""
         first_name: UserName,
         last_name: UserName,
         role: UserRole = "light",
-        message: OptionalString = None,
+        message: InvitationMessage = None,
     ) -> Optional[GenericDict]:
         """
         Invite a member to your organization.
@@ -212,7 +213,7 @@ If user doesn't provide all required info, ASK them before calling this tool."""
             first_name: First name of the user (REQUIRED - must not be empty)
             last_name: Last name of the user (REQUIRED - must not be empty)
             role: User role - 'light', 'standard', or 'admin' (default: 'light')
-            message: Custom invitation message (optional)
+            message: Custom invitation message (optional, max 5000 characters)
 
         Returns:
             Dict with user data for the invited user, or None if invitation failed

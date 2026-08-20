@@ -255,3 +255,68 @@ def get_jwt_scopes() -> Tuple[str, ...]:
         return ()
 
     return tuple(str(scope) for scope in scopes)
+
+
+def get_mcp_scopes() -> Optional[Tuple[str, ...]]:
+    """The ``mcp_scopes`` claim on the VERIFIED access token, or ``None``.
+
+    This is the claim that names what the user approved on the MCP consent
+    screen. It is NOT the same thing as ``get_jwt_scopes()``: fastmcp's
+    ``JWTVerifier._extract_scopes`` reads the ``scope`` / ``scp`` claims, and a
+    Tallyfy MCP token carries neither. Its Passport ``scopes`` claim is an
+    organization allowlist that ``McpAccessTokenService::issue`` deliberately
+    mints as ``[]``, with the MCP permissions in ``mcp_scopes`` beside it. So
+    ``AccessToken.scopes`` cannot answer this question and never could.
+
+    The claim is read by decoding ``access_token.token`` -- the exact string
+    fastmcp's ``JWTVerifier`` already validated the RS256 signature of before
+    any tool handler or tool middleware ran. Signature verification is disabled
+    on this decode because it has already happened, upstream, on this same
+    string; this is the identical pattern ``get_authenticated_credentials``
+    uses. It deliberately does NOT read ``org_id_middleware.get_jwt_claims()``,
+    whose claims come from an unverified pre-auth decode and are documented
+    there as observability-only.
+
+    Returns:
+        A tuple of scope strings when the token carries an ``mcp_scopes`` claim
+        that is a JSON array, or ``None`` otherwise.
+
+        ``None`` and ``()`` mean different things and callers must not conflate
+        them. ``None`` means the token is not MCP-issued and must NOT be scope
+        gated -- chat.tallyfy.com and the desktop AI shell forward the user's
+        raw Tallyfy session token, which carries no such claim, so gating on
+        its absence would 403 Tallyfy's own products. ``()`` means an MCP token
+        that was granted nothing, which IS gated.
+
+        A present-but-not-a-list claim returns ``None`` and logs a warning. That
+        mirrors api-v2's ``mcpScopesFromRequest``, which returns null unless
+        ``is_array($scopes)``; diverging would mean one token that api-v2
+        accepts and this server refuses. Nothing mints such a token today --
+        ``normaliseScopes`` refuses to -- so the warning exists to make it
+        visible rather than to handle an expected case.
+    """
+    access_token = get_access_token()
+    if access_token is None:
+        return None
+
+    try:
+        claims = jwt.decode(access_token.token, options={"verify_signature": False})
+    except jwt.PyJWTError:
+        # Unreachable for a token that passed RS256 verification. Fail the same
+        # way an absent claim does rather than inventing an empty grant set,
+        # which would deny every gated tool on a token we simply could not read.
+        logger.warning("Could not decode a verified access token to read mcp_scopes")
+        return None
+
+    raw = claims.get("mcp_scopes")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        logger.warning(
+            "Ignoring non-list mcp_scopes claim of type %s; treating this token "
+            "as not MCP-issued, as api-v2's own middleware does",
+            type(raw).__name__,
+        )
+        return None
+
+    return tuple(str(scope) for scope in raw)

@@ -111,6 +111,54 @@ def normalise_accepted_resources(
 # until it exists. This is that inventory. It changes no behaviour: every
 # caller counts and then returns exactly what it would have returned.
 #
+# ---------------------------------------------------------------------------
+# TWO LIMITS ON WHAT THIS INVENTORY ANSWERS. Both measured 2026-08-12, and both
+# are the kind of gap that reads as a clean zero rather than as a gap.
+# ---------------------------------------------------------------------------
+#
+# 1. IT COVERS TWO OF THE THREE ENVIRONMENTS THAT VERIFY TOKENS. The Cloud Run
+#    mirror (`mcp-gcp.tallyfy.com`, the Gemini Enterprise surface) runs this
+#    code and can report it to nobody: `METRICS_PASSWORD` is unset on that
+#    service, so `routes/metrics.py` disables the endpoint and it answers
+#    503 `{"error":"Metrics endpoint not configured"}` where both droplet
+#    surfaces answer 403 `insufficient_scope`. Prometheus scrapes four MCP
+#    targets and none of them is the mirror. Its counters increment in memory
+#    and are read by nothing. So a zero here means "zero on the DigitalOcean
+#    droplet", never "zero everywhere" - and #743 names that very mirror among
+#    the clients a cutover would lock out. Tracked in tallyfy/mcp#836.
+#
+# 2. IT COUNTS AUDIENCE CLASSES, NOT CALLERS. AC1 asks for an inventory of
+#    every live CALLER relying on the legacy arm; this produces the SIZE of
+#    that population, not the identity of its members - deliberately, because
+#    no claim value may become a metric label (see the counter's declaration).
+#    A zero makes identity moot. A NON-zero does not, and answering "who" then
+#    needs a different instrument than this one.
+#
+# 3. A ZERO IN A BUCKET IS ONLY EVIDENCE IF THAT BUCKET'S TRAFFIC HAPPENED.
+#    This is the one that nearly produced a wrong conclusion, so it is stated
+#    as a rule rather than as a caveat. `first_party_client` counts the
+#    population that dies with the legacy arm, and on production it reads 0 -
+#    which looks like "nothing depends on the arm". It is not: over the same
+#    window the production HOST served ZERO AI turns
+#    (`increase(claude_api_duration_seconds_count{environment="production"}[61h])`
+#    = 0, and 0 cumulative since container start), so the sidebar that would
+#    produce those tokens was simply idle. Staging, where the sidebar WAS used
+#    (7 turns), reads `first_party_client` 12 of 12. The inversion between the
+#    environments is explained entirely by USAGE, not by token shape, and it
+#    CONFIRMS the "chat.tallyfy.com rides the legacy arm" claim rather than
+#    refuting it.
+#
+#    So never read this counter without a usage denominator beside it. Require
+#    BOTH: the class at zero, AND real sidebar traffic in the same window.
+#
+# First reading, production, 2026-08-09T21:56:43Z to 2026-08-12T11:04Z, 61.1
+# hours and 1262 verified tokens: `legacy_mcp_host` 1262, every other class 0,
+# with the sibling `mcp_server_jwt_validation_total{status="success"}` reading
+# 1262 as a positive control. Those 1262 are external MCP clients, whose tokens
+# carry `mcp_resource: "mcp-host"`; they are admitted by the resource arm and
+# survive the removal of the legacy one, so they say nothing about it either
+# way. Full numbers, controls and the confounding above are on #743's AC1.
+#
 # The vocabulary is CLOSED and is asserted as a complete set in
 # tests/unit/server/test_audience_census.py. A value leaving this tuple is the
 # direction neither a green run nor a diff review surfaces, so it is pinned by
@@ -387,8 +435,13 @@ class TallyfyAuthProvider(JWTVerifier):
         # issuer, audience or scopes here, because this class constructs it
         # without `issuer=` or `audience=` - see __init__ for why forwarding
         # either would reject every real token. The resource check below is the
-        # only audience-shaped check that runs, and scopes are unenforced
-        # pending tallyfy/mcp#559.
+        # only audience-shaped check that runs.
+        #
+        # Scopes are NOT checked here, and deliberately not: `mcp_scopes` names
+        # what a token may do PER TOOL, and no tool name exists at this layer.
+        # That gate lives in middleware/tool_scope_enforcement.py, which runs on
+        # every tools/call once this verifier has established the token is
+        # genuine. See tallyfy/mcp#559 and utils/tool_scopes.py.
         access_token = await super().verify_token(token)
 
         if access_token is None:

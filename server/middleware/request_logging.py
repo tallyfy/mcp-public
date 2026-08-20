@@ -384,7 +384,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                     transaction.set_data("status_code", status)
                     if mcp_error:
                         transaction.set_data("mcp_error", True)
-            except Exception as e:
+            except Exception:
                 duration = time.time() - start_time
                 # Exception propagates to framework — LoggingIntegration captures it
                 raise
