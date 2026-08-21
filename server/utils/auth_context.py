@@ -202,7 +202,22 @@ def get_authenticated_credentials() -> Tuple[str, str]:
     token_hint = access_token.token[-8:] if len(access_token.token) > 8 else "***"
     logger.info(f"Auth OK │ org={org_id} │ token=...{token_hint}")
 
-    return access_token.token, org_id
+    # The MCP specification forbids presenting the caller's own token to the
+    # upstream API (2026-07-28, "Access Token Privilege Restriction", and again
+    # in "Token Handling"). Swap it for a short-lived downstream token that
+    # carries the same mcp_scopes and drops the mcp_resource claim, so api-v2
+    # can refuse the caller's token everywhere else without refusing ours.
+    #
+    # This is the ONE place it can be done. Every credential a tool presents
+    # comes through this return, so the swap reaches all of them with no
+    # call-site edits. Doing it anywhere else means doing it 123 times and
+    # missing one.
+    #
+    # Inert unless MCP_DOWNSTREAM_TOKEN_EXCHANGE is set; the default is "off".
+    from utils.downstream_token import get_downstream_token
+    api_key = get_downstream_token(access_token.token, org_id, token_claims)
+
+    return api_key, org_id
 
 
 def get_user_id_from_token() -> Optional[str]:

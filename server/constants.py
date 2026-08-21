@@ -47,6 +47,23 @@ TALLYFY_JWKS_URI = os.getenv('TALLYFY_JWKS_URI')
 #   MCP_ENFORCE_JWT_AUDIENCE  (the HOST, host/core/jwt_audience.py)
 #                                                     default "true"
 #
+# ⚠️ A THIRD flag now shares this vocabulary and is a DIFFERENT mechanism:
+#
+#   MCP_DOWNSTREAM_TOKEN_EXCHANGE  (utils/downstream_token.py)  default "off"
+#                                  values: off | shadow | enforce
+#
+# The two above decide whether we CHECK the audience of an inbound token. That
+# one decides whether we stop FORWARDING the inbound token upstream at all, by
+# exchanging it for a separate short-lived credential. Neither implies the
+# other, and neither is a step toward the other.
+#
+# It is deliberately read via os.getenv inside downstream_token._mode() rather
+# than bound here. A module constant is captured at import, which would make it
+# untestable without a reload and un-flippable at runtime. It is NOT declared
+# here as a constant on purpose: an unread key in this file is worse than no
+# key, because someone sets it and believes they changed something. That is
+# exactly what config/mcp.php's rate_limits.dcr was.
+#
 # Measured 2026-08-09 from the running containers: this one is EXPLICITLY set to
 # "false" in production and staging (rc=0, so configured off rather than merely
 # defaulting), while the host's is unset and therefore enforcing. The whole
