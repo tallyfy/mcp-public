@@ -208,6 +208,17 @@ TIME_MAPPINGS = {
 # Metrics & Observability
 # ============================================================================
 
+# Shared secret proving to api-v2 that an X-Tallyfy-Client-IP header really
+# came from this proxy (issue #863). api-v2 honours the forwarded IP only when
+# this matches AND the request arrives from the MCP egress CIDR -- two
+# independent conditions, so a leak of this value alone does not let anyone
+# choose a rate-limit bucket from outside our network.
+#
+# Empty by default and empty means OFF: we send no forwarding header at all,
+# and api-v2 falls back to its socket-level view, which is exactly today's
+# behaviour. That makes this safe to deploy on either side first.
+MCP_PROXY_SHARED_SECRET = os.getenv("MCP_PROXY_SHARED_SECRET", "")
+
 METRICS_ALLOWED_IPS = os.getenv('METRICS_ALLOWED_IPS')
 
 METRICS_USERNAME = os.getenv('METRICS_USERNAME', 'prometheus')

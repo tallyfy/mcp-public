@@ -17,6 +17,7 @@ References:
 from starlette.responses import JSONResponse
 
 from constants import SERVER_VERSION
+from routes.oauth import SUPPORTED_SCOPES
 
 
 _SERVER_CARD = {
@@ -47,14 +48,11 @@ _SERVER_CARD = {
             "authorizationServer": "https://go.tallyfy.com",
             "discoveryUrl": "https://mcp.tallyfy.com/.well-known/oauth-authorization-server",
             "resource": "https://mcp.tallyfy.com",
-            "scopes": [
-                "mcp.tasks.read",
-                "mcp.tasks.write",
-                "mcp.processes.read",
-                "mcp.processes.write",
-                "mcp.templates.read",
-                "mcp.templates.write",
-            ],
+            # Derived from the OAuth discovery document, never hand-listed.
+            # A literal list here silently under-declares the moment a scope is
+            # added: this advertised 6 of 12 for months (issue #860), and it is
+            # the artifact directory reviewers read. See test_server_card.py.
+            "scopes": list(SUPPORTED_SCOPES),
         },
     },
     "transports": [

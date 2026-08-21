@@ -16,6 +16,7 @@ from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
+from utils.client_ip import resolve_client_ip
 from constants import RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,12 @@ _last_cleanup = time.monotonic()
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Rate-limit unauthenticated requests by client IP."""
+    """Rate-limit unauthenticated requests, bucketed per originating client IP.
+
+    The IP is resolved via utils.client_ip.resolve_client_ip rather than read
+    off the socket, because behind the tunnel the socket is always loopback
+    (issue #864).
+    """
 
     async def dispatch(self, request: StarletteRequest, call_next):
         # Only rate-limit unauthenticated requests
@@ -69,8 +75,19 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if auth_header.lower().startswith("bearer "):
             return await call_next(request)
 
-        # Extract client IP
-        ip = request.client.host if request.client else "unknown"
+        # Extract client IP.
+        #
+        # issue #864: this used to read request.client.host directly. Behind
+        # Tallyfy's Cloudflare tunnel that terminates on the same host, so it
+        # is LOOPBACK for every request -- every caller in the world collapsed
+        # onto one bucket and RATE_LIMIT_MAX_REQUESTS became the whole server's
+        # budget rather than each caller's. One scanner burst rate-limited
+        # every real customer. Same defect as #219, same file family.
+        #
+        # resolve_client_ip honours CF-Connecting-IP only when the immediate
+        # peer is loopback/RFC1918, so a caller reaching us directly from the
+        # public internet cannot pick its own bucket by asserting a header.
+        ip = resolve_client_ip(request) or "unknown"
 
         # Periodic cleanup of stale buckets (every 5 minutes)
         global _last_cleanup

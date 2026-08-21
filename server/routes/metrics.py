@@ -15,52 +15,21 @@ from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from constants import METRICS_ALLOWED_IPS, METRICS_USERNAME, METRICS_PASSWORD
 
 
-# Trusted proxy networks. Only requests arriving from one of these peer
-# addresses are allowed to supply the true caller IP via CF-Connecting-IP /
-# X-Forwarded-For. In Tallyfy's production topology the tunnel terminates on
-# the same host, so request.client.host is loopback; we deliberately do NOT
-# accept public CF ranges here because that would let any caller claim any IP
-# by asserting a CF header directly.
-_TRUSTED_PROXY_NETWORKS = [
-    ip_network("127.0.0.0/8"),
-    ip_network("::1/128"),
-    ip_network("10.0.0.0/8"),      # Docker default bridge + compose networks
-    ip_network("172.16.0.0/12"),   # Docker's range for user-defined networks
-    ip_network("192.168.0.0/16"),  # Private LAN
-]
-
-
-def _is_trusted_proxy(peer_ip: str) -> bool:
-    try:
-        ip = ip_address(peer_ip)
-    except ValueError:
-        return False
-    return any(ip in net for net in _TRUSTED_PROXY_NETWORKS)
-
-
-def _resolve_client_ip(request) -> str:
-    """Return the true originating IP, honoring CF-Connecting-IP only when
-    the immediate peer is a trusted proxy. See issue #219.
-
-    Fallback order when peer is trusted:
-      1. CF-Connecting-IP (set by Cloudflare at the edge — single value)
-      2. X-Forwarded-For (first entry — least trusted of the three)
-      3. request.client.host (the proxy itself; fine for debugging)
-
-    When peer is untrusted we always use request.client.host and ignore any
-    spoofed forwarding headers.
-    """
-    peer_ip = request.client.host if request.client else ""
-    if peer_ip and _is_trusted_proxy(peer_ip):
-        cf_ip = request.headers.get("cf-connecting-ip", "").strip()
-        if cf_ip:
-            return cf_ip
-        xff = request.headers.get("x-forwarded-for", "")
-        if xff:
-            first = xff.split(",")[0].strip()
-            if first:
-                return first
-    return peer_ip
+# The IP-resolution logic below was written here for #219 (the /metrics
+# allowlist was a no-op because request.client.host is loopback behind the
+# tunnel). It now has three callers -- this allowlist, the rate limiter (#864)
+# and the OAuth proxy's upstream forwarding (#863) -- so it lives in
+# server/utils/client_ip.py and is imported here.
+#
+# The private names are re-exported unchanged because
+# tests/unit/server/routes/test_metrics_ip_resolution.py imports them from this
+# module by name. That test IS #219's regression coverage; keeping the aliases
+# means the promotion cannot quietly drop it.
+from utils.client_ip import (  # noqa: F401
+    is_trusted_proxy as _is_trusted_proxy,
+    resolve_client_ip as _resolve_client_ip,
+    _TRUSTED_PROXY_NETWORKS,
+)
 
 
 def register_metrics_routes(mcp):

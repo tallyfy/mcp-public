@@ -29,7 +29,9 @@ from urllib.parse import parse_qs
 import httpx
 
 from starlette.responses import JSONResponse, RedirectResponse, Response
+from utils.client_ip import resolve_forwardable_client_ip
 from constants import (
+    MCP_PROXY_SHARED_SECRET,
     MCP_RESOURCE_URL,
     MCP_ALLOWED_HOSTS,
     TALLYFY_ENVIRONMENT,
@@ -356,6 +358,39 @@ def _normalize_registration_error(status_code: int, content: bytes) -> JSONRespo
     return _oauth_error_response(error, description, status_code)
 
 
+def _proxy_identity_headers(request) -> dict:
+    """Headers telling api-v2 who the real caller is (issue #863).
+
+    Without these, every DCR and token request arriving through this proxy
+    reaches api-v2 from one address -- our own egress IP -- so all of them
+    share a single `throttle:5,60` bucket. Measured over 90 days: 37 legitimate
+    registrations were rejected with HTTP 429, 18 of them on 2026-08-07 alone.
+
+    Returns {} -- send nothing -- unless BOTH hold:
+      * we could establish a caller IP we are entitled to assert (the peer is a
+        trusted proxy and actually carried a forwarding header), and
+      * a shared secret is configured.
+
+    Sending nothing is the safe failure: api-v2 falls back to its own view of
+    the socket, which is precisely today's behaviour. Never send a bare IP with
+    no secret -- an unauthenticated forwarded IP is a bucket-selection primitive.
+
+    NOTE we use a private header, not X-Forwarded-For. Cloudflare rewrites
+    CF-Connecting-IP / True-Client-IP on the account.tallyfy.com hop and appends
+    to XFF, and api-v2's TrustProxies is '**' so Laravel already consumes that
+    chain. A private header is the only value that survives the hop intact.
+    """
+    if not MCP_PROXY_SHARED_SECRET:
+        return {}
+    client_ip = resolve_forwardable_client_ip(request)
+    if not client_ip:
+        return {}
+    return {
+        "X-Tallyfy-Client-IP": client_ip,
+        "X-Tallyfy-Proxy-Auth": MCP_PROXY_SHARED_SECRET,
+    }
+
+
 def register_oauth_routes(mcp):
     """Register OAuth 2.1 discovery endpoints with the MCP server."""
 
@@ -565,6 +600,10 @@ def register_oauth_routes(mcp):
                 "Content-Type": request.headers.get("Content-Type", "application/json"),
                 "Accept": _JSON_ONLY_ACCEPT,
             }
+            # Tell api-v2 who actually sent this, so its per-IP registration
+            # throttle buckets real callers apart instead of lumping every
+            # client in the estate onto our egress IP (issue #863).
+            headers.update(_proxy_identity_headers(request))
 
             async with httpx.AsyncClient(timeout=OAUTH_PROXY_TIMEOUT) as client:
                 response = await client.post(
@@ -683,6 +722,7 @@ def register_oauth_routes(mcp):
                 "Content-Type": request_content_type,
                 "Accept": _JSON_ONLY_ACCEPT,
             }
+            headers.update(_proxy_identity_headers(request))
 
             # Add authorization header if present
             if "Authorization" in request.headers:
