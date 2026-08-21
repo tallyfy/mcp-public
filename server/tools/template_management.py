@@ -99,6 +99,65 @@ _STEP_REJECTED_KEYS = {
 }
 
 
+# STEP deadline direction codes, from api-v2 app/Step/Deadline.php:20 and :22
+# (OPTION_FROM = 'from', OPTION_BEFORE = 'prior_to'). These are the only two
+# values any consumer understands.
+_STEP_DEADLINE_OPTIONS = ("from", "prior_to")
+
+# 'after' and 'before' are the LABELS the Tallyfy UI puts on those two codes, not
+# storable values: client-v2 services/step.service.ts::getDeadlineOptions maps
+# key 'from' -> title 'after' and key 'prior_to' -> title 'before'.
+#
+# They are mapped rather than forwarded because a wrong option is SILENT.
+# CreateStepRequest.php:39 is 'deadline.option' => 'required_with:deadline' with
+# no enum (contrast :65, which does use `in:` where the API wants a whitelist),
+# so any string is accepted with a 201. Then Helpers/tenant.php:175-182 switches
+# on exactly 'from' and 'prior_to' with NO default arm, so no offset is applied,
+# and UpdateChildrenTasksDeadlines.php:97-104 does Arr::get({from: add,
+# prior_to: sub}, option) and returns early on a miss, so the deadline never
+# re-anchors when the anchor step completes. Pass-through is therefore not the
+# safe default it usually is: nothing downstream ever reports the mistake.
+_STEP_DEADLINE_OPTION_ALIASES = {"after": "from", "before": "prior_to"}
+
+
+def _normalize_step_deadline(step_data: dict) -> None:
+    """Canonicalise deadline.option in place, or raise naming the two valid codes.
+
+    Scoped deliberately to 'option'. The sibling keys fail LOUDLY already: a
+    missing one is a 422 from CreateStepRequest's required_with rules, and a bad
+    'unit' raises out of Deadline::validate()'s whitelist. 'option' is the only
+    key of the four that api-v2 accepts, stores and then ignores.
+    """
+    deadline = step_data.get("deadline")
+    if not isinstance(deadline, dict) or "option" not in deadline:
+        return
+
+    option = deadline["option"]
+    if not isinstance(option, str):
+        raise ToolError(
+            f"deadline.option must be a string, got {type(option).__name__}. "
+            f"Valid values: {' or '.join(_STEP_DEADLINE_OPTIONS)}."
+        )
+
+    key = option.strip().lower()
+    if key in _STEP_DEADLINE_OPTIONS:
+        resolved = key
+    elif key in _STEP_DEADLINE_OPTION_ALIASES:
+        resolved = _STEP_DEADLINE_OPTION_ALIASES[key]
+    else:
+        raise ToolError(
+            f"deadline.option {option!r} is not a value Tallyfy stores. Use "
+            f"'from' (the UI shows this as \"after\" the anchor) or 'prior_to' "
+            f"(shown as \"before\" it). api-v2 accepts any string here and then "
+            f"applies no offset at all, so nothing would report this."
+        )
+
+    if resolved != option:
+        deadline = dict(deadline)
+        deadline["option"] = resolved
+        step_data["deadline"] = deadline
+
+
 def _normalize_step_data(step_data: dict) -> dict:
     """Map caller-friendly aliases onto api-v2's field names and reject the rest.
 
@@ -133,6 +192,8 @@ def _normalize_step_data(step_data: dict) -> dict:
             + ". Valid keys: "
             + ", ".join(sorted(_STEP_CREATE_KEYS))
         )
+
+    _normalize_step_deadline(normalized)
 
     return normalized
 
@@ -595,7 +656,7 @@ step_data keys:
   - 'title': step name (REQUIRED)
   - 'summary': HTML instructions for the step assignee ('description' is accepted as an alias)
   - 'position': 1-based order in the workflow. Steps always append on creation, so this tool issues a follow-up reorder to place the step. Omit it when adding steps in order.
-  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'after', 'step': 'start_run'}
+  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'from', 'step': 'start_run'} (all four keys required together). 'option' is the direction and takes exactly TWO values: 'from' (the UI shows this as "after") or 'prior_to' (shown as "before"). The words 'after' and 'before' are display labels, never values. 'step' is the anchor, not the direction.
   - 'start_date': dict {'value': int, 'unit': 'days'}
   - 'assignees': member IDs (ints), 'guests': email addresses, 'groups': group IDs
   - 'step_type': one of these 5 values (default 'task'):
