@@ -238,11 +238,12 @@ def get_user_id_from_token() -> Optional[str]:
 
 
 def get_jwt_scopes() -> Tuple[str, ...]:
-    """OAuth scopes carried by the VERIFIED access token for this request.
+    """OAuth ``scope`` / ``scp`` scopes on the VERIFIED access token.
 
-    Sibling of ``get_user_id_from_token``: a small read of the already-verified
-    request context, so a caller that needs to make an authorization decision
-    does not re-implement the auth plumbing at its own call site.
+    🔴 **UNUSABLE FOR AUTHORIZATION. It returns ``()`` for every real Tallyfy
+    token, whatever the user actually approved on the consent screen.** Use
+    ``get_mcp_scopes()`` below instead, and ``utils.tool_scopes.decide`` for
+    how to decide over the result.
 
     Reads ``AccessToken.scopes``, which fastmcp's ``JWTVerifier`` populates from
     the token's ``scope`` / ``scp`` claim AFTER the RS256 signature has been
@@ -250,11 +251,31 @@ def get_jwt_scopes() -> Tuple[str, ...]:
     an UNVERIFIED decode and are documented there as observability-only, so
     they must never drive an authorization decision.
 
+    **A Tallyfy MCP token carries neither claim.**
+    ``McpAccessTokenService::issue`` mints ``scopes: []`` on purpose (that field
+    is a Passport ORGANIZATION allowlist, not a permission set) and puts the MCP
+    permissions in a separate ``mcp_scopes`` claim beside it. So an empty tuple
+    from here does not distinguish "granted nothing" from "granted everything,
+    through a claim this function cannot see".
+
+    This had exactly one caller, ``tools/api_fallback.py``, feeding
+    ``utils.tallyfy_endpoint_allowlist.check``. Because that gate fails closed
+    on an empty set, the pair DENIED every write to a rule-covered path for
+    every real token, including one holding the required scope. Measured and
+    fixed in #856; that caller now reads ``get_mcp_scopes()``.
+
+    It is kept rather than deleted because it correctly answers a different
+    question -- "what standard OAuth scopes did this token declare" -- and
+    nothing in this repo asks that today.
+    ``tests/unit/server/utils/test_auth_context_scope_sources.py`` fails if a
+    module under ``server/`` starts calling it again, so a future caller is a
+    deliberate act rather than a repeat of #856.
+
     Returns:
-        The scopes as a tuple. An empty tuple means this caller PROVED no
-        scope — either no access token is present or the token carries none.
-        Callers must treat that as "no authority" and fail CLOSED; see
-        ``utils.tallyfy_endpoint_allowlist.check`` and #746.
+        The ``scope`` / ``scp`` scopes as a tuple. ``()`` covers three
+        different states -- no access token, no such claim, an empty claim --
+        and cannot tell them apart, which is the second reason it is unfit for
+        an authorization decision.
 
     Note:
         ``AccessToken.scopes`` is a required ``list[str]`` on the shipped model,

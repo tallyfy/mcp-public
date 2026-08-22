@@ -85,11 +85,20 @@ api-v2's own middleware deliberately leaves unmapped so it "never breaks
 identity/utility endpoints". Every entry carries its reason, and the completeness
 test requires an entry in exactly one of the two tables.
 
-Related, and NOT fixed here: ``utils.tallyfy_endpoint_allowlist``'s write gate is
-fed by ``auth_context.get_jwt_scopes()``, which reads ``AccessToken.scopes``.
-fastmcp populates that from the ``scope`` / ``scp`` claims, and a Tallyfy MCP
-token carries neither -- its permissions are in ``mcp_scopes``. That is why this
-module reads the claim itself via ``auth_context.get_mcp_scopes()``.
+Related, and FIXED SEPARATELY in #856: ``utils.tallyfy_endpoint_allowlist``'s
+write gate was fed by ``auth_context.get_jwt_scopes()``, which reads
+``AccessToken.scopes``. fastmcp populates that from the ``scope`` / ``scp``
+claims, and a Tallyfy MCP token carries neither -- its permissions are in
+``mcp_scopes``. That is why this module reads the claim itself via
+``auth_context.get_mcp_scopes()``, and it is now what that gate reads too.
+
+**The two gates agree on the absent claim, and that agreement is deliberate.**
+``decide`` below returns ``no_mcp_scopes_claim`` / allowed for ``granted is
+None``; ``tallyfy_endpoint_allowlist.check`` does the same for
+``mcp_scopes=None``. Before #856 they would have disagreed -- this one passing
+a claimless first-party token through, that one refusing it -- which is a
+worse outcome than either policy alone. If you change the rule here, change it
+there in the same commit.
 """
 
 from __future__ import annotations

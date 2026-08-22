@@ -37,7 +37,7 @@ from pydantic import Field
 from constants import TALLYFY_API_BASE_URL
 from utils.auth_context import (
     get_authenticated_credentials,
-    get_jwt_scopes,
+    get_mcp_scopes,
     get_user_id_from_token,
 )
 from utils.fastmcp_errors import handle_tallyfy_errors
@@ -187,10 +187,26 @@ async def _execute(
             f"Confirm the endpoint exists at {TALLYFY_API_DOCS_URL}"
         )
 
-    # Allowlist + scope gate. The scopes come from the VERIFIED access token
-    # for this request. They used to be a hardcoded empty tuple here, which
-    # meant the gate never saw the caller at all (#746).
-    gate = allowlist_check(method_u, resolved_path, jwt_scopes=get_jwt_scopes())
+    # Allowlist + scope gate. The scopes come from the ``mcp_scopes`` claim on
+    # the VERIFIED access token for this request.
+    #
+    # ⚠️ NOT ``get_jwt_scopes()``, which is what this line called until #856.
+    # That reads ``AccessToken.scopes``, which fastmcp populates from the
+    # ``scope`` / ``scp`` claims -- and a Tallyfy MCP token carries neither, so
+    # it returned ``()`` for every real caller and the fail-closed branch denied
+    # EVERY write to a path in ``_WRITE_SCOPE_RULES``, including from a token
+    # that genuinely held the required scope. It was invisible because
+    # MCP_ENABLE_API_FALLBACK is off in every deployment and because it failed
+    # toward "denied", which is the safe half.
+    #
+    # ``get_mcp_scopes()`` returns ``None`` for a token with no such claim, and
+    # ``check`` treats that as ungated -- deliberately matching #853's tool-name
+    # gate rather than contradicting it. See that module's docstring for the
+    # decision and the alternative that was rejected.
+    #
+    # They used to be a hardcoded empty tuple here, which meant the gate never
+    # saw the caller at all (#746).
+    gate = allowlist_check(method_u, resolved_path, mcp_scopes=get_mcp_scopes())
     if not gate.allowed:
         if gate.reason == "blocked":
             raise ToolError(
