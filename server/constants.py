@@ -254,6 +254,46 @@ REQUEST_DURATION_BUCKETS = [
 # Prometheus histogram buckets for API call duration (seconds)
 API_DURATION_BUCKETS = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 
+
+# ---------------------------------------------------------------------------
+# `mcp_server_tool_errors_total{error_type}` -- the closed label vocabulary
+# ---------------------------------------------------------------------------
+#
+# Lives here rather than beside the logic that produces it because TWO modules
+# have to agree on it and neither may import the other: `utils/fastmcp_errors`
+# stamps the class onto the ToolError it raises, and `metrics` reads it back
+# one decorator further out. `constants` is the only module both already
+# import, and it pulls in nothing but the standard library.
+#
+# WHY THE LABEL NEEDED FIXING AT ALL: on the live Prometheus it had exactly one
+# value, `unknown`, across the whole retention window, because the two
+# decorators are stacked `@track_tool_execution` OUTSIDE `@handle_tallyfy_errors`
+# on 107 of 110 tools -- so the inner one had already turned every TallyfyError
+# into a ToolError before the outer one tried to classify it by class name.
+# Full reasoning, and why an unlisted status is still labelled honestly, is in
+# the block comment in `utils/fastmcp_errors.py`.
+#
+# CARDINALITY IS THE POINT OF MAKING IT CLOSED. This multiplies against
+# `tool_name`, which carries ~79 distinct values, and no member may ever be
+# derived from message text or from anything a caller supplies -- otherwise a
+# single request could mint unbounded Prometheus time series.
+TOOL_ERROR_CLASS_ATTR = "_tallyfy_error_class"
+
+TOOL_ERROR_CLASSES: FrozenSet[str] = frozenset({
+    "validation",            # upstream 422, or a pydantic ValidationError
+    "not_found",             # upstream 404
+    "auth",                  # upstream 401 or 403
+    "bad_request",           # upstream 400
+    "conflict",              # upstream 409
+    "rate_limited",          # upstream 429
+    "client_error",          # any other upstream 4xx
+    "upstream_error",        # upstream 5xx
+    "upstream_unavailable",  # TallyfyError with no int status: retries exhausted
+    "internal_error",        # an unexpected exception inside the tool body
+    "tool_rejected",         # the tool's own code raised ToolError
+    "unknown",               # nothing above applied
+})
+
 # Sensitive parameter keys (redacted from logs)
 SENSITIVE_KEYS: FrozenSet[str] = frozenset({
     "api_key",

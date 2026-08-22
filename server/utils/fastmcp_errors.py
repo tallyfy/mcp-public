@@ -8,6 +8,7 @@ from functools import wraps
 from typing import Any, Optional
 from fastmcp.exceptions import ToolError
 from tallyfy import TallyfyError
+from constants import TOOL_ERROR_CLASS_ATTR, TOOL_ERROR_CLASSES
 import logging
 import sentry_sdk
 
@@ -68,6 +69,126 @@ def _sanitize_api_error(message: str) -> str:
             return before_leak
         return _GENERIC_ERROR
     return message
+
+
+# ===========================================================================
+# Tool-error classification for `mcp_server_tool_errors_total{error_type}`
+# ===========================================================================
+#
+# WHY THIS EXISTS. The counter has carried an `error_type` label since it was
+# added, and on the live Prometheus that label has exactly ONE value:
+#
+#     GET /api/v1/label/error_type/values -> {"status":"success","data":["unknown"]}
+#
+# (measured 2026-08-22; control on the same sweep, `tool_name` returns 79
+# distinct values, so the metric is genuinely populated and the label endpoint
+# works.) So the one label whose job is to answer "what KIND of thing is
+# failing" could never answer it, and an operator had to infer the answer from
+# Sentry's SILENCE instead. Recorded on #603 as its fifth suppression point.
+#
+# THE CAUSE IS DECORATOR ORDER, not a broken counter. 107 of the 110 tools are
+# declared as
+#
+#     @track_tool_execution("get_tags")     <- classifies the exception
+#     @handle_tallyfy_errors("get tags")    <- converts TallyfyError -> ToolError
+#
+# so by the time `track_tool_execution` sees the exception, this decorator has
+# already replaced the `TallyfyError` with a `ToolError`, whose class name
+# matches neither of the two names that decorator tests for. Every tool error
+# therefore falls to its `else` branch and is labelled `unknown`.
+#
+# THE FIX is to hand the classification forward rather than make the outer
+# decorator guess at it: this decorator already knows the upstream HTTP status,
+# so it stamps the derived class onto the ToolError it raises and the metrics
+# decorator reads it back. `classify_upstream_status` is the single place that
+# maps a status to a label.
+#
+# TWO PROPERTIES ARE DELIBERATE AND BOTH ARE ASSERTED BY TESTS.
+#
+# 1. The label is derived ONLY from an integer status and this closed map. It
+#    is never taken from message text and never from anything a caller
+#    supplies, so no request can mint an unbounded Prometheus time series.
+#
+# 2. The enumeration cannot go stale in the way a BEHAVIOURAL list can.
+#    `tallyfy_error_handler` in host/core/server.py argues at length against
+#    enumerating "expected" statuses, because such a list is always one
+#    incident late (#687, #184, #509, #510, #511). That argument is about which
+#    codes change what the server DOES. Here an unlisted status still lands in
+#    a correct, honest bucket -- any other 4xx is CLIENT_ERROR, any 5xx is
+#    UPSTREAM_ERROR -- so adding a name only ever sharpens a label that was
+#    already right. Nothing about behaviour depends on this map.
+#
+# THIS CHANGES NO LOG LEVEL AND NO SENTRY BEHAVIOUR. Which statuses are demoted
+# to WARNING is a separate judgement call and is #603's own acceptance
+# criterion 2; it is untouched here on purpose.
+
+# The attribute name and the closed vocabulary live in `constants` so that
+# `metrics` can read both without importing this module (it would be a heavier
+# import and an easy cycle to create later). This module owns the LOGIC that
+# produces a member; `constants` owns the SET of members.
+ERROR_CLASS_VALIDATION = "validation"
+ERROR_CLASS_NOT_FOUND = "not_found"
+ERROR_CLASS_AUTH = "auth"
+ERROR_CLASS_BAD_REQUEST = "bad_request"
+ERROR_CLASS_CONFLICT = "conflict"
+ERROR_CLASS_RATE_LIMITED = "rate_limited"
+ERROR_CLASS_CLIENT_ERROR = "client_error"
+ERROR_CLASS_UPSTREAM_ERROR = "upstream_error"
+ERROR_CLASS_UPSTREAM_UNAVAILABLE = "upstream_unavailable"
+ERROR_CLASS_INTERNAL_ERROR = "internal_error"
+ERROR_CLASS_TOOL_REJECTED = "tool_rejected"
+ERROR_CLASS_UNKNOWN = "unknown"
+
+_STATUS_ERROR_CLASSES = {
+    400: ERROR_CLASS_BAD_REQUEST,
+    401: ERROR_CLASS_AUTH,
+    403: ERROR_CLASS_AUTH,
+    404: ERROR_CLASS_NOT_FOUND,
+    409: ERROR_CLASS_CONFLICT,
+    422: ERROR_CLASS_VALIDATION,
+    429: ERROR_CLASS_RATE_LIMITED,
+}
+
+
+def classify_upstream_status(status: Any) -> str:
+    """Map an upstream Tallyfy API status onto the closed error-class vocabulary.
+
+    A non-integer status is NOT a fallback case worth burying in `unknown`: the
+    SDK raises ``TallyfyError`` with ``status_code=None`` when retries are
+    exhausted on a transport failure, so "no status at all" is precisely the
+    shape a real upstream outage takes. It gets its own value.
+    """
+    if not isinstance(status, int) or isinstance(status, bool):
+        return ERROR_CLASS_UPSTREAM_UNAVAILABLE
+    named = _STATUS_ERROR_CLASSES.get(status)
+    if named:
+        return named
+    if 400 <= status < 500:
+        return ERROR_CLASS_CLIENT_ERROR
+    if 500 <= status < 600:
+        return ERROR_CLASS_UPSTREAM_ERROR
+    return ERROR_CLASS_UNKNOWN
+
+
+def tag_error_class(error: BaseException, error_class: str) -> BaseException:
+    """Stamp an error class onto an exception and return it, for `raise tag_...`.
+
+    Returning the exception keeps the raise site a single expression, so the
+    stamp cannot drift away from the `raise` it belongs to.
+    """
+    setattr(error, TOOL_ERROR_CLASS_ATTR, error_class)
+    return error
+
+
+def read_error_class(error: BaseException) -> Optional[str]:
+    """Read back a stamped error class, or None when the exception carries none.
+
+    Guarded rather than trusted: only a member of the closed vocabulary is
+    returned, so a stray attribute of the same name can never widen the label
+    set that reaches Prometheus.
+    """
+    value = getattr(error, TOOL_ERROR_CLASS_ATTR, None)
+    return value if value in TOOL_ERROR_CLASSES else None
 
 
 _MAX_FIELD_ERRORS = 12
@@ -408,16 +529,36 @@ def handle_tallyfy_errors(operation_name: str):
                         )
                         flag_downstream_auth_failure(api_msg)
 
-                    raise ToolError(
-                        f"Could not {operation_name} — {api_msg} "
-                        f"(Your session may be expired or misconfigured. "
-                        f"Please re-authenticate the MCP connector and retry.)"
+                    raise tag_error_class(
+                        ToolError(
+                            f"Could not {operation_name} — {api_msg} "
+                            f"(Your session may be expired or misconfigured. "
+                            f"Please re-authenticate the MCP connector and retry.)"
+                        ),
+                        classify_upstream_status(status),
                     )
 
                 # Raise descriptive ToolError with status code + API message
-                raise ToolError(_build_error_message(operation_name, e))
-            except ToolError:
-                # Re-raise ToolError directly (already properly formatted)
+                raise tag_error_class(
+                    ToolError(_build_error_message(operation_name, e)),
+                    classify_upstream_status(status),
+                )
+            except ToolError as e:
+                # Re-raise ToolError directly (already properly formatted).
+                #
+                # This is a tool rejecting the call in its own code -- a missing
+                # required argument, a precondition the API would not have
+                # caught, a response shape the tool cannot use. 135 sites across
+                # server/tools raise this way, and they are a genuinely
+                # different kind of failure from an upstream status, so they get
+                # their own label rather than falling into `unknown` with
+                # everything else.
+                #
+                # Only stamp when the error carries no class already: a nested
+                # decorator's classification is more specific than this one and
+                # must survive.
+                if read_error_class(e) is None:
+                    tag_error_class(e, ERROR_CLASS_TOOL_REJECTED)
                 raise
             except Exception as e:
                 # Set Sentry tags so LoggingIntegration event has context
@@ -428,8 +569,11 @@ def handle_tallyfy_errors(operation_name: str):
 
                 # User-facing message without internal details (type, traceback, etc.)
                 # Full context is already captured in the log/Sentry above
-                raise ToolError(
-                    f"Could not {operation_name} — {_sanitize_api_error(str(e))}"
+                raise tag_error_class(
+                    ToolError(
+                        f"Could not {operation_name} — {_sanitize_api_error(str(e))}"
+                    ),
+                    ERROR_CLASS_INTERNAL_ERROR,
                 )
         return wrapper
     return decorator

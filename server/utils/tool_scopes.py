@@ -216,6 +216,7 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "delete_template": _TMPL_W,
     "edit_description_on_step": _TMPL_W,
     "reorder_step": _TMPL_W,
+    "update_step": _TMPL_W,
     "update_template": _TMPL_W,
     "tag_template": _TMPL_W,
     "untag_template": _TMPL_W,

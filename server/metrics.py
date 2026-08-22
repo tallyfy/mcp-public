@@ -19,9 +19,34 @@ from constants import (
     SERVER_VERSION,
     FASTMCP_VERSION,
     PYTHON_VERSION,
+    TOOL_ERROR_CLASS_ATTR,
+    TOOL_ERROR_CLASSES,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _read_stamped_error_class(error: BaseException):
+    """Read the class `@handle_tallyfy_errors` stamped on its way past, or None.
+
+    Validated against the closed vocabulary rather than trusted, so an unrelated
+    attribute that happens to share the name can never widen the label set that
+    reaches Prometheus.
+
+    The guard is not defensive habit. This runs INSIDE the except block of the
+    decorator that records tool metrics, and the exception it inspects came from
+    arbitrary tool code -- a class defining a `__getattr__` that raises is
+    unlikely but entirely legal, and here it would take out the metric AND mask
+    the original error the caller needs to see. Returning None on any failure
+    falls back to the class-name test below, which is exactly the behaviour that
+    was in place before this function existed.
+    """
+    try:
+        value = getattr(error, TOOL_ERROR_CLASS_ATTR, None)
+    except Exception:
+        return None
+    return value if value in TOOL_ERROR_CLASSES else None
+
 
 # ============================================================================
 # MCP Server Metrics
@@ -291,10 +316,40 @@ def track_tool_execution(tool_name: str):
                 return result
 
             except Exception as e:
-                # Determine error type from exception name
+                # Prefer the class @handle_tallyfy_errors stamped on the way
+                # past. That decorator sits INSIDE this one on 107 of the 110
+                # tools, so by the time we get here it has already replaced the
+                # original TallyfyError with a ToolError -- and the class-name
+                # test below then matches neither name and labels EVERYTHING
+                # `unknown`. That is not a hypothetical: on the live Prometheus
+                # the error_type label had exactly one value, `unknown`, across
+                # the full retention window, so the one label whose job is to
+                # say what kind of thing is failing could never say it. See
+                # #603 (fifth suppression point) and the long comment in
+                # server/utils/fastmcp_errors.py.
+                #
+                # The class-name test is KEPT as the fallback rather than
+                # replaced. Three tools (the ask_user_* family in
+                # user_interaction.py) carry no @handle_tallyfy_errors at all,
+                # and a pydantic ValidationError can reach here unstamped, so
+                # removing it would lose the only classification those paths
+                # have ever had.
+                stamped = _read_stamped_error_class(e)
                 error_class = e.__class__.__name__
 
-                if 'ValidationError' in error_class:
+                if stamped is not None:
+                    # `status` stays exactly where it was. It is a separate,
+                    # coarser label on a different counter, and every error
+                    # arriving here already reported 'error' before this change
+                    # (a stamped error is always a ToolError by the time it
+                    # reaches this decorator, which the old class-name test
+                    # below sent to its else branch). Sharpening it too would
+                    # move an existing series distribution as a side effect of
+                    # an observability fix, which is the kind of change that
+                    # should be asked for rather than bundled.
+                    status = 'error'
+                    error_type = stamped
+                elif 'ValidationError' in error_class:
                     status = 'validation_error'
                     error_type = 'validation'
                 elif 'TallyfyError' in error_class or 'Tallyfy' in error_class:

@@ -99,10 +99,91 @@ _STEP_REJECTED_KEYS = {
 }
 
 
+# Keys api-v2's UpdateStepRequest carries a rule for, so they survive
+# StepControllerNew::update's onlyValidatedFields() and actually reach the step.
+#
+# Derived by reading app/Http/Requests/Steps/UpdateStepRequest::rules() on
+# origin/production, NOT copied from _STEP_CREATE_KEYS. The two contracts differ
+# in BOTH directions and rule 27 says only the rules array answers "does api-v2
+# accept X": create carries 'tags' and update does not, while update carries
+# 'bp_to_launch' and the three 'ai_*' keys that the create whitelist never
+# forwards. Harmonising the two sets would silently drop a caller's value.
+_STEP_UPDATE_KEYS = frozenset({
+    "title", "summary", "step_type", "webhook", "max_assignable",
+    "assignees", "guests", "groups",
+    "deadline", "start_date",
+    "allow_guest_owners", "skip_start_process", "can_complete_only_assignees",
+    "everyone_must_complete", "prevent_guest_comment", "is_soft_start_date",
+    "role_changes_every_time", "assign_run_starter", "top_secret",
+    "send_chromeless", "bp_to_launch",
+    "ai_assigned", "ai_allowed_app_keys", "ai_on_uncertainty",
+})
+
+# Keys that reach the update endpoint and then do nothing, each with the reason
+# and the path that does work. Rejecting them by name beats letting a caller
+# believe a write landed (rules 25 and 27).
+_STEP_UPDATE_REJECTED_KEYS = {
+    # THE MOST DANGEROUS PAYLOAD THIS ENDPOINT TAKES, and it looks like the most
+    # innocent. UpdateStepRequest::rules() on origin/production carries
+    #     if (count($this->all()) === 1 && $this->has('position')) { return $rules; }
+    # so a body of exactly {"position": N} skips the title requirement AND the
+    # captures rules, and still reaches StepBuilder::build, which detaches every
+    # assignee, group and guest. Refusing 'position' in ANY combination is what
+    # makes that shape unrepresentable here rather than merely unlikely.
+    # Reordering has its own route and controller (StepReorderController,
+    # routes/api.php:436), which is what reorder_step already calls.
+    "position": (
+        "use reorder_step instead. A body of exactly {'position': N} is the single "
+        "most dangerous payload this endpoint takes: UpdateStepRequest returns early "
+        "for it, so the title requirement never applies, and it still detaches every "
+        "assignee, group and guest. Reordering has its own endpoint, which is what "
+        "reorder_step calls"
+    ),
+    "tags": (
+        "UpdateStepRequest has no rule for it (CreateStepRequest does), so the "
+        "API discards it on an update"
+    ),
+    "folders": (
+        "validated but consumed by nothing on the step update path — neither "
+        "StepBuilder, StepService nor StepControllerNew reads it"
+    ),
+    "captures": (
+        "use add_form_field_to_step or update_form_field instead, which "
+        "normalize option shapes that the raw update path does not"
+    ),
+    "alias": (
+        "steps have no settable alias — UpdateStepRequest has no rule for it, "
+        "so the API discards it"
+    ),
+    "roles": (
+        "roles cannot be set through a step update — UpdateStepRequest has no "
+        "rule for it, so the API discards it"
+    ),
+}
+
+# The three buckets whose ABSENCE from a step PUT means "detach everyone", not
+# "leave that dimension alone". StepBuilder::build (app/Step/StepBuilder.php:37
+# on origin/production) unconditionally calls
+#   saveAssignees(Assignees::newFromArray(Arr::only($data, ['assignees','guests','groups'])))
+# and BaseAssignees::newFromArray reads `$data['users'] ?? $data['assignees'] ?? []`,
+# so an omitted key yields an EMPTY SET, Assignees::modify diffs it against
+# current and calls every existing member "removed", and
+# AssignableTrait::saveAssignees detaches them. HTTP 200, no error.
+#
+# api-v2 origin/master FIXES this (commit 29dc8ff7a / PR #9587, 2026-07-24 —
+# `assigneesFromPartial()` treats an omitted key as "leave alone"), but that fix
+# is NOT deployed to production, so every tool here must keep re-sending the
+# buckets. See tallyfy/api-v2#10052.
+_STEP_ASSIGNEE_BUCKETS = ("assignees", "guests", "groups")
+
 # STEP deadline direction codes, from api-v2 app/Step/Deadline.php:20 and :22
 # (OPTION_FROM = 'from', OPTION_BEFORE = 'prior_to'). These are the only two
 # values any consumer understands.
 _STEP_DEADLINE_OPTIONS = ("from", "prior_to")
+
+# All four travel together: CreateStepRequest and UpdateStepRequest both mark
+# value/unit/option/step 'required_with:deadline', so a partial dict is a 422.
+_STEP_DEADLINE_KEYS = ("value", "unit", "option", "step")
 
 # 'after' and 'before' are the LABELS the Tallyfy UI puts on those two codes, not
 # storable values: client-v2 services/step.service.ts::getDeadlineOptions maps
@@ -158,14 +239,18 @@ def _normalize_step_deadline(step_data: dict) -> None:
         step_data["deadline"] = deadline
 
 
-def _normalize_step_data(step_data: dict) -> dict:
+def _normalize_step_payload(step_data: dict, valid_keys, rejected_keys) -> dict:
     """Map caller-friendly aliases onto api-v2's field names and reject the rest.
 
     'description' is accepted and mapped to 'summary' because the tool documented
     'description' for a long time and callers learned it from the tool itself.
-    Everything else outside _STEP_CREATE_KEYS raises, naming the offending keys —
+    Everything else outside `valid_keys` raises, naming the offending keys —
     a key that is silently dropped turns a caller mistake into a successful no-op
     with an empty step to show for it.
+
+    The key set is a PARAMETER because create and update are different api-v2
+    contracts (rule 27). One implementation with two vocabularies cannot drift
+    the way two copies would (rule 16).
     """
     normalized = dict(step_data)
 
@@ -179,10 +264,10 @@ def _normalize_step_data(step_data: dict) -> dict:
             )
         normalized["summary"] = normalized.pop("description")
 
-    unknown = sorted(set(normalized) - _STEP_CREATE_KEYS)
+    unknown = sorted(set(normalized) - valid_keys)
     if unknown:
         details = [
-            f"'{key}': {_STEP_REJECTED_KEYS[key]}" if key in _STEP_REJECTED_KEYS
+            f"'{key}': {rejected_keys[key]}" if key in rejected_keys
             else f"'{key}': not a step field"
             for key in unknown
         ]
@@ -190,12 +275,133 @@ def _normalize_step_data(step_data: dict) -> dict:
             "step_data contains keys the API will discard, so nothing was sent. "
             + "; ".join(details)
             + ". Valid keys: "
-            + ", ".join(sorted(_STEP_CREATE_KEYS))
+            + ", ".join(sorted(valid_keys))
         )
 
     _normalize_step_deadline(normalized)
 
     return normalized
+
+
+def _normalize_step_data(step_data: dict) -> dict:
+    """Normalize a step CREATE payload against CreateStepRequest's rules."""
+    return _normalize_step_payload(
+        step_data, _STEP_CREATE_KEYS, _STEP_REJECTED_KEYS
+    )
+
+
+def _normalize_step_update_data(step_data: dict) -> dict:
+    """Normalize a step UPDATE payload against UpdateStepRequest's rules."""
+    normalized = _normalize_step_payload(
+        step_data, _STEP_UPDATE_KEYS, _STEP_UPDATE_REJECTED_KEYS
+    )
+    _require_complete_step_deadline(normalized)
+    return normalized
+
+
+def _require_complete_step_deadline(step_data: dict) -> None:
+    """Raise if a deadline is present but incomplete, before any network call.
+
+    api-v2 answers a partial deadline with a 422, which is legible but costs a
+    round trip. `_normalize_step_deadline` cannot cover this: it returns early
+    when 'option' is absent, so a dict missing 'step' reaches the wire untouched.
+    """
+    deadline = step_data.get("deadline")
+    if deadline is None:
+        return
+    if not isinstance(deadline, dict):
+        raise ToolError(
+            f"deadline must be a dict carrying "
+            f"{', '.join(_STEP_DEADLINE_KEYS)}, got "
+            f"{type(deadline).__name__}."
+        )
+    missing = [key for key in _STEP_DEADLINE_KEYS if key not in deadline]
+    if missing:
+        raise ToolError(
+            f"deadline is missing {', '.join(missing)}. api-v2 marks all four of "
+            f"{', '.join(_STEP_DEADLINE_KEYS)} 'required_with:deadline', so a "
+            f"partial deadline is rejected. Read the step first and restate every "
+            f"key, or omit 'deadline' entirely to leave the current one alone."
+        )
+
+
+def _assert_deadline_option_is_storable(payload: dict) -> None:
+    """Last check on the OUTGOING body, immediately before the PUT.
+
+    `_normalize_step_deadline` guards the caller's INPUT. This guards the bytes
+    that leave, which is a different question once a payload is assembled from
+    more than one source. It is the assertion that makes "this tool cannot emit
+    an unstorable deadline direction" true of the request rather than of one
+    code path.
+
+    api-v2 accepts any string for deadline.option, stores it, and then applies no
+    offset at all (rule 29), so nothing downstream would ever report a mistake
+    here — which is exactly why the check belongs on our side of the wire.
+    """
+    deadline = payload.get("deadline")
+    if not isinstance(deadline, dict) or "option" not in deadline:
+        return
+    option = deadline["option"]
+    if option not in _STEP_DEADLINE_OPTIONS:
+        raise ToolError(
+            f"Refusing to send deadline.option {option!r}: Tallyfy stores only "
+            f"{' and '.join(repr(o) for o in _STEP_DEADLINE_OPTIONS)}. api-v2 "
+            f"would accept this with a 200 and then never apply the offset."
+        )
+
+
+def _fetch_step_for_update(sdk, org_id: str, template_id: str, step_id: str):
+    """Return (endpoint, current step dict) for a step about to be updated."""
+    endpoint = f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}"
+    current = sdk._make_request("GET", endpoint)
+    step = current.get("data", current) if isinstance(current, dict) else {}
+    return endpoint, step
+
+
+def _preserved_step_fields(step: dict, step_id: str) -> dict:
+    """Build the MINIMUM every step PUT must carry, and nothing else.
+
+    Two categories, each for a stated reason, and deliberately no third:
+
+    - 'title', because UpdateStepRequest sets `$rules['title'] = 'required|max:600'`
+      on every update that is not a bare position-only payload. Omitting it is a
+      422 even when the caller is changing something unrelated.
+    - the three assignee buckets, because omitting one DETACHES everyone in it
+      (see _STEP_ASSIGNEE_BUCKETS).
+
+    Everything else is left out on purpose. `StepBuilder::editStep` applies
+    `Arr::only($data, $this->model->fields)`, so for summary, step_type, deadline,
+    start_date, the booleans and bp_to_launch an absent key genuinely means "leave
+    alone"; and `AddCapturesToStep` guards on `is_array($this->captures)`, so an
+    absent 'captures' is a no-op rather than a wipe. Echoing them back would buy
+    nothing and cost two things: it would widen the lost-update window to every
+    field a concurrent editor might have touched, and it would launder a value
+    already stored wrong straight back into the database — there are 62 production
+    step rows carrying the unstorable deadline.option "after" (rule 29), and a
+    read-modify-write that re-sent the deadline would rewrite each of them intact.
+
+    A bucket that is missing or not a list means the READ failed, so this aborts
+    rather than sending []. A genuinely empty list is legitimate and passes
+    through: StepTransformer emits all three keys unconditionally, so present-and-
+    empty is the real shape of an unassigned step (rule 10, verified live).
+    """
+    title = step.get("title") or ""
+    if not title:
+        raise ToolError(
+            "Could not read the step's current title, which the API requires "
+            "on every step update. Verify template_id and step_id are correct."
+        )
+
+    payload = {"title": title}
+    for field in _STEP_ASSIGNEE_BUCKETS:
+        value = step.get(field)
+        if not isinstance(value, list):
+            raise ToolError(
+                f"Step {step_id} did not return its current '{field}', so "
+                f"updating it would detach every assignee. Nothing was sent."
+            )
+        payload[field] = list(value)
+    return payload
 
 
 def register_template_management_tools(mcp):
@@ -366,6 +572,8 @@ DEADLINE SHAPE: all four keys travel together. api-v2 marks value, unit, option 
 - step: the ANCHOR. 'start_run' means process launch; any other step ID anchors to that
   step. Launch-relative is step='start_run', NOT option='from'.
 Default deadline is value=1, unit='day', option='from', step='start_run'.
+
+This tool only SUGGESTS. To apply a suggestion, pass the same four-key dict to update_step as step_data={'deadline': {...}}.
 
 REQUIRED: Both 'template_id' and 'step_id' must be provided (32-character hex strings). Never call this without both parameters.""",
         tags=["templates", "workflow", "analysis", "deadlines", "read-only"],
@@ -604,47 +812,105 @@ REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'description
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             # READ-MODIFY-WRITE — the SDK's edit_description_on_step() sends only
-            # {title, summary}, and StepBuilder::build (app/Step/StepBuilder.php:37)
-            # unconditionally calls
-            #   saveAssignees(Assignees::newFromArray(Arr::only($data, ['assignees','guests','groups'])))
-            # AssignableTrait::saveAssignees (app/Models/Concerns/AssignableTrait.php:101-124)
-            # diffs against the payload with NO empty-set guard, so an omitted key
-            # means "detach everything". Editing a description therefore wiped every
-            # assignee off the step. Re-send the current sets: the diff comes out
-            # empty and saveAssignees returns before touching the pivot tables.
-            endpoint = f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}"
-            current = sdk._make_request("GET", endpoint)
-            step = current.get("data", current) if isinstance(current, dict) else {}
-
-            title = step.get("title") or ""
-            if not title:
-                raise ToolError(
-                    "Could not read the step's current title, which the API requires "
-                    "on every step update. Verify template_id and step_id are correct."
-                )
-
-            # StepTransformer emits assignees as member IDs, guests as emails and
-            # groups as group IDs — the same key names UpdateStepRequest validates.
-            # UpdateStepRequest treats an omitted bucket as "detach everything", so a
-            # missing or malformed bucket here must abort rather than send []. An empty
-            # list is legitimate (the step genuinely has nobody) and passes through.
-            payload = {
-                "title": title,
-                "summary": description,
-            }
-            for field in ("assignees", "guests", "groups"):
-                value = step.get(field)
-                if not isinstance(value, list):
-                    raise ToolError(
-                        f"Step {step_id} did not return its current '{field}', so "
-                        f"changing only the description would detach every assignee. "
-                        f"Nothing was sent."
-                    )
-                payload[field] = list(value)
+            # {title, summary}, and an omitted assignee bucket means "detach
+            # everything" on production (see _STEP_ASSIGNEE_BUCKETS). Editing a
+            # description therefore wiped every assignee off the step. Re-send the
+            # current sets: the diff comes out empty and saveAssignees returns
+            # before touching the pivot tables.
+            #
+            # _preserved_step_fields is shared with update_step on purpose. Two
+            # tools writing the same endpoint with two copies of this logic is
+            # exactly the sibling drift rule 16 is about; one helper cannot drift.
+            endpoint, step = _fetch_step_for_update(
+                sdk, org_id, template_id, step_id
+            )
+            payload = _preserved_step_fields(step, step_id)
+            payload["summary"] = description
 
             response = sdk._make_request("PUT", endpoint, data=payload)
             result = response.get("data", response) if isinstance(response, dict) else response
             return ToolResult(content=serialize_dataclass(result) if result else {}, structured_content=None)
+
+    @mcp.tool(
+        name="update_step",
+        description="""Edit an EXISTING step in place, keeping its id, automations, form fields and history. Use this to change a step's deadline, start date, type or instructions after it was created. Never delete_step then add_step_to_template to make an edit: that mints a NEW id and orphans every automation rule pointing at the old one.
+
+REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'step_data' — a dict holding ONLY the fields you want to change.
+
+Anything you do not mention is left as it is. The tool reads the step first and re-sends its title and all three assignee buckets, because api-v2 reads an omitted bucket as "remove everyone". To deliberately CLEAR one, pass it as an empty list.
+
+step_data keys:
+  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'from', 'step': 'start_run'} — all four required together. 'option' is the DIRECTION and takes exactly TWO values: 'from' (the UI shows this as "after") or 'prior_to' (shown as "before"). The words 'after' and 'before' are display labels, never values. 'step' is the ANCHOR: 'start_run' means process launch, otherwise another step's id.
+  - 'start_date': dict {'value': int, 'unit': 'days'}
+  - 'step_type': 'task', 'approval', 'expiring', 'email' or 'expiring_email'
+  - 'title', 'summary' ('description' is an alias for 'summary')
+  - 'assignees': member IDs (ints), 'guests': emails, 'groups': group IDs
+  - booleans: 'everyone_must_complete', 'can_complete_only_assignees', 'assign_run_starter', 'allow_guest_owners', 'skip_start_process', 'is_soft_start_date', 'top_secret', 'prevent_guest_comment', 'send_chromeless', 'role_changes_every_time'
+  - 'webhook', 'max_assignable', 'bp_to_launch', 'ai_assigned', 'ai_allowed_app_keys', 'ai_on_uncertainty'
+
+To MOVE a step use reorder_step; for questions use add_form_field_to_step or update_form_field.
+
+Never call this without all three parameters.""",
+        tags=["templates", "workflow", "write", "management", "editing", "deadlines"],
+        annotations=ToolAnnotations(
+            title="Update a step in place",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("update_step")
+    @handle_tallyfy_errors("update step")
+    def update_step(
+        template_id: TemplateId,
+        step_id: StepId,
+        step_data: GenericDict
+    ) -> GenericDict:
+        """
+        Edit an existing step in place without changing its id.
+
+        Args:
+            template_id: Template ID (REQUIRED - 32-character hex string)
+            step_id: Step ID to update (REQUIRED - 32-character hex string)
+            step_data: Only the fields to change (REQUIRED - must be non-empty)
+
+        Returns:
+            Dictionary containing the updated step, carrying the SAME id
+        """
+        if not isinstance(step_data, dict) or not step_data:
+            raise ToolError(
+                "step_data must be a non-empty dict naming the fields to change, "
+                "e.g. {'deadline': {'value': 3, 'unit': 'days', "
+                "'option': 'from', 'step': 'start_run'}}. Nothing was sent."
+            )
+
+        changes = _normalize_step_update_data(step_data)
+
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            # READ-MODIFY-WRITE, and the READ is not optional. See
+            # _preserved_step_fields for exactly what is preserved and why the
+            # list is deliberately short.
+            endpoint, step = _fetch_step_for_update(
+                sdk, org_id, template_id, step_id
+            )
+            payload = _preserved_step_fields(step, step_id)
+
+            # The caller's values win over the preserved ones, so passing
+            # 'title' renames and passing 'assignees': [] genuinely clears.
+            payload.update(changes)
+
+            # Last gate on the bytes that leave, not on the input.
+            _assert_deadline_option_is_storable(payload)
+
+            response = sdk._make_request("PUT", endpoint, data=payload)
+            result = response.get("data", response) if isinstance(response, dict) else response
+            return ToolResult(
+                content=serialize_dataclass(result) if result else {},
+                structured_content=None,
+            )
 
     @mcp.tool(
         name="add_step_to_template",
