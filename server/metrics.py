@@ -54,6 +54,22 @@ mcp_active_connections = Gauge(
     'Number of active MCP server connections'
 )
 
+# Durable-record shipping outcome (#890).
+#
+# status="fail" means a failure happened and NOTHING recorded it anywhere that
+# survives a deploy, so this counter going non-zero is itself an incident. Each
+# fail is also logged at WARNING, which reaches Sentry via LoggingIntegration -
+# the counter is the trend, the log line is the page. Deliberately not modelled
+# on log_bridge_events_sent_total, whose counter has no alert behind it and which
+# is how tallyfy/mcp#697 dropped every batched flush unnoticed for three months.
+# status="dropped" means the in-memory queue overflowed, i.e. ingest has been
+# unreachable long enough that events are now being discarded.
+event_log_total = Counter(
+    'mcp_server_event_log_total',
+    'MCP server durable failure-record shipping outcomes',
+    ['status']
+)
+
 # Tallyfy API metrics
 tallyfy_api_calls_total = Counter(
     'tallyfy_api_calls_total',
@@ -110,6 +126,50 @@ jwt_audience_class_total = Counter(
     'mcp_server_jwt_audience_class_total',
     'Verified JWTs by audience class, counted regardless of ENFORCE_JWT_AUDIENCE',
     ['audience_class']  # see utils.tallyfy_auth_provider.AUDIENCE_CLASSES
+)
+
+# Downstream token exchange census (#894), the sibling of the counter above and
+# built the same way for the same reason.
+#
+# utils/downstream_token.py has a `shadow` mode whose ENTIRE JOB is to produce a
+# census you watch before deciding on `enforce`. Until this counter existed there
+# was nothing to watch: the module emitted two log lines and registered no metric,
+# so the census lived only in container stdout and every deploy discarded it. A
+# gate whose evidence cannot be read is a gate that cannot fail.
+#
+# COUNTED IN EVERY MODE, `off` INCLUDED, and that is the point rather than an
+# oversight. `off` short-circuits before any exchange, so counting it is the only
+# thing that distinguishes "shadow is running and nothing failed" from "nobody
+# called the server this week". It makes the series self-denominating: summed
+# across outcomes it IS the authenticated-credential-resolution count for the
+# window, so the usage denominator the audience census needs a second query for
+# is already here.
+#
+# THE LABEL VOCABULARY IS CLOSED, both labels, and neither is derived from
+# anything a caller controls.
+#   mode    - exactly the three in downstream_token._VALID_MODES. _mode()
+#             normalises an unrecognised env value to "off" BEFORE it reaches
+#             this label, so a typo in the deploy config cannot mint a series.
+#   outcome - the seven in downstream_token._OUTCOMES.
+# Cap is 3 x 7 = 21 series per environment.
+#
+# ⚠️ NOTHING HERE MAY CARRY A TOKEN, A SUBJECT, AN ORG, A `jti` OR AN api-v2
+# ERROR BODY. The cache key is (sub, org_id, jti) and every one of those is
+# per-user unbounded; a label built from any of them is both a Prometheus memory
+# exhaustion and a credential leak into a scrape endpoint. The failure REASON is
+# recorded, the failure MESSAGE is not.
+#
+# ⚠️ A closed vocabulary is worth nothing if the code only ever emits one member.
+# That is live in this repo right now: mcp_server_tool_errors_total{error_type}
+# has exactly one value ever, the literal "unknown", against 79 distinct
+# tool_name values (#603). Guarded here by
+# tests/unit/server/utils/test_downstream_token.py, which walks the module AST
+# and fails if any `raise DownstreamTokenError` omits an explicit reason, so a
+# raise site added tomorrow cannot silently default to "unknown".
+downstream_token_exchange_total = Counter(
+    'mcp_server_downstream_token_exchange_total',
+    'Downstream token exchange outcomes by mode, counted in every mode including off',
+    ['mode', 'outcome']  # see utils.downstream_token._VALID_MODES and _OUTCOMES
 )
 
 # ============================================================================
@@ -396,3 +456,17 @@ def record_jwt_audience_class(audience_class: str):
         audience_class: One of utils.tallyfy_auth_provider.AUDIENCE_CLASSES
     """
     jwt_audience_class_total.labels(audience_class=audience_class).inc()
+
+
+def record_downstream_token_exchange(mode: str, outcome: str):
+    """Record one downstream-token decision.
+
+    Changes no behaviour: every caller counts and then returns exactly what it
+    would have returned anyway, in every mode. See the counter's declaration
+    above for why the label vocabulary must stay closed and why `off` is counted.
+
+    Args:
+        mode: one of utils.downstream_token._VALID_MODES
+        outcome: one of utils.downstream_token._OUTCOMES
+    """
+    downstream_token_exchange_total.labels(mode=mode, outcome=outcome).inc()

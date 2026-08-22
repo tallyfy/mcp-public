@@ -7,6 +7,14 @@ Provides detailed request/response logging with:
 - User/org context extraction from JWT
 - Sentry transaction tracking
 - Color-coded terminal output
+- A durable off-box record of every failure (#890)
+
+The last one is why this file is the wiring point rather than somewhere tidier.
+This middleware already computes the whole answer to "what failed, for whom" -
+org, user, tool name, HTTP status, the MCP-level isError flag, the error text and
+the duration - and then writes it only to stdout, which a deploy destroys.
+Shipping the values it already has costs one call; recomputing them anywhere
+else would mean re-parsing the request body and re-peeking the response.
 """
 
 import json
@@ -22,6 +30,12 @@ from starlette.responses import Response, StreamingResponse
 import metrics
 from utils.org_id_middleware import get_org_id
 from constants import MCP_SESSION_TIMEOUT
+from durable_event_log import (
+    EVENT_AUTH_FAILURE,
+    EVENT_TOOL_ERROR,
+    EVENT_UPSTREAM_REJECTED,
+    get_event_log,
+)
 
 
 # Maximum bytes the middleware will buffer to inspect a tools/call response
@@ -315,6 +329,30 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                                     json_data = line[6:]  # Remove "data: " prefix
                                     break
 
+                            if json_data is None:
+                                # NOT SSE. server.py:258 builds the app with
+                                # json_response=True, so FastMCP answers every
+                                # tools/call with content-type application/json
+                                # and no framing. Parsing only `data: ` lines
+                                # therefore detected NOTHING on any deployment
+                                # of this server: mcp_error could never be True,
+                                # and an HTTP 200 carrying isError:true - the
+                                # #652 shape, the one #890 was filed about - was
+                                # invisible to every consumer of this flag,
+                                # including the durable record.
+                                #
+                                # Measured on live staging 2026-08-22: a failing
+                                # tools/call returned HTTP/2 200,
+                                # content-type: application/json, isError true,
+                                # and this middleware logged it with no error
+                                # marker at all.
+                                #
+                                # The SSE branch is kept because json_response
+                                # is a server.py argument that can be changed
+                                # back, and a parser that understands only the
+                                # framing in use today is how this bug happened.
+                                json_data = response_text.strip()
+
                             if json_data:
                                 response_json = json.loads(json_data)
 
@@ -522,4 +560,84 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             else:
                 logging.info(log_msg)
 
+        # Durable record (#890). Everything above this line goes to stdout and
+        # dies with the container; this call is the only thing that outlives a
+        # deploy. It is deliberately the LAST statement before the response is
+        # returned, so it can never change what the caller receives.
+        self._record_failure_durably(
+            mcp_error=mcp_error,
+            mcp_error_msg=mcp_error_msg,
+            status=status,
+            org_id=org_id,
+            user_id=user_id,
+            tool_name=mcp_tool_name,
+            mcp_method=mcp_method,
+            duration=duration,
+            session_id=mcp_session_id,
+            client_type=client_type,
+            is_noise=(
+                is_scanner
+                or is_oauth_discovery
+                or is_sse_404
+                or is_delete_400
+                or is_favicon
+            ),
+        )
+
         return response
+
+    @staticmethod
+    def _record_failure_durably(
+        *,
+        mcp_error: bool,
+        mcp_error_msg,
+        status: int,
+        org_id,
+        user_id,
+        tool_name,
+        mcp_method,
+        duration: float,
+        session_id,
+        client_type,
+        is_noise: bool,
+    ) -> None:
+        """Ship one failure to the off-box record. Never raises, never blocks.
+
+        Only FAILURES travel. A successful tool call is already counted by
+        ``mcp_server_requests_total``, answers no incident question, and would
+        multiply the volume landing in a table shared with the whole estate.
+
+        ``mcp_error`` is checked BEFORE ``status``, and that order is the point
+        of the whole change: a tool rejected by api-v2 comes back as HTTP 200
+        with ``isError:true`` inside the result (#652), so a status-code-only
+        rule records nothing for the exact failure mode that prompted #890.
+        """
+        try:
+            if is_noise:
+                # Scanner probes, RFC-9728 discovery 401s, /sse 404s and expired
+                # session DELETEs. Each is expected, high-volume, and answers
+                # nothing - the same set the display logic already suppresses.
+                return
+            if mcp_error:
+                event = EVENT_TOOL_ERROR
+            elif status in (401, 403):
+                event = EVENT_AUTH_FAILURE
+            elif status >= 400:
+                event = EVENT_UPSTREAM_REJECTED
+            else:
+                return
+
+            get_event_log().emit(
+                event,
+                org_id=org_id,
+                user_id=user_id,
+                tool_name=tool_name,
+                mcp_method=mcp_method,
+                status_code=status,
+                duration_ms=int(duration * 1000),
+                error_message=mcp_error_msg,
+                session_id=session_id,
+                client_type=client_type,
+            )
+        except Exception as exc:  # pragma: no cover - emit already swallows
+            logging.debug("event_log wiring failed (%s)", type(exc).__name__)

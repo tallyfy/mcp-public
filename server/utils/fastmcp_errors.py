@@ -383,6 +383,31 @@ def handle_tallyfy_errors(operation_name: str):
                 # domain message; only add the hint when the message reads like auth.
                 if status == 401 or (status == 403 and _is_auth_style_message(e)):
                     api_msg = _extract_api_message(e)
+
+                    # A 401 means the credential this request carried is no
+                    # longer accepted, which is an authentication failure of the
+                    # HTTP request and not merely of this tool. FastMCP has no
+                    # way to say that from here: every exception a tool raises,
+                    # ToolError included, comes back to the client as HTTP 200
+                    # with isError:true, and clients re-authenticate on a real
+                    # 401 and on nothing else. So flag the request and let
+                    # DownstreamAuthChallengeMiddleware answer with the 401
+                    # challenge the MCP authorization spec requires (#652).
+                    #
+                    # 403 is deliberately excluded even when the message reads
+                    # like auth: api-v2 answers 403 for business rules too, and
+                    # re-authenticating cannot fix those (#592).
+                    #
+                    # The ToolError below is raised either way. If the flag
+                    # cannot be delivered (no HTTP request, SSE streaming, a
+                    # background task) the client still gets today's descriptive
+                    # result rather than nothing.
+                    if status == 401:
+                        from middleware.downstream_auth_challenge import (
+                            flag_downstream_auth_failure,
+                        )
+                        flag_downstream_auth_failure(api_msg)
+
                     raise ToolError(
                         f"Could not {operation_name} — {api_msg} "
                         f"(Your session may be expired or misconfigured. "

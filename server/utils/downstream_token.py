@@ -105,6 +105,33 @@ MODE_SHADOW = "shadow"
 MODE_ENFORCE = "enforce"
 _VALID_MODES = (MODE_OFF, MODE_SHADOW, MODE_ENFORCE)
 
+#: Closed vocabulary for the census label (#894). Every value this module can
+#: ever emit is here, and `metrics.record_downstream_token_exchange` is called
+#: with nothing else.
+#:
+#:   skipped            - mode is off, so nothing was attempted
+#:   cache_hit          - served from cache, no round trip
+#:   exchanged          - a fresh exchange succeeded
+#:   failed_no_secret   - MCP_PROXY_SHARED_SECRET unset, refused before the network
+#:   failed_transport   - httpx could not complete the request
+#:   failed_http_status - api-v2 answered, but not 200
+#:   failed_bad_body    - 200 with a body we cannot use
+#:
+#: The three `failed_*` splits are not decoration. Today EVERY failure is
+#: `failed_no_secret`, because that secret is unset in both environments, and a
+#: census that could not tell those apart would read as "the exchange is broken"
+#: when what it actually measures is a credential nobody has set yet.
+OUTCOME_SKIPPED = "skipped"
+OUTCOME_CACHE_HIT = "cache_hit"
+OUTCOME_EXCHANGED = "exchanged"
+OUTCOME_FAILED_PREFIX = "failed_"
+_REASONS = ("no_secret", "transport", "http_status", "bad_body")
+_OUTCOMES = (
+    OUTCOME_SKIPPED,
+    OUTCOME_CACHE_HIT,
+    OUTCOME_EXCHANGED,
+) + tuple(OUTCOME_FAILED_PREFIX + r for r in _REASONS)
+
 #: Seconds trimmed off the issued lifetime so a token is never presented in the
 #: last moments of its validity.
 CLOCK_SKEW_S = 30
@@ -142,6 +169,26 @@ def _shared_secret() -> str:
     return MCP_PROXY_SHARED_SECRET
 
 
+def _record(mode: str, outcome: str) -> None:
+    """Count one decision. Must never be able to break a request.
+
+    Imported at call time rather than at module import, matching `_auth_server`
+    and `_shared_secret` above: `metrics` is a top-level server module and this
+    one lives under `utils/`, so a module-level import here would add an import
+    edge for a call that is pure observability.
+
+    The try/except is not defensive habit. `shadow` exists precisely to discover
+    failures without causing them, so a metrics backend problem raising out of a
+    census call would defeat the mode's entire purpose, and in `enforce` it would
+    turn a working exchange into a failed request.
+    """
+    try:
+        from metrics import record_downstream_token_exchange
+        record_downstream_token_exchange(mode, outcome)
+    except Exception:                                     # noqa: BLE001
+        logger.debug("downstream token exchange census not recorded", exc_info=True)
+
+
 def _timeout() -> float:
     """Never raises. A malformed env var must not break a request in shadow."""
     raw = os.getenv("MCP_DOWNSTREAM_TIMEOUT", "10")
@@ -158,7 +205,25 @@ class DownstreamTokenError(Exception):
 
     Raised only in ``enforce``. In ``shadow`` a failure is logged and swallowed,
     because shadow exists precisely to discover failures without causing them.
+
+    ``reason`` is the census label (#894) and must be a member of ``_REASONS``.
+    It is deliberately SEPARATE from the message: the message interpolates
+    api-v2's status code and exception types, which is fine for a log and is
+    exactly what must never reach a Prometheus label.
+
+    The default exists so that raising can never itself raise, which matters on
+    a path whose whole promise is that it cannot break a request. It is not an
+    invitation to omit the argument:
+    ``tests/unit/server/utils/test_downstream_token.py`` walks this module's AST
+    and fails if any ``raise DownstreamTokenError`` leaves it defaulted. Without
+    that guard this label rots into the single literal ``"unknown"``, which is
+    live in this repo today on ``mcp_server_tool_errors_total{error_type}`` and
+    is tracked as #603.
     """
+
+    def __init__(self, message: str, reason: str = "unknown"):
+        super().__init__(message)
+        self.reason = reason
 
 
 # --------------------------------------------------------------------------
@@ -268,7 +333,8 @@ def _post_exchange(subject_token: str) -> Dict[str, Any]:
     if not secret:
         raise DownstreamTokenError(
             "MCP_PROXY_SHARED_SECRET is not set, so the exchange cannot "
-            "authenticate to api-v2. Refusing to call it unauthenticated."
+            "authenticate to api-v2. Refusing to call it unauthenticated.",
+            reason="no_secret",
         )
 
     url = f"{_auth_server()}/mcp/oauth/token-exchange"
@@ -286,11 +352,14 @@ def _post_exchange(subject_token: str) -> Dict[str, Any]:
         with httpx.Client(timeout=_timeout()) as client:
             response = client.post(url, headers=headers)
     except httpx.RequestError as exc:
-        raise DownstreamTokenError(f"token exchange transport error: {exc}") from exc
+        raise DownstreamTokenError(
+            f"token exchange transport error: {exc}", reason="transport"
+        ) from exc
 
     if response.status_code != 200:
         raise DownstreamTokenError(
-            f"token exchange returned HTTP {response.status_code}"
+            f"token exchange returned HTTP {response.status_code}",
+            reason="http_status",
         )
 
     # Everything below is parsing a body we do not control, so it is wrapped
@@ -301,15 +370,20 @@ def _post_exchange(subject_token: str) -> Dict[str, Any]:
     try:
         payload = response.json()
         if not isinstance(payload, dict):
-            raise DownstreamTokenError("token exchange returned a non-object body")
+            raise DownstreamTokenError(
+                "token exchange returned a non-object body", reason="bad_body"
+            )
         token = payload.get("access_token")
         if not token or not isinstance(token, str):
-            raise DownstreamTokenError("token exchange returned no access_token")
+            raise DownstreamTokenError(
+                "token exchange returned no access_token", reason="bad_body"
+            )
     except DownstreamTokenError:
         raise
     except Exception as exc:
         raise DownstreamTokenError(
-            f"token exchange returned an unreadable body: {type(exc).__name__}"
+            f"token exchange returned an unreadable body: {type(exc).__name__}",
+            reason="bad_body",
         ) from exc
 
     return payload
@@ -340,12 +414,19 @@ def _exchange_or_none(subject_token: str, mode: str) -> Optional[Dict[str, Any]]
     and there is no branch here that can return the caller's token instead.
     """
     try:
-        return _post_exchange(subject_token)
+        payload = _post_exchange(subject_token)
     except DownstreamTokenError as exc:
+        # Counted BEFORE the re-raise, so an enforce failure is in the census
+        # rather than only in whatever caught the exception upstream. `reason`
+        # is read defensively because an exception is the one object you cannot
+        # afford to touch optimistically while handling it.
+        _record(mode, OUTCOME_FAILED_PREFIX + str(getattr(exc, "reason", "unknown")))
         if mode == MODE_ENFORCE:
             raise
         logger.warning("downstream token exchange failed in shadow mode: %s", exc)
         return None
+    _record(mode, OUTCOME_EXCHANGED)
+    return payload
 
 
 def get_downstream_token(
@@ -368,6 +449,11 @@ def get_downstream_token(
     """
     mode = _mode()
     if mode == MODE_OFF:
+        # Counted deliberately. This is the branch that makes the series
+        # self-denominating: without it, a week of zeros is equally consistent
+        # with "shadow ran clean" and with "nobody called the server". See the
+        # counter's declaration in metrics.py.
+        _record(mode, OUTCOME_SKIPPED)
         return subject_token
 
     claims = claims or {}
@@ -389,6 +475,7 @@ def get_downstream_token(
     if key is not None:
         cached = _cache_get(key, now)
         if cached is not None:
+            _record(mode, OUTCOME_CACHE_HIT)
             return cached if mode == MODE_ENFORCE else subject_token
 
     if key is not None:
@@ -398,6 +485,7 @@ def get_downstream_token(
             # nothing: every waiter would still exchange, just in single file.
             cached = _cache_get(key, time.time())
             if cached is not None:
+                _record(mode, OUTCOME_CACHE_HIT)
                 return cached if mode == MODE_ENFORCE else subject_token
             payload = _exchange_or_none(subject_token, mode)
             if payload is None:

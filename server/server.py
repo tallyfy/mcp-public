@@ -15,7 +15,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from sentry_config import init_sentry_server
 from utils.tallyfy_auth_provider import build_auth_provider
-from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, ToolScopeEnforcementMiddleware
+from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, DownstreamAuthChallengeMiddleware, ToolScopeEnforcementMiddleware
 from routes import register_all_routes
 from tools.user_management import register_user_management_tools
 from tools.task_management import register_task_management_tools
@@ -360,6 +360,16 @@ async def catch_all_not_found(request):
     return JSONResponse({"error": "not_found"}, status_code=404)
 
 app.routes.append(Route("/{path:path}", catch_all_not_found, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]))
+
+# Answer a tool call whose Tallyfy API request came back 401 with a 401 of our
+# own, so the client re-runs its OAuth flow (#652). Added FIRST, which makes it
+# the INNERMOST of the app.add_middleware() layers, because Starlette inserts
+# each new middleware at the front of the list and builds the stack in reverse.
+# Being inside AuthErrorMiddleware is the point: this emits a plain OAuth error
+# body and AuthErrorMiddleware attaches the WWW-Authenticate header carrying the
+# RFC 9728 resource_metadata pointer, so that middleware stays the single place
+# in this server that builds a challenge header.
+app.add_middleware(DownstreamAuthChallengeMiddleware)
 
 # Add auth error middleware (transforms 401/403 to OAuth 2.1 compliant format)
 # Must be added before request logging to ensure errors are logged correctly
