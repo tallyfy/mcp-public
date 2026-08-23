@@ -538,7 +538,9 @@ def handle_tallyfy_errors(operation_name: str):
                         classify_upstream_status(status),
                     )
 
-                # Raise descriptive ToolError with status code + API message
+                # Raise descriptive ToolError carrying the API's own message only.
+                # Deliberately NO HTTP status code in the text: see
+                # _build_error_message's docstring above, which is the contract.
                 raise tag_error_class(
                     ToolError(_build_error_message(operation_name, e)),
                     classify_upstream_status(status),
