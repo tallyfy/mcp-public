@@ -323,6 +323,138 @@ def _is_auth_style_message(error: TallyfyError) -> bool:
     return any(marker in lowered for marker in _AUTH_STYLE_MARKERS)
 
 
+# ---------------------------------------------------------------------------
+# 401 classification: is this about the CREDENTIAL, or about the OBJECT? (#652)
+# ---------------------------------------------------------------------------
+#
+# Honest constraint first, because it bounds what this can ever answer.
+# ``TallyfyError`` carries only ``message``, ``status_code`` and
+# ``response_data`` (tallyfy/models.py:12-15) -- NO RESPONSE HEADERS. So "did
+# the Cloudflare edge or Laravel answer this" cannot be decided at the tool
+# layer without an SDK change. What follows classifies on the body alone.
+#
+# Each entry below was read from its emitter's source, not inferred.
+
+#: 401 bodies that DO mean "this credential is no longer accepted". Used only to
+#: LABEL the metric; the decision itself does not depend on this set.
+_CREDENTIAL_401_MESSAGES = frozenset({
+    # cloudflare-workers/app-production-api/index.js:1966 -- the edge refusing a
+    # token it could not validate. NOTE: that body is {error, message} and
+    # carries NO `code` key, so a classifier keyed on `code` sees nothing.
+    "permission denied. error code: apsh213.",
+    # Laravel's stock AuthenticationException. api-v2's app/Exceptions/Handler.php
+    # has no unauthenticated() override (verified: line 150 delegates to the base
+    # handler), so this is the framework default text, trailing stop included.
+    "unauthenticated.",
+})
+
+#: 401 bodies that are about the OBJECT, not the credential. Re-authenticating
+#: cannot fix any of these, so challenging on one sends a client round the OAuth
+#: loop over a correct rejection -- #592 arriving one status code down.
+_NON_CREDENTIAL_401_MESSAGES = frozenset({
+    # api-v2 app/Services/GuestTasksMessagingService.php:120
+    #   throw new UserException('Unauthorized action', 401);
+    # The guest is authenticated fine; that thread is not theirs.
+    "unauthorized action",
+    # api-v2 app/Http/Middleware/ExplicitUserAccess.php:36
+    #   return response('Unauthorized.', Response::HTTP_UNAUTHORIZED);
+    # A PLAIN-TEXT body, so response_data is a `str`. The SDK renders it as
+    # "API request failed with status 401: Unauthorized." and
+    # _extract_primary_message strips the prefix back to this.
+    "unauthorized.",
+    # api-v2 app/Http/Middleware/Saml.php:23
+    #   abort(401, 'Saml Is Not Enabled In this Organization');
+    # An organization configuration fact. No token fixes it.
+    "saml is not enabled in this organization",
+})
+
+
+def _normalized_401_message(error: TallyfyError) -> str:
+    """The comparable form of a 401's primary message.
+
+    ``_extract_primary_message`` already does the envelope unwrap, the SDK
+    prefix strip and the plain-string body, so this only normalises case and
+    whitespace. Kept as a named function so the classifier and the metric label
+    cannot normalise differently.
+    """
+    return _extract_primary_message(error).strip().lower()
+
+
+def is_known_401_message(error: TallyfyError) -> bool:
+    """Whether this 401's body is one we have actually read the emitter for.
+
+    Only ever used to label ``mcp_server_auth_challenge_total``. A False here
+    with a challenge issued means api-v2 has a 401 shape nobody has classified,
+    which is a thing to go and read rather than a thing to suppress.
+    """
+    message = _normalized_401_message(error)
+    return message in _CREDENTIAL_401_MESSAGES or message in _NON_CREDENTIAL_401_MESSAGES
+
+
+def is_credential_401(error: TallyfyError) -> bool:
+    """Would re-authenticating plausibly fix this 401?
+
+    🔴 THIS IS A DENYLIST AND IT MUST STAY ONE. Unknown means "challenge".
+
+    The temptation is an allowlist -- challenge only on messages we recognise --
+    and it is wrong in the one direction that matters. The day api-v2 adds a new
+    credential-failure message, an allowlist silently stops challenging, and the
+    failure is invisible: the connector just goes quiet. That is #652 verbatim,
+    reintroduced by a change that looks like tightening.
+
+    A denylist fails the other way: an unclassified 401 produces one extra
+    re-authentication. The runaway cost of that is what the circuit breaker in
+    ``middleware/downstream_auth_challenge`` bounds, which is why the two shipped
+    together.
+
+    Returns:
+        False when the body names a known object-scoped refusal, or carries a
+        field-``errors`` block (a validation rejection, never a credential
+        problem). True otherwise.
+    """
+    response_data = getattr(error, "response_data", None)
+    if isinstance(response_data, dict) and response_data.get("errors"):
+        return False
+
+    return _normalized_401_message(error) not in _NON_CREDENTIAL_401_MESSAGES
+
+
+def _auth_error_hint(decision: Optional[str]) -> str:
+    """The parenthetical that follows the API's own message on a 401 or 403.
+
+    ``decision`` is None for a 403 (which never reaches the challenge path) and
+    one of ``CHALLENGE_DECISIONS`` for a 401.
+
+    A non-credential 401 gets NO re-authentication hint. The API's own message
+    already names the real problem, and telling a user to re-authenticate over a
+    correct object-scoped refusal is exactly the trade #592 made one status code
+    up.
+    """
+    from middleware.downstream_auth_challenge import (
+        CHALLENGE_SUPPRESSED_CIRCUIT_OPEN,
+        CHALLENGE_SUPPRESSED_NOT_CREDENTIAL,
+        circuit_open_notice,
+    )
+
+    if decision == CHALLENGE_SUPPRESSED_NOT_CREDENTIAL:
+        return ""
+
+    if decision == CHALLENGE_SUPPRESSED_CIRCUIT_OPEN:
+        session_id = None
+        try:
+            from fastmcp.server.dependencies import get_http_request
+
+            session_id = get_http_request().headers.get("mcp-session-id")
+        except Exception:  # pragma: no cover - defensive
+            pass
+        return circuit_open_notice(session_id)
+
+    return (
+        "(Your session may be expired or misconfigured. "
+        "Please re-authenticate the MCP connector and retry.)"
+    )
+
+
 def _structured_error_envelope(response_data: Any) -> Optional[dict]:
     """
     Return api-v2's structured ``{"error": {...}}`` payload, or None.
@@ -523,17 +655,30 @@ def handle_tallyfy_errors(operation_name: str):
                     # cannot be delivered (no HTTP request, SSE streaming, a
                     # background task) the client still gets today's descriptive
                     # result rather than nothing.
+                    #
+                    # Not every 401 earns a challenge, and not every challenge is
+                    # issued. is_credential_401 refuses the object-scoped ones (a
+                    # guest thread, an explicit-access middleware, a SAML
+                    # refusal), and the circuit breaker refuses one that has
+                    # already been asked three times on this session with no
+                    # successful upstream call in between. The DECISION decides
+                    # the hint, because a re-authentication hint attached to a
+                    # rejection re-authenticating cannot fix is #592 verbatim.
+                    decision = None
                     if status == 401:
                         from middleware.downstream_auth_challenge import (
                             flag_downstream_auth_failure,
                         )
-                        flag_downstream_auth_failure(api_msg)
+                        decision = flag_downstream_auth_failure(
+                            api_msg,
+                            credential_failure=is_credential_401(e),
+                            known_message=is_known_401_message(e),
+                        )
 
                     raise tag_error_class(
                         ToolError(
                             f"Could not {operation_name} — {api_msg} "
-                            f"(Your session may be expired or misconfigured. "
-                            f"Please re-authenticate the MCP connector and retry.)"
+                            f"{_auth_error_hint(decision)}"
                         ),
                         classify_upstream_status(status),
                     )

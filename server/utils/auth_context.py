@@ -4,11 +4,52 @@ Extract authenticated user credentials from MCP auth context
 """
 
 import os
+import time
 import logging
 import jwt
 from typing import Optional, Tuple
-from fastmcp.server.dependencies import get_http_headers
-from mcp.server.auth.middleware.auth_context import get_access_token
+# 🔴 READ THIS BEFORE "TIDYING" THE IMPORT BELOW.
+#
+# There are TWO functions called ``get_access_token`` and they answer different
+# questions. Swapping one for the other is a one-line change with no visible
+# symptom, and the wrong one silently forwards a DEAD credential.
+#
+#   mcp.server.auth.middleware.auth_context.get_access_token   <- STALE. Do not use.
+#   fastmcp.server.dependencies.get_access_token               <- fresh. This one.
+#
+# The SDK accessor reads ``auth_context_var``, a ContextVar written in exactly one
+# place: ``AuthContextMiddleware.__call__``, which runs in the ASGI REQUEST task.
+# On the ``initialize`` POST, ``streamable_http_manager`` does
+# ``await self._task_group.start(run_server)``; anyio copies the CALLER'S CONTEXT
+# at that instant, so ``run_server`` inherits the token presented at the
+# handshake. Every later message is dispatched by ``tg.start_soon(
+# self._handle_message, ...)`` from inside ``run_server``, so each handler task
+# copies that same handshake-time snapshot -- for the whole life of the session.
+#
+# ``_handle_request`` DOES rebuild ``request_ctx`` from the live Starlette request,
+# so the REQUEST is fresh while the auth ContextVar is not. That asymmetry is what
+# makes this invisible: everything else about the request is current.
+#
+# The session outlives the credential. ``_session_owners`` compares
+# ``AuthorizationContext(client_id, issuer, subject)``, all of which survive a
+# refresh, so a refreshed token keeps the same session, the same ``run_server``
+# task and the same snapshot. Access tokens live 3600s (api-v2 ``config/mcp.php``),
+# which is exactly the "works for a couple of hours then dies" a customer reported
+# after a week of reconnecting by hand (#652).
+#
+# fastmcp already fixed this. Its accessor reads ``request.scope["user"]`` first,
+# built by ``BearerAuthBackend.authenticate`` from THIS request's Authorization
+# header, so it is fresh by construction, and falls back to the SDK ContextVar
+# when there is no HTTP request (stdio, in-process clients, Docket workers). Its
+# own docstring cites fastmcp issue #1863 and says the SDK var "may become stale
+# after token refresh".
+#
+# The module-level NAME stays ``get_access_token`` deliberately: 26 existing tests
+# patch ``utils.auth_context.get_access_token``, and rebinding the name costs zero
+# test churn. That is also precisely why this comment is here -- those 26 tests
+# pass just as happily against the reverted import, so they cannot protect this
+# line. ``tests/regression/test_forwarded_token_source.py`` is what does.
+from fastmcp.server.dependencies import get_http_headers, get_access_token
 from tallyfy import TallyfyError
 from utils.org_id_middleware import ORG_ID_HEADERS, get_org_id, get_jwt_claims
 from constants import TALLYFY_API_BASE_URL
@@ -78,6 +119,78 @@ class OrgIdMismatchError(TallyfyError):
         self.header_org_id = header_org_id
 
 
+#: Closed label vocabulary for ``mcp_server_forwarded_token_freshness_total``.
+#: Declared here rather than in metrics.py because this module is the only
+#: emitter, and a vocabulary living apart from its single emitter is how the
+#: two drift.
+FRESHNESS_FRESH = "fresh"
+FRESHNESS_STALE_AVOIDED = "stale_avoided"
+FRESHNESS_NO_REQUEST = "no_request"
+_FRESHNESS_STATES = (FRESHNESS_FRESH, FRESHNESS_STALE_AVOIDED, FRESHNESS_NO_REQUEST)
+
+
+def _record_freshness(forwarded_token: str) -> None:
+    """Count whether the SDK ContextVar would have handed us a different token.
+
+    This is the ONLY place in ``server/`` allowed to read the SDK accessor, and
+    it reads it purely to compare. It never returns it and never forwards it.
+    ``tests/regression/test_forwarded_token_source.py`` allowlists this one
+    function by name; every other import of that symbol fails the build.
+
+    Never raises. A metric must not be able to break an authenticated request.
+    """
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        from mcp.server.auth.middleware.auth_context import (
+            get_access_token as _sdk_get_access_token,
+        )
+        from metrics import record_forwarded_token_freshness
+
+        try:
+            get_http_request()
+        except Exception:
+            # stdio, an in-process FastMCP client, or a Docket worker. The SDK
+            # ContextVar is the only source there and is not stale, because
+            # there is no session outliving a request to make it so.
+            record_forwarded_token_freshness(FRESHNESS_NO_REQUEST)
+            return
+
+        sdk_token = getattr(_sdk_get_access_token(), "token", None)
+        if not sdk_token or sdk_token == forwarded_token:
+            record_forwarded_token_freshness(FRESHNESS_FRESH)
+        else:
+            record_forwarded_token_freshness(FRESHNESS_STALE_AVOIDED)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not record forwarded-token freshness: %s", exc)
+
+
+def _warn_if_already_expired(token_claims: dict, token_hint: str) -> None:
+    """Log at ERROR if the credential about to be forwarded is past its own exp.
+
+    After the fix this is impossible: ``TallyfyAuthProvider.load_access_token``
+    pre-checks ``exp``, and fastmcp's ``BearerAuthBackend.authenticate``
+    re-checks ``expires_at`` before it builds the ``AuthenticatedUser`` this
+    request reads. So a line here means the chain broke again, which is exactly
+    the state that produced #652 and produced no log line at all at the time.
+
+    Only the fingerprint is logged, never the token.
+    """
+    try:
+        exp = token_claims.get("exp")
+        if exp is None:
+            return
+        if float(exp) < time.time():
+            logger.error(
+                "Forwarding a token that is already past its own exp "
+                "(token=...%s, exp=%s). The freshness chain is broken; see "
+                "utils/auth_context.py and issue #652.",
+                token_hint,
+                exp,
+            )
+    except (TypeError, ValueError):  # pragma: no cover - a non-numeric exp
+        return
+
+
 def _client_supplied_org_id() -> Optional[str]:
     """The organization id THIS request's headers carry, or None.
 
@@ -145,15 +258,26 @@ def get_authenticated_credentials() -> Tuple[str, str]:
     if not access_token:
         raise Exception("No authenticated user found. Please authenticate with a valid JWT token.")
 
-    # Reuse claims already decoded by OrgIdMiddleware. Safe here because
-    # get_access_token() confirms JWTVerifier validated the RS256 signature
-    # before any tool handler runs — the claims are from the same token.
-    token_claims = get_jwt_claims() or {}
-    if not token_claims:
-        try:
-            token_claims = jwt.decode(access_token.token, options={"verify_signature": False})
-        except jwt.DecodeError:
-            token_claims = {}
+    # Decode the claims from THIS token, and fall back to OrgIdMiddleware's
+    # pre-decoded claims only if that fails.
+    #
+    # The order used to be the other way round, under a comment asserting "the
+    # claims are from the same token". That is exactly what is false across a
+    # token refresh: get_jwt_claims() is another ContextVar written in the ASGI
+    # request task, so it carries the SAME handshake-time snapshot the SDK
+    # accessor does (see the import block at the top of this file). Reading it
+    # first would re-introduce the staleness one line below the fix for it.
+    #
+    # Cost is one unverified decode per call, about 30 microseconds. The
+    # signature was already checked upstream by fastmcp's JWTVerifier on this
+    # exact string, which is why verify_signature=False is correct here and not
+    # a shortcut. get_mcp_scopes() below already gives this identical reasoning
+    # for deliberately not reading get_jwt_claims(); this now matches it.
+    token_claims = {}
+    try:
+        token_claims = jwt.decode(access_token.token, options={"verify_signature": False})
+    except jwt.DecodeError:
+        token_claims = get_jwt_claims() or {}
 
     claim_org_id = token_claims.get('org_id')
     # Header OR this user's persisted organization — OrgIdMiddleware cannot
@@ -202,6 +326,20 @@ def get_authenticated_credentials() -> Tuple[str, str]:
     token_hint = access_token.token[-8:] if len(access_token.token) > 8 else "***"
     logger.info(f"Auth OK │ org={org_id} │ token=...{token_hint}")
 
+    _record_freshness(access_token.token)
+    _warn_if_already_expired(token_claims, token_hint)
+
+    # Mark that this request actually resolved a credential to present upstream.
+    # DownstreamAuthChallengeMiddleware's circuit breaker resets a session's
+    # challenge count only on a success that got this far, because `initialize`
+    # and `tools/list` never touch api-v2 and so succeed happily on a dead
+    # credential. Resetting on those would defeat the breaker entirely while
+    # every test still passed. This return is the single chokepoint -- 132 call
+    # sites reach it, including tools/api_fallback.py, which builds its own
+    # Authorization header from the value.
+    from middleware.downstream_auth_challenge import note_credential_presented
+    note_credential_presented()
+
     # The MCP specification forbids presenting the caller's own token to the
     # upstream API (2026-07-28, "Access Token Privilege Restriction", and again
     # in "Token Handling"). Swap it for a short-lived downstream token that
@@ -221,20 +359,27 @@ def get_authenticated_credentials() -> Tuple[str, str]:
 
 
 def get_user_id_from_token() -> Optional[str]:
-    """Extract user ID from the authenticated JWT token."""
+    """Extract user ID from the authenticated JWT token.
+
+    Reads the token FIRST and ``get_jwt_claims()`` only as a fallback, for the
+    same reason ``get_authenticated_credentials`` does: those claims come from a
+    ContextVar written in the ASGI request task, so on a long-lived MCP session
+    they are the handshake-time snapshot rather than this request's token. See
+    the import block at the top of this file.
+    """
+    access_token = get_access_token()
+    if access_token:
+        try:
+            claims = jwt.decode(access_token.token, options={"verify_signature": False})
+            return claims.get('sub') or claims.get('user_id')
+        except jwt.DecodeError:
+            pass
+
     claims = get_jwt_claims()
     if claims:
         return claims.get('sub') or claims.get('user_id')
 
-    access_token = get_access_token()
-    if not access_token:
-        return None
-
-    try:
-        claims = jwt.decode(access_token.token, options={"verify_signature": False})
-        return claims.get('sub') or claims.get('user_id')
-    except jwt.DecodeError:
-        return None
+    return None
 
 
 def get_jwt_scopes() -> Tuple[str, ...]:

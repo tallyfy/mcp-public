@@ -197,6 +197,59 @@ downstream_token_exchange_total = Counter(
     ['mode', 'outcome']  # see utils.downstream_token._VALID_MODES and _OUTCOMES
 )
 
+# Which SOURCE the forwarded credential came from, per resolution (#652).
+#
+# The bug this measures: an MCP session's auth ContextVar is a snapshot taken at
+# the `initialize` handshake and inherited by every later tool call, so after a
+# token refresh the server kept forwarding the credential the client had stopped
+# using. `utils/auth_context.py` now reads the current request instead. This
+# counter is how a recurrence becomes loud instead of silent.
+#
+#   fresh          - the current request's token and the SDK ContextVar agree,
+#                    or the ContextVar is empty. The ordinary case.
+#   stale_avoided  - THEY DIFFER. This is the bug, counted, in production. The
+#                    old code would have forwarded the ContextVar's dead token.
+#   no_request     - no HTTP request in scope (stdio, an in-process FastMCP
+#                    client, a Docket worker). The ContextVar is all there is.
+#
+# ⚠️ `stale_avoided` READS NON-ZERO FOREVER AFTER THE FIX, AND THAT IS CORRECT.
+# The SDK ContextVar goes on being stale; we simply stopped reading it. The
+# series measures how often the old code WOULD have forwarded a dead credential,
+# not how often we do. Do not "fix" it to zero.
+#
+# Label vocabulary is closed and none of it is caller-controlled: three values,
+# enumerated in utils.auth_context._FRESHNESS_STATES. Nothing here carries a
+# token, a fingerprint, a subject or an org.
+forwarded_token_freshness_total = Counter(
+    'mcp_server_forwarded_token_freshness_total',
+    'Source of the credential forwarded upstream, per authenticated resolution',
+    ['state']  # see utils.auth_context._FRESHNESS_STATES
+)
+
+# Whether an auth challenge was issued for a downstream 401, and if not, why not
+# (#652). The suppression states are the ones worth watching: they are the
+# difference between a client that re-authenticates once and a client that loops.
+#
+#   issued_known_credential    - a 401 whose body matches a known credential
+#                                failure. Re-authenticating should fix it.
+#   issued_unclassified        - a 401 matching neither list. Challenged anyway,
+#                                because unknown-means-challenge is what keeps
+#                                #652 fixed. THIS IS THE REVIEW QUEUE: a non-zero
+#                                reading means api-v2 has a 401 body we have not
+#                                classified, and it should be read and sorted.
+#   suppressed_not_credential  - a 401 about the OBJECT, not the credential (a
+#                                guest thread, an explicit-access middleware, a
+#                                SAML refusal). Re-authenticating cannot fix one.
+#   suppressed_circuit_open    - this session has been challenged N times running
+#                                with no successful upstream call in between, so
+#                                the challenge is a loop and we stopped.
+#   no_request                 - no HTTP request to challenge on.
+auth_challenge_total = Counter(
+    'mcp_server_auth_challenge_total',
+    'Downstream 401 challenge decisions, by whether a challenge was issued',
+    ['decision']  # see middleware.downstream_auth_challenge.CHALLENGE_DECISIONS
+)
+
 # ============================================================================
 # Helpers
 # ============================================================================
@@ -281,7 +334,14 @@ def track_tool_execution(tool_name: str):
                 claims = get_jwt_claims()
                 if claims:
                     user_id = claims.get('sub') or claims.get('user_id') or claims.get('uid', 'unknown')
-                from mcp.server.auth.middleware.auth_context import get_access_token
+                # fastmcp's accessor, NOT mcp.server.auth.middleware.auth_context's.
+                # The SDK one returns the token captured at the MCP handshake and
+                # never updates it for the life of the session, so on a refreshed
+                # session `api_key` here is the DEAD token -- and its only consumer
+                # is the 401 log hint below, which would then print the fingerprint
+                # of a token that is not the one the request carried, next to a 401
+                # caused by exactly that staleness. See utils/auth_context.py.
+                from fastmcp.server.dependencies import get_access_token
                 access_token = get_access_token()
                 if access_token:
                     api_key = access_token.token
@@ -525,3 +585,27 @@ def record_downstream_token_exchange(mode: str, outcome: str):
         outcome: one of utils.downstream_token._OUTCOMES
     """
     downstream_token_exchange_total.labels(mode=mode, outcome=outcome).inc()
+
+
+def record_forwarded_token_freshness(state: str):
+    """Record where the credential about to be forwarded upstream came from.
+
+    Changes no behaviour. See the counter's declaration above for the label
+    vocabulary and for why `stale_avoided` is expected to stay non-zero.
+
+    Args:
+        state: one of utils.auth_context._FRESHNESS_STATES
+    """
+    forwarded_token_freshness_total.labels(state=state).inc()
+
+
+def record_auth_challenge(decision: str):
+    """Record one downstream-401 challenge decision.
+
+    Changes no behaviour: the caller counts and then acts exactly as it would
+    have. See the counter's declaration above for the vocabulary.
+
+    Args:
+        decision: one of middleware.downstream_auth_challenge.CHALLENGE_DECISIONS
+    """
+    auth_challenge_total.labels(decision=decision).inc()
