@@ -19,6 +19,10 @@ from utils.fastmcp_types import (
 )
 from utils.sdk_serializer import serialize_dataclass
 from metrics import track_tool_execution
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 
 def register_automation_tools(mcp):
@@ -376,6 +380,133 @@ def register_automation_tools(mcp):
 
         return conditions
 
+    # What the caller may call each replaceable list, mapped to the key the
+    # STORED rule uses. AutomatedActionTransformer.php:18 emits `then_actions`;
+    # the SDK maps a caller's `actions` onto that same key before the PUT.
+    _REPLACEABLE_LISTS = (
+        ("conditions", ("conditions",)),
+        ("then_actions", ("actions", "then_actions")),
+    )
+
+    def _stored_automation_rule(sdk, org_id: str, template_id: str, automation_id: str):
+        """Re-read one automation rule, or return None when it cannot be established.
+
+        Deliberately the SAME request the SDK issues moments later inside
+        `update_automation_rule` (a template GET with `?with=automated_actions`)
+        rather than a narrower endpoint, so the guard and the read-merge can
+        never disagree about what "stored" means.
+        """
+        try:
+            resp = sdk._make_request(
+                "GET",
+                f"organizations/{org_id}/checklists/{template_id}",
+                params={"with": "automated_actions"},
+            )
+        # Deliberately broad: ANY failure to read means we cannot judge whether
+        # the submission is short, and the guard fails open by design. See
+        # _guard_shorter_list's docstring for why open rather than closed.
+        except Exception as exc:
+            logger.warning(
+                "could not re-read automation rule %s on template %s to check for a "
+                "destructive replace: %s", automation_id, template_id, exc
+            )
+            return None
+
+        data = resp.get("data", {}) if isinstance(resp, dict) else {}
+        # A FLAT list is the correct shape here, and the sibling key is the
+        # opposite: ChecklistTransformer builds `automated_actions` with
+        # $this->map() (flat array) and `steps` with $this->collection() (a
+        # Fractal include, {"data": [...]}). Same-looking code, opposite right
+        # answers -- PR #995 read `steps` as flat on this assumption.
+        automations = data.get("automated_actions") if isinstance(data, dict) else None
+        if not isinstance(automations, list):
+            logger.warning(
+                "template %s did not return a list of automated_actions, so "
+                "automation rule %s could not be re-read to check for a "
+                "destructive replace; the guard is failing open. Got %s",
+                template_id, automation_id, type(automations).__name__
+            )
+            return None
+        for rule in automations:
+            if isinstance(rule, dict) and str(rule.get("id")) == str(automation_id):
+                return rule
+        logger.warning(
+            "automation rule %s was not among the %d rule(s) stored on template "
+            "%s, so it could not be re-read to check for a destructive replace; "
+            "the guard is failing open",
+            automation_id, len(automations), template_id
+        )
+        return None
+
+    def _submitted_list(automation_data: dict, caller_keys):
+        """Return the caller's list for one replaceable slot, or None if untouched.
+
+        None and an empty list are different answers. None means the caller never
+        mentioned the slot, which the SDK refills from its own fetch, so nothing
+        is destroyed. An empty list means "replace with nothing", which deletes
+        every stored row and IS what this guard exists to catch.
+        """
+        for key in caller_keys:
+            if key in automation_data:
+                value = automation_data[key]
+                return value if isinstance(value, list) else None
+        return None
+
+    def _guard_shorter_list(sdk, org_id, template_id, automation_id, automation_data,
+                            confirm_replace: bool) -> None:
+        """Refuse a submitted conditions/actions list SHORTER than the stored one.
+
+        api-v2 syncs each list BY ID and force-deletes every stored row whose id
+        is absent from the submission::
+
+            $currentRules->whereNotIn('id', $ids)->each(fn ($r) => $r->forceDelete());
+
+        (`AutomatedAction::syncRulesConditions` and `syncDoableActions`,
+        app/Models/AutomatedAction.php:108-110.) It then answers **HTTP 200 and
+        reports nothing**, so the API cannot tell the caller what it destroyed
+        and pass-through is not the safe default here. This is the only place in
+        the round trip where the loss is visible before it happens.
+
+        ⚠️ **FAILS OPEN when the stored rule cannot be read**, and that is a
+        deliberate trade rather than an oversight. Blocking on an unreadable
+        re-read would turn a transient network fault into a hard refusal whose
+        only escape is `confirm_replace=True` — which would teach every caller to
+        pass it always, and a guard everybody bypasses guards nothing. The
+        unreadable case is logged at WARNING so it is observable rather than
+        silent. Consequence worth stating plainly: a green call is NOT proof the
+        guard ran.
+
+        It compares COUNTS, not id sets. A submission of the same length that
+        swaps one row for another is a deliberate edit and is allowed through;
+        what this catches is the shape that silently loses data, which is
+        sending fewer rows than are stored.
+        """
+        wanted = [
+            (stored_key, submitted)
+            for stored_key, caller_keys in _REPLACEABLE_LISTS
+            if (submitted := _submitted_list(automation_data, caller_keys)) is not None
+        ]
+        if not wanted or confirm_replace:
+            return
+
+        rule = _stored_automation_rule(sdk, org_id, template_id, automation_id)
+        if rule is None:
+            return
+
+        for stored_key, submitted in wanted:
+            stored = rule.get(stored_key)
+            if not isinstance(stored, list) or len(submitted) >= len(stored):
+                continue
+            raise ToolError(
+                f"Refusing to update: you sent {len(submitted)} {stored_key} where "
+                f"{len(stored)} are stored. This PUT REPLACES the list wholesale, so "
+                f"Tallyfy would permanently delete the {len(stored) - len(submitted)} "
+                "you left out, answer HTTP 200 and warn nobody. Read the rule with "
+                "analyze_template_automations, then resend EVERY entry you want to "
+                "keep, verbatim and including its 'id'. If deleting them is genuinely "
+                "what you want, repeat this call with confirm_replace=True."
+            )
+
     def _apply_condition_logic(automation_data: dict) -> None:
         """Translate the non-existent top-level condition_logic to per-condition logic.
 
@@ -526,6 +657,11 @@ Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name,
         name="update_automation_rule",
         description="""Modify automation conditions and actions.
 
+THE PUT REPLACES conditions and actions WHOLESALE. Read the rule with
+analyze_template_automations first and send back EVERY condition and action you
+want to keep: a shorter list force-deletes the rest, HTTP 200, no warning.
+Omitting 'conditions' or 'actions' is a 422.
+
 REQUIRED (all three): 'template_id' (32-char hex), 'automation_id' (32-char hex), 'automation_data' (dict).
 
 Use "actions" (NOT "then_actions"). Use "alias" (NOT "automated_alias"). Use "step"/"field"/"kickoff" for conditionable_type (auto-resolved).
@@ -534,19 +670,18 @@ VALID ENUM VALUES:
   STEP operations:    completed, reopened, approved, rejected, acknowledged, expired, not_assigned
   FIELD/KICKOFF ops:  contains, not_contains, equals, not_equals, equals_any, greater_than, less_than, is_empty, is_not_empty
 
-COMPATIBILITY MATRIX - action_type constrains action_verb
+MATRIX - action_type constrains action_verb
   visibility -> show | hide    deadline -> deadline    status -> reopen
   webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
 e.g. `reopen` is only valid with action_type "status", never "visibility".
-conditionable_type step | field | kickoff pairs with any action_verb.
 
 CONDITIONS: every entry needs a `statement` key (null for step ops). AND/OR is set
 PER CONDITION as `logic`:"and"|"or"; there is no top-level condition_logic field.
 
 ACTION-SPECIFIC REQUIRED FIELDS (all actions need `target_step_id`):
-  - assignment    → `assignees: {users:[...], guests:[...], groups:[...]}`
-  - deadline      → COMPLETE `deadline: {value:int, unit:minutes|hours|days|weeks|months, option:before|from}`
-  - emit_webhook  → `webhook_url` AND `alias_name`
+  - assignment -> `assignees: {users:[...], guests:[...], groups:[...]}`
+  - deadline -> COMPLETE `deadline: {value:int, unit:minutes|hours|days|weeks|months, option:before|from}`
+  - emit_webhook -> `webhook_url` AND `alias_name`
 
 INCOMPATIBLE COMBOS (produce 422 errors):
   - an action_verb outside its action_type's list (see matrix above)
@@ -555,10 +690,7 @@ INCOMPATIBLE COMBOS (produce 422 errors):
   - operation="completed" with conditionable_type="field" (use "equals")
   - a condition with no `statement` key
 
-CORRECT: update_automation_rule(template_id="abc...", automation_id="def...", automation_data={"conditions":[...], "actions":[...]})
-WRONG:   update_automation_rule(automation_id="def...", automation_data={...})  ← MISSING template_id
-
-Never call this without all three parameters.""",
+To keep a condition or action UNCHANGED, resend it verbatim including its `id`.""",
         tags=["automation", "rules", "update", "write", "configuration"],
         annotations=ToolAnnotations(
             title="Update automation rule",
@@ -574,7 +706,8 @@ Never call this without all three parameters.""",
     def update_automation_rule(
         template_id: TemplateId,
         automation_id: AutomationId,
-        automation_data: GenericDict
+        automation_data: GenericDict,
+        confirm_replace: bool = False
     ) -> GenericDict:
         """
         Modify automation conditions and actions.
@@ -583,8 +716,19 @@ Never call this without all three parameters.""",
             template_id: Template ID (REQUIRED - 32-character hex string)
             automation_id: Automation rule ID to update (REQUIRED - 32-character hex string)
             automation_data: Dictionary containing updated automation rule data (REQUIRED)
-                - Can include partial updates to conditions, actions, or both
+                - Partial at the TOP level is safe: a key you omit entirely
+                  (`conditions`, `actions`, `alias`) is refilled by the SDK from a
+                  fresh read of the stored rule, so omitting one changes nothing.
+                - Partial WITHIN a list is DESTRUCTIVE: api-v2 syncs conditions and
+                  actions by id and force-deletes every stored entry whose id is
+                  absent from the list you send, at HTTP 200 with no warning
+                  (AutomatedAction::syncRulesConditions / syncDoableActions,
+                  app/Models/AutomatedAction.php:108-110). Send back every entry
+                  you want to keep, verbatim and including its `id`.
                 - Structure: {conditions: [...], then_actions: [...], name: str, etc.}
+            confirm_replace: Set True to allow a submitted `conditions` or `actions`
+                list SHORTER than the stored one, i.e. to delete the entries you
+                left out on purpose. Defaults to False, which refuses that shape.
 
         Returns:
             Updated AutomatedAction object data
@@ -598,6 +742,11 @@ Never call this without all three parameters.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            # BEFORE the write: api-v2 accepts a short list, deletes the remainder
+            # and answers 200, so this is the last point at which the loss is
+            # visible. See _guard_shorter_list, including why it fails open.
+            _guard_shorter_list(sdk, org_id, template_id, automation_id,
+                                automation_data, confirm_replace)
             result = sdk.templates.update_automation_rule(org_id, template_id, automation_id, automation_data)
             return ToolResult(
                 content=serialize_dataclass(result) if result else {},
@@ -712,10 +861,22 @@ Never call this without all three parameters.""",
 
     @mcp.tool(
         name="analyze_template_automations",
-        description="""Retrieve and analyze all automation rules for a template.
+        description="""READ every automation rule on a template.
 
-Returns the complete automation rules (conditions, actions, targets), a step lookup map,
-and pre-computed redundant_groups identifying duplicates and merge candidates.
+This is the ONLY tool that reads automation rules - there is no separate
+list_automation_rules and no get_automations. Use it whenever the user asks to
+see, list, review, audit, export or explain a template's automations, not only
+when they ask for analysis.
+
+RETURNS: template_id, template_title, automations (every rule in full: its
+conditions, its then_actions, their targets and ids), step_lookup (step id ->
+title), redundant_groups (pre-computed duplicates and merge candidates),
+total_automations, total_steps.
+
+HIDDEN AT LAUNCH: a step targeted by a "visibility"/"show" action starts HIDDEN
+in every process launched from this template, revealed when the rule fires. That
+is how "hidden by default" is expressed - there is no per-step flag, so these
+rules are the only record of it.
 
 Use this data to:
 - Review redundant_groups for exact duplicates (same trigger AND actions) and same-trigger rules (mergeable actions)
@@ -727,12 +888,13 @@ IMPORTANT: Two rules with the same structure (e.g. both have 1 condition and 1 a
 if they reference different steps. Always compare conditionable_id AND target_step_id values.
 
 To consolidate: review redundant_groups, then use update_automation_rule to merge actions and
-delete_automation_rule to remove duplicates. The LLM decides which changes to apply.
+delete_automation_rule to remove duplicates.
 
 REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.""",
-        tags=["automation", "analysis", "optimization", "read-only"],
+        tags=["automation", "automations", "rules", "list", "read", "analysis",
+              "optimization", "read-only"],
         annotations=ToolAnnotations(
-            title="Analyze template automations",
+            title="List and analyze template automation rules",
             readOnlyHint=True,
             destructiveHint=False,
             idempotentHint=True,

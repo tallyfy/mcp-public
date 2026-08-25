@@ -17,7 +17,7 @@ for tool chaining.
 
 import json
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from dataclasses import fields, is_dataclass
 
 from utils.response_sanitizer import sanitize_for_user_text
@@ -28,7 +28,51 @@ logger = logging.getLogger(__name__)
 # <persisted-output> tags, making the data invisible to the model.
 # We target well under that to leave headroom for MCP framing.
 MAX_RESULT_BYTES = 25_000
+
+# Per-string cap. DELIBERATELY LEFT AT 500 (issue #982).
+#
+# Raising it looks like the obvious half of the truncation fix and is not. The
+# defect that cost a customer his migrated email bodies was that a cut string
+# was INDISTINGUISHABLE from a whole one, not that the cut was at 500. The
+# marker below fixes that; the number does not.
+#
+# Raising it costs delivered items everywhere, because every string competes for
+# the same MAX_RESULT_BYTES ceiling. Measured on this branch at 5000: a 50-item
+# comment list at 3000 chars each drops from 35 items delivered to 8, and a
+# 40-item step list does the same. Fourteen list call sites share this default,
+# so a global raise is a 4x cut on thirteen tools that were not the problem.
+#
+# A cut string is still ADDRESSABLE, because the item carries its id and
+# get_template_steps(step_id=..., full_text=True) reads it whole. A dropped item
+# is not addressable at all: the caller never learns it exists. That asymmetry
+# is the argument #767 makes about pagination, and it is why the escape hatch is
+# the right lever here and the default is not.
 MAX_STRING_LENGTH = 500
+
+# The literal every truncation marker opens with, exported so a tool DESCRIPTION
+# can interpolate it instead of repeating it. A description that tells a model to
+# look for "[truncated:" while this module emits something else is worse than no
+# advice at all, and nothing would have gone red on the rename.
+TRUNCATION_MARKER_PREFIX = "[truncated:"
+
+
+def _truncation_marker(kept: int, total: int) -> str:
+    """The suffix appended to a string this module had to cut.
+
+    It stays a plain ``str`` on purpose: no consumer, test, or
+    ``sanitize_for_user_text`` pass has to learn a new type, and the value can
+    still be rendered straight into a tool result.
+
+    It says the total length because "some of this is missing" is not actionable
+    on its own, and it says do-not-write-it-back because that is the failure this
+    marker exists to stop. The previous marker was ``"..."``, which is
+    indistinguishable from an ellipsis the author typed, so a model round-tripping
+    a description had no way to know it was overwriting the rest of it.
+    """
+    return (
+        f" {TRUNCATION_MARKER_PREFIX} this is the first {kept} of {total} characters, "
+        "NOT the full value. Do not write it back, you would overwrite the rest.]"
+    )
 
 
 def _is_empty(value: Any) -> bool:
@@ -40,12 +84,16 @@ def _is_empty(value: Any) -> bool:
     return False
 
 
-def _serialize_inner(obj: Any) -> Any:
+def _serialize_inner(obj: Any, max_string_length: Optional[int] = MAX_STRING_LENGTH) -> Any:
     """Recursive serialize without the user-text sanitisation pass.
 
     Internal helper used by ``serialize_dataclass`` so the sanitiser
     only runs once, at the top of the recursion (instead of on every
     nested level).
+
+    ``max_string_length`` is threaded through every level so a caller can ask
+    for one whole object uncut (``None``) without the cap reappearing on a
+    nested field. ``None`` means no cap at all.
     """
     if obj is None:
         return None
@@ -54,31 +102,40 @@ def _serialize_inner(obj: Any) -> Any:
         result = {}
         for field in fields(obj):
             value = getattr(obj, field.name)
-            serialized = _serialize_inner(value)
+            serialized = _serialize_inner(value, max_string_length)
             if not _is_empty(serialized):
                 result[field.name] = serialized
         return result
 
     elif isinstance(obj, list):
-        return [_serialize_inner(item) for item in obj]
+        return [_serialize_inner(item, max_string_length) for item in obj]
 
     elif isinstance(obj, dict):
         compacted = {}
         for key, value in obj.items():
-            serialized = _serialize_inner(value)
+            serialized = _serialize_inner(value, max_string_length)
             if not _is_empty(serialized):
                 compacted[key] = serialized
         return compacted
 
-    elif isinstance(obj, str) and len(obj) > MAX_STRING_LENGTH:
-        return obj[:MAX_STRING_LENGTH] + "..."
+    elif (
+        isinstance(obj, str)
+        and max_string_length is not None
+        and len(obj) > max_string_length
+    ):
+        return obj[:max_string_length] + _truncation_marker(max_string_length, len(obj))
 
     else:
         # Primitive type (str, int, float, bool, etc.)
         return obj
 
 
-def serialize_dataclass(obj: Any, *, _sanitize: bool = True) -> Any:
+def serialize_dataclass(
+    obj: Any,
+    *,
+    _sanitize: bool = True,
+    max_string_length: Optional[int] = MAX_STRING_LENGTH,
+) -> Any:
     """
     Recursively serialize a dataclass object to a dictionary.
     Strips null/empty fields to reduce payload size, then applies the
@@ -91,13 +148,18 @@ def serialize_dataclass(obj: Any, *, _sanitize: bool = True) -> Any:
         _sanitize: If False, skip the user-visible-text sanitisation
             pass and return the raw serialised structure. Default True.
             Used internally by other helpers to avoid double-passes.
+        max_string_length: Per-string cap. ``None`` returns every string
+            whole, which is only safe for ONE object and only when the
+            caller then bounds the result (see ``window_longest_text``):
+            an uncapped serialisation can exceed MAX_RESULT_BYTES, and
+            the client cuts anything over that silently.
 
     Returns:
         Serialized representation (dict, list, or primitive). When
         ``_sanitize=True`` (default), the structure is safe to drop into
         ``ToolResult.content`` for the user-visible text path.
     """
-    serialized = _serialize_inner(obj)
+    serialized = _serialize_inner(obj, max_string_length)
     if _sanitize:
         return sanitize_for_user_text(serialized)
     return serialized
@@ -157,6 +219,157 @@ def compact_dict_list_field(
         list_key: items[:lo],
         "_truncated": f"Showing {lo} of {total_count} {item_label}",
     }
+
+
+def window_longest_text(
+    obj: Dict[str, Any],
+    *,
+    offset: int = 0,
+    max_bytes: int = MAX_RESULT_BYTES,
+) -> Dict[str, Any]:
+    """Return ``obj`` with its single longest string windowed to fit ``max_bytes``.
+
+    This exists because "return the whole value" is not achievable in one
+    response and pretending otherwise is the defect this module is being fixed
+    for. An uncapped serialisation of one step with a 60,000-character summary
+    encodes to about 60KB. That is 2.4x MAX_RESULT_BYTES and well past the ~30KB
+    at which the CLI cuts a tool result, so the caller receives a truncated
+    payload with nothing saying so. ``compact_result`` cannot help: with a single
+    item its binary search bottoms out at 1 and it labels the result
+    ``"Showing 1 of 1 items"``, which reads as complete.
+
+    So the whole value is delivered ACROSS CALLS instead of pretending to fit in
+    one. The window that was actually returned is named in the text itself,
+    along with the exact offset to ask for next, so a caller can reassemble the
+    value and can tell when it is done.
+
+    Returns ``obj`` unchanged when it already fits and ``offset`` is 0.
+    """
+    if not isinstance(obj, dict):
+        return obj
+
+    def encoded_len(candidate: Any) -> int:
+        """Measured with DEFAULT separators on purpose: that is the widest of the
+        two encodings in use here, so a window that fits under it also fits under
+        the compact one. Measuring the compact form instead put a result 25 bytes
+        over the ceiling, because ", " and ": " cost two bytes per key more.
+        """
+        return len(json.dumps(candidate, default=str))
+
+    if offset == 0 and encoded_len(obj) <= max_bytes:
+        return obj
+
+    key = max(
+        (k for k, v in obj.items() if isinstance(v, str)),
+        key=lambda k: len(obj[k]),
+        default=None,
+    )
+    if key is None:
+        # Nothing string-shaped to window. Say so rather than returning an
+        # oversize payload that reads as complete.
+        return {**obj, "_truncated": (
+            f"This result is {encoded_len(obj)} bytes, over the {max_bytes}-byte "
+            "limit, and has no single long text field to split. It WILL be cut "
+            "before you see all of it."
+        )}
+
+    whole = obj[key]
+    total = len(whole)
+    if offset >= total:
+        raise ValueError(
+            f"text_offset {offset} is past the end of '{key}', which is {total} "
+            f"characters. The last valid offset is {total - 1}."
+        )
+
+    remaining = whole[offset:]
+
+    # Binary search the largest window that still fits WITH its marker, since the
+    # marker's own length depends on the numbers inside it and JSON escaping can
+    # make a character cost more than a byte.
+    def build(keep: int, base: Dict[str, Any]) -> Dict[str, Any]:
+        end = offset + keep
+        if offset == 0 and end >= total:
+            return {**base, key: whole}
+        marker = (
+            f" {TRUNCATION_MARKER_PREFIX} this is characters {offset} to {end} "
+            f"of {total} of '{key}', NOT the full value. Do not write it back. "
+        )
+        marker += (
+            f"Call the same tool again with text_offset={end} for the next part.]"
+            if end < total else "This is the LAST part.]"
+        )
+        return {**base, key: remaining[:keep] + marker}
+
+    def largest_window_that_fits(base: Dict[str, Any]) -> Dict[str, Any]:
+        """Binary search the biggest window that still fits WITH its marker.
+
+        The marker's own length depends on the numbers inside it and JSON
+        escaping can make a character cost more than a byte, so every trial is
+        measured rather than computed.
+        """
+        lo, hi = 1, len(remaining)
+        if encoded_len(build(hi, base)) <= max_bytes:
+            return build(hi, base)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if encoded_len(build(mid, base)) <= max_bytes:
+                lo = mid
+            else:
+                hi = mid - 1
+        return build(lo, base)
+
+    windowed = largest_window_that_fits(obj)
+    if encoded_len(windowed) <= max_bytes:
+        logger.info(
+            "Windowed '%s': offset %d, kept %d of %d chars",
+            key, offset, len(windowed[key]), total,
+        )
+        return windowed
+
+    # STILL over with the window at its smallest, so the weight is NOT in the
+    # field being windowed and no window size can fix it. Windowing one string
+    # only bounds a payload whose other values are small; a step carrying a long
+    # summary AND eight long form-field defaults is over the ceiling before the
+    # summary is considered at all. Returning the smallest window unchecked here
+    # handed back a 73,915-byte result against a 25,000-byte ceiling, which the
+    # client cuts with nothing saying so -- the exact silence this module is
+    # being fixed for, one level up from the string case.
+    #
+    # So drop the heaviest siblings, largest first, until it fits, and NAME every
+    # one that was dropped. A named absence can be asked for again; a silent cut
+    # cannot.
+    reduced = dict(obj)
+    withheld: List[str] = []
+    heavies = sorted(
+        ((k, encoded_len(v)) for k, v in obj.items() if k != key),
+        key=lambda kv: kv[1],
+        reverse=True,
+    )
+    for name, size in heavies:
+        reduced.pop(name, None)
+        withheld.append(f"'{name}' ({size} bytes)")
+        candidate = largest_window_that_fits(
+            {**reduced, "_withheld": (
+                "Removed to fit the "
+                f"{max_bytes}-byte response limit and NOT returned: "
+                + ", ".join(withheld)
+                + ". Ask for these on their own; they were not empty."
+            )}
+        )
+        if encoded_len(candidate) <= max_bytes:
+            logger.info(
+                "Windowed '%s' and withheld %s to fit %d bytes",
+                key, ", ".join(withheld), max_bytes,
+            )
+            return candidate
+
+    # Nothing left to withhold. Say so rather than returning an oversize payload
+    # that reads as complete.
+    return {**windowed, "_truncated": (
+        f"This result is {encoded_len(windowed)} bytes even with '{key}' cut to "
+        f"its shortest and every other field removed, over the {max_bytes}-byte "
+        "limit. It WILL be cut before you see all of it."
+    )}
 
 
 def compact_result(result: Any) -> Any:

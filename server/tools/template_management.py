@@ -3,6 +3,7 @@ Template Management Tools
 Tools for managing templates, steps, and template health
 """
 
+import logging
 import re
 from typing import Any
 
@@ -26,7 +27,14 @@ from utils.fastmcp_types import (
     GenericDict,
     GenericList,
 )
-from utils.sdk_serializer import serialize_dataclass, compact_result
+from utils.sdk_serializer import (
+    serialize_dataclass,
+    compact_result,
+    compact_dict_list_field,
+    window_longest_text,
+    MAX_RESULT_BYTES,
+    TRUNCATION_MARKER_PREFIX,
+)
 from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
 
@@ -68,6 +76,8 @@ def _find_folder_by_name(folders, name: str):
 # StepControllerNew::create's onlyValidatedFields() and actually reach the step.
 # 'position' is included because this tool honours it via a follow-up reorder,
 # not because the create endpoint accepts it — it does not.
+logger = logging.getLogger(__name__)
+
 _STEP_CREATE_KEYS = frozenset({
     "title", "summary", "step_type", "webhook", "max_assignable", "position",
     "assignees", "guests", "groups", "tags",
@@ -77,6 +87,14 @@ _STEP_CREATE_KEYS = frozenset({
     "role_changes_every_time", "assign_run_starter", "top_secret",
     "send_chromeless",
 })
+
+# Bytes reserved for the JSON list brackets a single-step result is returned in,
+# plus slack for transport framing. Measured: bounding the step dict alone
+# produced a 25,002-byte list against a 25,000-byte ceiling.
+#
+# Placed here rather than above _STEP_CREATE_KEYS because a sibling branch
+# inserts at that exact line; two insertions at one point conflict on merge.
+_RESULT_CONTAINER_ALLOWANCE = 128
 
 # Keys that reach the API and are then silently dropped, each with the reason and
 # the path that does work. Naming them beats the old behaviour, where the SDK
@@ -358,6 +376,52 @@ def _fetch_step_for_update(sdk, org_id: str, template_id: str, step_id: str):
     return endpoint, step
 
 
+def _deadline_anchors(steps: list, step_id: str) -> list:
+    """Other steps whose deadline is anchored to ``step_id``.
+
+    This is the SECOND thing api-v2 refuses a delete for, and the only one no
+    existing tool reports. It maps to `Step::hasDeadlineDependents`
+    (api-v2 app/Models/Step.php:263-266), which is:
+
+        $this->whereRaw("deadline ->> 'step' = ?", [$this->id])->exists()
+
+    Two properties of that query decide how this is written.
+
+    Compare ids on the TRANSFORMED payload. `StepTransformer.php:33` re-emits the
+    key as `timelineID($step->deadline['step'])`, so what arrives here is a
+    timeline id, and both sides of the comparison have been through the same
+    transform. That is why this takes already-fetched steps rather than querying.
+
+    It is NOT scoped by checklist_id. api-v2 therefore checks the whole tenant
+    while this scan is template-scoped, so a step in ANOTHER template anchored to
+    this one is a FALSE NEGATIVE here: the pre-flight reports clean and the delete
+    is still refused. That gap is why the tool description calls a clean
+    pre-flight strong evidence rather than a guarantee.
+    """
+    anchors = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("id", "")) == str(step_id):
+            continue  # a step anchored to itself is not a dependent
+        deadline = step.get("deadline")
+        if not isinstance(deadline, dict):
+            continue
+        if str(deadline.get("step", "")) != str(step_id):
+            continue
+        anchors.append({
+            "step_id": step.get("id"),
+            "step_title": step.get("title"),
+            "position": step.get("position"),
+            "deadline": {
+                "value": deadline.get("value"),
+                "unit": deadline.get("unit"),
+                "option": deadline.get("option"),
+            },
+        })
+    return anchors
+
+
 def _preserved_step_fields(step: dict, step_id: str) -> dict:
     """Build the MINIMUM every step PUT must carry, and nothing else.
 
@@ -409,7 +473,7 @@ def register_template_management_tools(mcp):
 
     @mcp.tool(
         name="get_template",
-        description="""Get a template (checklist) by its ID or name with full details.
+        description=f"""Get a template (checklist) by its ID or name with full details.
 
 MANDATORY: You MUST provide either 'template_id' OR 'template_name'. Calling with empty parameters WILL FAIL.
 
@@ -423,7 +487,18 @@ WRONG usage (will fail):
 
 If you don't have a template_id or name, use search_for_templates(query="...") first to find templates, or use get_all_templates() to list all templates.
 
-DO NOT use this tool just to list steps — use get_template_steps instead.""",
+PREFER A NARROWER TOOL when you know what you want. This returns the whole template in one
+payload, so it hits the size ceiling soonest and is the most likely to come back trimmed:
+- steps, or a step's id: get_template_steps
+- automation rules: analyze_template_automations
+- kick-off (prerun) fields: get_kickoff_fields
+
+SIZE: if the response carries "_truncated", later steps were dropped and are NOT in it. If it
+carries "_withheld", a named field was removed whole and is NOT in it either. The trim
+reaches the step list only, so no marker is not a promise of completeness.
+If any text CONTAINS "{TRUNCATION_MARKER_PREFIX}", that string is only part of the real value.
+Never write a value carrying that marker back to Tallyfy; re-read it first with
+get_template_steps(step_id=..., full_text=True).""",
         tags=["templates", "blueprints", "read-only"],
         annotations=ToolAnnotations(
             title="Get template",
@@ -448,7 +523,8 @@ DO NOT use this tool just to list steps — use get_template_steps instead.""",
             template_name: Template (checklist) name (provide this OR template_id, not both)
 
         Returns:
-            Template object with complete template data
+            Template object, with its step list trimmed when the payload
+            exceeds the result ceiling
         """
         if not template_id.strip() and not template_name.strip():
             raise ToolError("Either template_id or template_name must be provided")
@@ -462,8 +538,16 @@ DO NOT use this tool just to list steps — use get_template_steps instead.""",
                 template = sdk.templates.get_template(org_id, template_name=template_name.strip())
             else:
                 template = sdk.templates.get_template(org_id, template_id=template_id.strip())
+            if not template:
+                return ToolResult(content={}, structured_content=None)
+            # Whole-template reads have no size control of their own: compact_result
+            # only trims list-shaped results. Route through the ONE shared trimmer so
+            # an oversize template loses steps visibly, with a _truncated marker,
+            # instead of being handed over the 25KB ceiling silently.
             return ToolResult(
-                content=serialize_dataclass(template) if template else {},
+                content=compact_dict_list_field(
+                    serialize_dataclass(template), "steps", item_label="steps"
+                ),
                 structured_content=None
             )
 
@@ -514,9 +598,11 @@ DO NOT use this tool just to list steps — use get_template_steps instead.""",
         name="get_step_dependencies",
         description="""Read-only: analyze which automations affect when this step appears in the workflow. Inspects all template rules referencing the step as condition trigger OR action target.
 
-RETURN: {step_info: {id,title,position,summary}, dependencies: {incoming: [{step_id,step_title,condition_type,automation_id,description}], outgoing: [{step_id,step_title,action_type,automation_id,description}], field_dependencies: [{field_label,expected_value,condition_type,automation_id,description}], conditional_visibility: [{action_type:"show_step"|"hide_step",automation_id,description}]}, complexity_analysis: {score:0-100, level:"Low"|"Medium"|"High", total_dependencies, incoming_count, outgoing_count, field_dependencies_count, visibility_conditions_count}, recommendations: [advisory strings], template_id}
+RETURN: {step_info: {id,title,position,summary}, dependencies: {incoming: [{step_id,step_title,condition_type,automation_id,description}], outgoing: [{step_id,step_title,action_type,automation_id,description}], field_dependencies: [{field_label,expected_value,condition_type,automation_id,description}], conditional_visibility: [{action_type:"show_step"|"hide_step",automation_id,description}], deadline_anchors: [{step_id,step_title,position,deadline:{value,unit,option}}]}, complexity_analysis: {score:0-100, level:"Low"|"Medium"|"High", total_dependencies, incoming_count, outgoing_count, field_dependencies_count, visibility_conditions_count, deadline_anchor_count}, recommendations: [advisory strings], template_id}
 
-KEY: `conditional_visibility` lists automation_ids of show/hide rules for this step. Look them up via `analyze_template_automations` or `get_step_visibility_conditions` for full conditions.
+BEFORE DELETING: `deadline_anchors` plus incoming/outgoing are the TWO delete blockers. See delete_step.
+
+KEY: `conditional_visibility` gives automation_ids of show/hide rules; read them with `analyze_template_automations` or `get_step_visibility_conditions`.
 
 USE CASES: "What does this step depend on?"→incoming · "What does this step trigger?"→outgoing · "Which fields gate it?"→field_dependencies · "Is visibility conditional?"→conditional_visibility · "Should this step be split?"→complexity_analysis.level
 
@@ -549,7 +635,108 @@ REQUIRED: 'template_id' AND 'step_id' (both 32-char hex). Never call without bot
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             result = sdk.templates.get_step_dependencies(org_id, template_id, step_id)
-            return ToolResult(content=serialize_dataclass(result) if result else {}, structured_content=None)
+            payload = serialize_dataclass(result) if result else {}
+            if not isinstance(payload, dict):
+                return ToolResult(content=payload, structured_content=None)
+
+            dependencies = payload.setdefault("dependencies", {})
+            complexity = payload.setdefault("complexity_analysis", {})
+
+            # One extra round trip, DELIBERATELY. The SDK's dependency walk does
+            # not look at deadlines, and re-implementing it here to save a call
+            # would create a second copy that drifts from the first.
+            #
+            # This is best-effort ON PURPOSE. Before it was added, this tool
+            # returned the automation dependencies it had already fetched; a
+            # transient failure on this second call must not take those away.
+            # But it must not report a clean anchor check either, so on failure
+            # the count is LEFT UNSET and the reason is stated. An absent count
+            # means "not checked"; 0 means "checked, and there are none".
+            try:
+                template = sdk._make_request(
+                    "GET",
+                    f"organizations/{org_id}/checklists/{template_id}",
+                    params={"with": "steps"},
+                )
+                # The block below is what separates "checked" from "not checked",
+                # which is the whole contract stated just above. It replaces two
+                # unguarded lines, and every shape it now rejects used to fall
+                # through to `raw_steps = None`, which `_normalize_steps` answers
+                # with [] -- so the tool reported a confident
+                # `deadline_anchor_count: 0` about a payload it had never read.
+                # Raising routes them into the `except` below, which already IS
+                # the unavailable path, so one place builds the marker and the
+                # two cannot drift.
+                if not isinstance(template, dict):
+                    raise ValueError(
+                        f"template read returned {type(template).__name__}, not an object"
+                    )
+                data = template.get("data", template)
+                # `data` being a LIST is deliberately NOT rejected: that is what
+                # an empty template answers with, and an empty collection
+                # provably holds no step anchored anywhere, so 0 is a real
+                # answer there. Flipping it would make every empty template read
+                # as unchecked, which is worse than the gap being closed here.
+                raw_steps = data.get("steps") if isinstance(data, dict) else data
+                # Anything `_normalize_steps` would answer [] for WITHOUT having
+                # read a list. Absent and null `steps` both land here, and so
+                # does a `steps` that is neither a list nor a Fractal envelope.
+                # After the normalizer runs, "[] because empty" and "[] because
+                # unparseable" are indistinguishable, so the check has to be
+                # here rather than on its result.
+                if not (
+                    isinstance(raw_steps, list)
+                    or (isinstance(raw_steps, dict) and "data" in raw_steps)
+                ):
+                    raise ValueError(
+                        "template read carried no readable 'steps' include "
+                        f"(got {type(raw_steps).__name__})"
+                    )
+
+                # `?with=steps` is a Fractal INCLUDE, and ChecklistTransformer
+                # builds it with $this->collection() while its siblings use
+                # $this->map(). AppServiceProvider registers a bare `new Manager`
+                # and never calls setSerializer, so Fractal's default
+                # DataArraySerializer is in force and the include arrives as
+                # {"data": [...]}, NOT as a flat list. Reading the key directly
+                # yields [] on every real response. The SDK already solves this
+                # in exactly one place, so use that rather than a second copy.
+                #
+                # `.analysis`, NOT the facade. `sdk.templates` is a
+                # `TemplateManager` whose MRO is [TemplateManager, object]: it
+                # does NOT inherit `TemplateManagerBase`. It is a facade that
+                # re-exports a hand-written list of PUBLIC methods onto three
+                # sub-managers, and `_normalize_steps` is private, so it is not
+                # on that list. `sdk.templates._normalize_steps(...)` raises
+                # AttributeError, which the `except` below then swallows into
+                # the unavailable path -- i.e. the feature never runs at all.
+                # `.analysis` is the sub-manager that OWNS this call: it is the
+                # only module in the SDK that uses `_normalize_steps`, in
+                # `get_step_dependencies` and `get_step_visibility_conditions`,
+                # on this very payload. There is no public equivalent --
+                # `TemplateManagerBase` exposes zero public methods, and
+                # `get_template_steps` is a different endpoint plus a second
+                # round trip that returns dataclasses rather than raw dicts.
+                steps = sdk.templates.analysis._normalize_steps(raw_steps)
+                anchors = _deadline_anchors(steps, step_id)
+            except Exception as exc:  # noqa: BLE001 - degrade, never fail the call
+                logger.warning(
+                    "Deadline-anchor pre-flight failed for step %s: %s", step_id, exc
+                )
+                if isinstance(dependencies, dict):
+                    dependencies["deadline_anchors_unavailable"] = (
+                        "The deadline-anchor check could not run, so this result does "
+                        "NOT tell you whether other steps are anchored to this one. "
+                        "Treat it as unchecked, not as clear."
+                    )
+                return ToolResult(content=payload, structured_content=None)
+
+            if isinstance(dependencies, dict):
+                dependencies["deadline_anchors"] = anchors
+            if isinstance(complexity, dict):
+                complexity["deadline_anchor_count"] = len(anchors)
+
+            return ToolResult(content=payload, structured_content=None)
 
     @mcp.tool(
         name="suggest_step_deadline",
@@ -1133,7 +1320,7 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
 
     @mcp.tool(
         name="get_template_steps",
-        description="""Get all steps for a template in order. USE THIS instead of get_template when the user asks about steps.
+        description=f"""Get all steps for a template in order. USE THIS instead of get_template when the user asks about steps.
 
 MANDATORY: 'template_id' (32-char hex string) is required.
 
@@ -1149,7 +1336,21 @@ WORKFLOW: If you don't have the template_id yet:
 2. Then call get_template_steps(template_id="<id>")
 
 CORRECT usage:
-- get_template_steps(template_id="abc123...")
+- get_template_steps(template_id="abc123...") - every step, long text shortened
+- get_template_steps(template_id="abc123...", step_id="def456...") - one step
+- get_template_steps(template_id="abc123...", step_id="def456...", full_text=True) - that
+  step's text in full, across as many calls as it takes
+
+READING LONG TEXT: to keep all steps in one response, long text is shortened and marked
+"{TRUNCATION_MARKER_PREFIX} ...]". A marked value is NOT the full text. Never write one back;
+you would overwrite whatever was cut. Re-read that one step with full_text=True first.
+'full_text' needs a 'step_id' (it is refused without one) because one step's text can be
+paged and a whole template of them cannot.
+
+Text longer than one response is delivered IN PARTS. Each part says which characters it
+covers and names the next offset, e.g. "characters 0 to 24461 of 60000 ... call again with
+text_offset=24461". Keep calling with the offset you were given and join the parts in
+order; the final part says "This is the LAST part." Do not write a part back on its own.
 
 DO NOT call get_template just to read its steps — use this tool instead.""",
         tags=["templates", "steps", "workflow", "read-only"],
@@ -1164,29 +1365,86 @@ DO NOT call get_template just to read its steps — use this tool instead.""",
     )
     @track_tool_execution("get_template_steps")
     @handle_tallyfy_errors("get template steps")
-    def get_template_steps(template_id: TemplateId) -> GenericList:
+    def get_template_steps(
+        template_id: TemplateId,
+        step_id: OptionalString = "",
+        full_text: bool = False,
+        text_offset: int = 0,
+    ) -> GenericList:
         """
-        Get all steps for a template in order.
+        Get all steps for a template in order, or one step in full.
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
+            step_id: Return only this step. Required when full_text is True.
+            full_text: Return the step's text in full, in parts if it does not
+                fit one response. Refused without step_id: the cap is what keeps
+                a whole template under the 25KB result ceiling, so lifting it
+                for a list would re-create the truncation this flag exists to
+                escape.
+            text_offset: Character offset to resume from, taken from the marker
+                on the previous part. Only meaningful with full_text.
 
         Returns:
             List of step objects with id, title, position, and other step properties
         """
+        wanted = step_id.strip()
+        if text_offset and not full_text:
+            raise ToolError(
+                "text_offset only means anything with full_text=True. Without it "
+                "the text is capped per string, not paged."
+            )
+        if text_offset < 0:
+            raise ToolError(f"text_offset must be 0 or more, got {text_offset}.")
+        if full_text and not wanted:
+            raise ToolError(
+                "full_text=True requires a step_id. Call "
+                "get_template_steps(template_id=...) first to find the step you want, "
+                "then re-read that one step with full_text=True."
+            )
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             steps = sdk.templates.get_template_steps(org_id, template_id)
+            if wanted:
+                steps = [st for st in steps if str(getattr(st, "id", "")) == wanted]
+                if not steps:
+                    raise ToolError(
+                        f"Step '{wanted}' was not found in template '{template_id}'. "
+                        "Call get_template_steps(template_id=...) to list the step ids."
+                    )
+            if full_text:
+                # Lifting the cap alone is NOT enough and returning the result
+                # here would re-create the very defect this flag exists to fix: a
+                # 60,000-char summary encodes to ~60KB, the client cuts anything
+                # past ~30KB with no signal, and compact_result would label the
+                # single item "Showing 1 of 1 items", which reads as complete.
+                # So the value is delivered across calls, and every part says
+                # which characters it covers.
+                whole = serialize_dataclass(steps[0], max_string_length=None)
+                try:
+                    return ToolResult(
+                        # The window is budgeted for the LIST it is returned in.
+                        # Bounding the dict alone left the encoded list 2 bytes
+                        # over, because "[" and "]" are not free; the margin also
+                        # covers the framing this result is wrapped in.
+                        content=[window_longest_text(
+                            whole, offset=text_offset,
+                            max_bytes=MAX_RESULT_BYTES - _RESULT_CONTAINER_ALLOWANCE,
+                        )],
+                        structured_content=None,
+                    )
+                except ValueError as exc:
+                    raise ToolError(str(exc)) from exc
+
             return ToolResult(
-                content=compact_result([serialize_dataclass(s) for s in steps]),
+                content=compact_result([serialize_dataclass(st) for st in steps]),
                 structured_content=None
             )
 
     @mcp.tool(
         name="assess_template_health",
-        description="""Retrieve complete template data for a comprehensive health assessment.
-
-Returns the full template including metadata, steps, automation rules, and kickoff fields.
+        description=f"""Retrieve a template's data for a comprehensive health assessment.
 
 Use this data to evaluate template health across these dimensions:
 - Metadata quality: Does it have a clear title, summary, and guidance?
@@ -1198,7 +1456,14 @@ Use this data to evaluate template health across these dimensions:
 
 Provide an overall health rating (excellent/good/fair/poor/critical) with specific recommendations.
 
-RETURNS: full template payload — top-level keys include `id`, `title`, `summary`, `steps[]`, `automated_actions[]`, `prerun[]` (kickoff fields), and metadata. Synthesize this into a `health_rating` (one of: excellent, good, fair, poor, critical) plus a `recommendations` list (string array of specific, actionable improvements). The tool returns RAW data — the LLM is responsible for the rating + recommendations synthesis.
+RETURNS: the template payload, trimmed when large — top-level keys include `id`, `title`, `summary`, `steps[]`, `automated_actions[]`, `prerun[]` (kickoff fields), and metadata. Synthesize this into a `health_rating` (one of: excellent, good, fair, poor, critical) plus a `recommendations` list (string array of specific, actionable improvements). The tool returns RAW data — the LLM is responsible for the rating + recommendations synthesis.
+
+SIZE: if the response carries "_truncated", later steps were dropped and are NOT in it; if it
+carries "_withheld", a named field was removed whole. The trim reaches the step list only, so
+no marker is not a promise of completeness. Rate only what arrived, and say the assessment is
+partial whenever a marker is present. If any text CONTAINS "{TRUNCATION_MARKER_PREFIX}", that
+string is only part of the real value: never write it back, re-read that one step first with
+get_template_steps(step_id=..., full_text=True).
 
 REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.""",
         tags=["templates", "workflow", "analysis", "health", "read-only", "optimization"],
@@ -1215,13 +1480,14 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
     @handle_tallyfy_errors("assess template health")
     def assess_template_health(template_id: TemplateId) -> GenericDict:
         """
-        Retrieve complete template data for health assessment.
+        Retrieve a template's data for health assessment.
 
         Args:
             template_id: Template ID to assess (REQUIRED - 32-character hex string)
 
         Returns:
-            Dictionary with full template data for comprehensive analysis
+            Dictionary with the template data for comprehensive analysis, trimmed
+            through compact_dict_list_field when it exceeds the result ceiling
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -1229,8 +1495,12 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
             if not template:
                 raise ToolError("Template not found")
 
+            # Same size control as get_template: one shared trimmer, not a third
+            # binary search. See compact_dict_list_field's docstring.
             return ToolResult(
-                content=serialize_dataclass(template),
+                content=compact_dict_list_field(
+                    serialize_dataclass(template), "steps", item_label="steps"
+                ),
                 structured_content=None
             )
 
@@ -1518,10 +1788,21 @@ server-side. The request is REJECTED with an error if either of these holds:
   - any other step's deadline is anchored to this step → "Cannot delete this step because
     other steps have deadlines that depend on it."
 
-So you MUST clear the dependents FIRST to preserve or retarget them: use
-`get_step_dependencies` / `analyze_template_automations` to find what points at this step,
-then `update_automation_rule` (or `delete_automation_rule`) and re-anchor any dependent
-deadlines. Only then will the delete succeed.
+So you MUST clear the dependents FIRST to preserve or retarget them. Run
+`get_step_dependencies(template_id, step_id)` and read exactly these keys:
+  - dependencies.incoming and dependencies.outgoing -> automation rules pointing here.
+    Retarget with `update_automation_rule`, or remove with `delete_automation_rule`.
+  - dependencies.deadline_anchors -> other steps whose deadline is anchored to this one,
+    each carrying step_id, step_title, position and its deadline. Re-anchor each with
+    `update_step`, sending all four deadline keys.
+  - complexity_analysis.deadline_anchor_count -> 0 when nothing is anchored here.
+Only when both are clear will the delete succeed.
+
+A CLEAN PRE-FLIGHT IS STRONG EVIDENCE, NOT A GUARANTEE. Two blockers are invisible to it:
+SOFT-DELETED then-actions, which appear in no template read; and anchors in ANOTHER
+template, because api-v2 checks the whole organization while this scan sees one template.
+If `deadline_anchors_unavailable` is present the check did not run, which is not a clean
+result. Treat any refusal as real; act on its message rather than retrying.
 
 Never call this without both parameters.""",
         tags=["templates", "steps", "write", "delete"],

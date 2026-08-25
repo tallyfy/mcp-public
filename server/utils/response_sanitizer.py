@@ -24,9 +24,12 @@ This module provides two pure helpers and a thin wrapper:
   call when shaping the user-visible content payload.
 
 **Tool chaining is preserved**: the IDs the LLM needs for follow-up calls
-(``id``, ``run_id``, ``task_id``, anything ending in ``_id`` / ``_ids``)
-are kept untouched. Only loose hex values under non-chaining keys are
-stripped.
+(``id``, ``uuid``, ``step``, ``run_id``, ``task_id``, anything ending in
+``_id`` / ``_ids``) are kept untouched. Only loose hex values under
+non-chaining keys are stripped. ``step`` is on that list because a
+deadline anchors to another step by id, and dropping it silently
+re-anchors the deadline to process launch — see ``_CHAINING_KEY_ALLOWLIST``
+for the authoritative set.
 
 Pure / referentially transparent — no I/O, no side effects, no shared
 state. Always returns a fresh structure (never mutates the input).
@@ -91,6 +94,24 @@ _CHAINING_KEY_SUFFIXES: Tuple[str, ...] = ("_id", "_ids")
 _CHAINING_KEY_ALLOWLIST: frozenset[str] = frozenset({
     "id",
     "uuid",
+    # ``step`` carries a step id inside a deadline object, e.g.
+    # ``{"step": "<32-hex>", "unit": "day", "value": 6, "option": "from"}``
+    # for a deadline anchored to ANOTHER STEP. It is a chaining key by the
+    # definition above: the model needs it to write the deadline back.
+    #
+    # Without it Rule 3 dropped the value for being a loose hex32, and the
+    # damage was silent and destructive rather than merely lossy. Every read
+    # path returned the deadline with no anchor; ``update_step`` then refused
+    # the write, telling the model to "read the step first and restate every
+    # key" -- a key the read could not supply. The one guess that api-v2
+    # accepts is ``"start_run"``, which SILENTLY RE-ANCHORS the deadline to
+    # process launch and reports success. On a template whose deadlines chain
+    # step to step, editing one number collapsed the whole schedule to
+    # "N days after launch", invisibly. See tallyfy/mcp#1005.
+    #
+    # ``"start_run"`` is not hex32, so it always survived -- which is exactly
+    # why the corruption was one-directional and hard to see.
+    "step",
 })
 
 # Keys whose VALUES we always drop entirely — they leak alias-resolution
@@ -254,8 +275,10 @@ def sanitize_for_user_text(payload: Any) -> Any:
     over the final user-visible shape) to produce a payload safe to drop
     into ``ToolResult.content``.
 
-    Tool chaining stays intact: every chaining-key (``id``, ``*_id``,
-    ``*_ids``) survives. Only internal-only metadata is removed.
+    Tool chaining stays intact: every chaining-key survives. See
+    ``_CHAINING_KEY_ALLOWLIST`` and ``_CHAINING_KEY_SUFFIXES`` for the
+    authoritative set rather than relying on a list repeated here. Only
+    internal-only metadata is removed.
     """
     return strip_internal_metadata(payload)
 

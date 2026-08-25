@@ -4,8 +4,9 @@ Gives Claude an escape hatch: if no specific tool matches the user's
 request, Claude can issue a direct HTTP call against any Tallyfy REST
 API endpoint, subject to:
 
-- Feature flag: ``MCP_ENABLE_API_FALLBACK=true`` (OFF by default in prod
-  until the per-org whitelist warms up).
+- Feature flag: ``MCP_ENABLE_API_FALLBACK=true``, OFF by default. It is
+  per-DEPLOYMENT and all-or-nothing; there is no per-org gate anywhere in
+  this server (see the note at ``_ENABLED``).
 - Path validation against the live OpenAPI spec (``tallyfy_spec_cache``).
 - Block-list of admin / oauth / metrics surfaces (``tallyfy_endpoint_allowlist``).
 - Audit logging for every write call.
@@ -19,7 +20,43 @@ not satisfy the rule. Splitting also lets the annotations tell the truth,
 so the read tool can run without a confirmation prompt while the write
 tool always asks. See https://claude.com/docs/connectors/building/review-criteria
 
-Issues: #171 (original), #651 (the split)  |  Plan: §VIII / §V.4
+**Why registration is NOT gated on the feature flag.** Both tools are registered
+unconditionally and the flag is checked inside ``_execute``. Gating registration
+would look tidier and would break the server's own advertised identity:
+``routes/capabilities.py::_count_tools_in_module`` registers each tools module
+against a stub and counts what comes back, so on a deployment with the flag off
+it would report ``Universal API Fallback: 0`` and take the advertised total to
+108 instead of 110 - on exactly the deployments the directory reviewers and the
+published tool manifest describe. ``tests/unit/server/routes/test_server_card.py``
+would then fail against a server that is behaving correctly. Leave it alone.
+
+**Why the refusal names no environment variable.** The message raised to the
+caller reaches whoever is using the AI client, and an env var name is useless to
+them: they cannot set it, and it reads as an instruction they can follow, so a
+model retries or tells the user to change a setting they do not have. The
+operator half is not lost - it goes to ``logger.warning`` in ``_execute``, where
+somebody who can act on it will see it. See #981.
+
+**Why the refusal does NOT say "only Tallyfy can enable it".** That reads as
+true because the flag is off in Tallyfy's hosted service, and it is false on the
+other supported deployment. ``server/**/*.py`` is published to the public mirror
+``tallyfy/mcp-public``, whose README carries a "Run it yourself" section, so
+running this server yourself is a real path rather than a hypothetical. On one
+of those the person running the container is the ONLY party who can flip the
+flag, Tallyfy support cannot reach it, and a message asserting otherwise tells
+the one person who can act that they cannot - which is the same dead end #981
+exists to remove, pointing the other way. So the message names the party by ROLE
+(whoever runs this server) and gives both cases, which is true either way.
+
+A deployment-aware branch was considered and rejected: it would have to read a
+configuration value to decide, and this server cannot tell "Tallyfy's hosted
+instance" from "a self-hoster who copied the hosted defaults" - so it would be
+confidently wrong for exactly the reader it exists to help.
+
+Issues: #171 (original), #651 (the split), #981 (the leaked setting).
+PR #985 carries the follow-up above: the wording that replaced the setting name
+asserted an exclusivity that is false on a self-hosted deployment.
+Plan: §VIII / §V.4
 """
 from __future__ import annotations
 
@@ -50,7 +87,15 @@ logger = logging.getLogger(__name__)
 _audit_logger = logging.getLogger("tallyfy_api_call_audit")
 
 
-# Environment flag. Start OFF in prod; flip per-org via MCP_FEATURE_WHITELIST_ORGS.
+# Environment flag, read once at import. It is per-DEPLOYMENT and
+# all-or-nothing: this line is the only gate, and the check in `_execute` is the
+# only place it is consulted.
+#
+# This comment read "flip per-org via MCP_FEATURE_WHITELIST_ORGS" until
+# 2026-08-24, and that variable is read NOWHERE in this server - the string
+# appeared exactly once under `server/`, in this comment. So it described a
+# per-org warm-up that does not exist, to the one audience (an operator) who
+# would act on it.
 _ENABLED = os.getenv("MCP_ENABLE_API_FALLBACK", "false").lower() == "true"
 
 
@@ -158,9 +203,23 @@ async def _execute(
     so the two tools cannot drift apart.
     """
     if not _ENABLED:
+        # The env var name belongs to the OPERATOR, who can act on it, and to
+        # nobody on the other end of the connector. Keep it here, out of the
+        # message that reaches a customer. See the module docstring.
+        logger.warning(
+            "%s was called but is disabled on this deployment "
+            "(MCP_ENABLE_API_FALLBACK is not 'true'); refused before any request "
+            "was made", tool_name
+        )
         raise ToolError(
-            f"{tool_name} is disabled. Set MCP_ENABLE_API_FALLBACK=true "
-            "to enable it for this deployment."
+            f"{tool_name} is not enabled on this Tallyfy deployment. Nothing was "
+            "sent to Tallyfy and nothing changed. Direct API access is a "
+            "server-side setting and it is switched off here, so a retry cannot "
+            "help. Do not call it again. Use a first-class tool for what you need "
+            "instead. If none covers it, tell the user that direct API access is "
+            "off on this deployment and that only whoever runs the deployment can "
+            "enable it: Tallyfy support on Tallyfy's hosted service, or the "
+            "operator of the server if it is self-hosted."
         )
 
     api_key, org_id = get_authenticated_credentials()
@@ -258,6 +317,13 @@ async def _execute(
 
 
 _SHARED_RULES = (
+    "AVAILABILITY: this escape hatch is a server-side setting and is OFF in "
+    "Tallyfy's hosted service, so it will usually refuse. Treat that refusal as "
+    "FINAL: nothing was sent, nothing changed, and retrying cannot help. Only "
+    "whoever runs this server can enable it: Tallyfy support on the hosted "
+    "service, or the operator if it is self-hosted. Reach for a first-class tool "
+    "first, and if none fits, say direct API access is off here and who can turn "
+    "it on.\n\n"
     "Paths under /support, /auth, /oauth, /metrics, /health, /ready and "
     "/debug are BLOCKED and return an error. This is a PATH-PREFIX block "
     "list and nothing more: it does NOT restrict administrative actions, "
