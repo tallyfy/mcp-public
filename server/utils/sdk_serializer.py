@@ -512,13 +512,33 @@ def serialize_paginated_response(response_obj: Any) -> Dict[str, Any]:
 # Task fields that are always present but carry no actionable information for Claude.
 # These are internal platform flags, duplicates, or fields that are only meaningful
 # when non-default (and are already implied by other fields when they are non-default).
+#
+# `is_soft_start_date` was in this set and is deliberately NOT any more. It is not an
+# internal flag: it is the user-facing "Start anytime" / "Start on-time" toggle
+# (client-v2 features/steps/.../step-deadline.component.html).
+#
+# What made stripping it misleading, read from api-v2 TaskTransformer.php: a task emits
+# `started_at` (line 61), a concrete resolved timestamp, ALONGSIDE `is_soft_start_date`
+# (line 90). `started_at` is NOT in this set, so it survived while its gate did not, and
+# `is_soft_start_date` is exactly what says whether that timestamp BINDS ("Start
+# on-time", not workable before it) or is advisory ("Start anytime").
+#
+# It compounds a default. A step is born with start_date {"unit":"hours","value":2} AND
+# is_soft_start_date true, both set by one api-v2 migration
+# (2022_02_24_125353_change_default_value_of_start_date_in_steps_table.php), so the two
+# hours is inert by construction and every task inherits a started_at about two hours
+# out. Shown that timestamp and not the flag, a reader concludes the task starts in two
+# hours when in fact it starts whenever.
+#
+# NOTE the field is `started_at` on a task, not `start_date`. Template STEPS carry
+# `start_date` and do not pass through this set at all: get_template_steps serialises
+# them with `serialize_dataclass`, which never consults _TASK_NOISE_FIELDS.
 _TASK_NOISE_FIELDS = frozenset({
     "allow_guest_owners",           # always false on one-off tasks
     "is_completable",               # always true for visible tasks
     "status_label",                 # duplicate of status
     "has_deadline_dependent_child_tasks",  # internal dependency flag
     "can_complete_only_assignees",  # internal flag
-    "is_soft_start_date",           # internal scheduling flag
     "everyone_must_complete",       # only relevant for template steps
 })
 

@@ -336,10 +336,14 @@ def _require_complete_step_deadline(step_data: dict) -> None:
     missing = [key for key in _STEP_DEADLINE_KEYS if key not in deadline]
     if missing:
         raise ToolError(
-            f"deadline is missing {', '.join(missing)}. api-v2 marks all four of "
-            f"{', '.join(_STEP_DEADLINE_KEYS)} 'required_with:deadline', so a "
-            f"partial deadline is rejected. Read the step first and restate every "
-            f"key, or omit 'deadline' entirely to leave the current one alone."
+            f"To change a deadline, send all four keys together: "
+            f"{{'value': 3, 'unit': 'days', 'option': 'from', 'step': 'start_run'}}. "
+            f"Yours is missing {', '.join(missing)}. Read the current deadline with "
+            f"get_template_steps, then restate every key including the ones you are "
+            f"not changing. If you did not mean to touch the deadline at all, omit "
+            f"'deadline' and the existing one is left alone. (api-v2 marks all four "
+            f"of {', '.join(_STEP_DEADLINE_KEYS)} 'required_with:deadline', so a "
+            f"partial deadline is rejected outright.)"
         )
 
 
@@ -824,9 +828,30 @@ assignees: {"users": [10026], "guests": ["alice@example.com"]}
 assignees: {"guests": ["alice@example.com"]}
 assignees: {"users": [10026]}
 
+THIS IS THE RECIPIENT LIST FOR AN EMAIL STEP. A step of type 'email' or
+'expiring_email' has NO separate "recipient", "to" or "send_to" field, and no
+tool sets one. Its assignees ARE the "To" line. Tallyfy says so in the interface
+by renaming that step's Assign tab to "To" for exactly those two step types. The
+subject is the step's 'title' and the body is its 'summary', both set through
+update_step. Asked who an email goes to, answer with this list: "email this to
+Dana" means adding Dana here.
+
+TWO EMAIL TYPES, named differently in the UI:
+  'email' = "Email Draft". A HUMAN clicks SEND; it does not send itself.
+  'expiring_email' = "Email Auto-Send". Goes out on the deadline, self-completes.
+Going out on its own? 'expiring_email'. Reviewed first? 'email'.
+
 This APPENDS: the tool reads the step first and re-sends its existing members,
 guests and groups alongside the additions, which the API would otherwise clear
-on an update that omits them. Existing assignees are never removed.
+on an update that omits them. Existing assignees are never removed. To REPLACE
+or clear a bucket, use update_step and pass the full list, or an empty one.
+
+SEPARATELY, every step carries 'allow_guest_owners', which Tallyfy defaults to
+TRUE. That flag is what shows the "Guest" slot on a step, so a brand new step
+offers one whether or not a guest was ever added. Assigning members here does
+NOT turn it off, and no MCP tool clears it; only the Assign tab in the browser
+does, as a side effect of choosing certain assignee modes. To stop a step
+offering a guest slot, send 'allow_guest_owners': False through update_step.
 
 Never call this without all three parameters.""",
         tags=["templates", "workflow", "write", "management", "assignees"],
@@ -1020,22 +1045,20 @@ REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'description
 
     @mcp.tool(
         name="update_step",
-        description="""Edit an EXISTING step in place, keeping its id, automations, form fields and history. Use this to change a step's deadline, start date, type or instructions after it was created. Never delete_step then add_step_to_template to make an edit: that mints a NEW id and orphans every automation rule pointing at the old one.
+        description="""Edit an EXISTING step in place, keeping its id, automations, form fields and history. To RENAME a step, pass 'title'. Also use this to change its deadline, start date, type or instructions. Never delete_step then add_step_to_template to edit: that mints a NEW id and orphans every automation pointing at the old one.
 
-REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'step_data' — a dict holding ONLY the fields you want to change.
-
-Anything you do not mention is left as it is. The tool reads the step first and re-sends its title and all three assignee buckets, because api-v2 reads an omitted bucket as "remove everyone". To deliberately CLEAR one, pass it as an empty list.
+REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'step_data', a dict of ONLY the fields to change. A field you omit is left alone; pass an empty list to CLEAR one. An unknown key is refused with the full list of valid ones.
 
 step_data keys:
-  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'from', 'step': 'start_run'} — all four required together. 'option' is the DIRECTION and takes exactly TWO values: 'from' (the UI shows this as "after") or 'prior_to' (shown as "before"). The words 'after' and 'before' are display labels, never values. 'step' is the ANCHOR: 'start_run' means process launch, otherwise another step's id.
-  - 'start_date': dict {'value': int, 'unit': 'days'}
-  - 'step_type': 'task', 'approval', 'expiring', 'email' or 'expiring_email'
-  - 'title', 'summary' ('description' is an alias for 'summary')
-  - 'assignees': member IDs (ints), 'guests': emails, 'groups': group IDs
-  - booleans: 'everyone_must_complete', 'can_complete_only_assignees', 'assign_run_starter', 'allow_guest_owners', 'skip_start_process', 'is_soft_start_date', 'top_secret', 'prevent_guest_comment', 'send_chromeless', 'role_changes_every_time'
-  - 'webhook', 'max_assignable', 'bp_to_launch', 'ai_assigned', 'ai_allowed_app_keys', 'ai_on_uncertainty'
+  - 'title': the step name. This is the rename.
+  - 'summary': HTML instructions for the assignee ('description' is an alias).
+  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'from', 'step': 'start_run'}. All four travel TOGETHER; a partial deadline is refused. 'option' is the DIRECTION and takes exactly TWO values: 'from' (shown in the UI as "after") or 'prior_to' (shown as "before"). Those two words are display labels, never values. 'step' is the ANCHOR: 'start_run' means process launch, else another step's id.
+  - 'start_date': dict {'value': int, 'unit': 'days'}. INERT ON ITS OWN. Every step is born "start anytime" (is_soft_start_date defaults TRUE), which ignores start_date. To make it bite, send 'is_soft_start_date': False in the SAME call. 'value' must be 1 or more, so it cannot be cleared with 0.
+  - 'step_type': 'task', 'approval', 'expiring', 'email' (draft) or 'expiring_email' (auto-sends)
+  - 'assignees': member IDs (ints), 'guests': emails, 'groups': group IDs. On an 'email' or 'expiring_email' step these ARE the email's "To" line, not merely who is responsible. See add_assignees_to_step.
+  - also: 'allow_guest_owners', 'is_soft_start_date', 'everyone_must_complete', 'can_complete_only_assignees', 'assign_run_starter', 'webhook', 'max_assignable'
 
-To MOVE a step use reorder_step; for questions use add_form_field_to_step or update_form_field.
+To MOVE a step use reorder_step; for questions use add_form_field_to_step.
 
 Never call this without all three parameters.""",
         tags=["templates", "workflow", "write", "management", "editing", "deadlines"],
@@ -1101,25 +1124,24 @@ Never call this without all three parameters.""",
 
     @mcp.tool(
         name="add_step_to_template",
-        description="""Add a new step to a template. Call this repeatedly after create_template to build out the workflow structure — one call per step, in order. When building a template from a user description or document, break the workflow into logical steps and call this for each one.
+        description="""Add a new step to a template. Call this repeatedly after create_template, one call per step, in order. When building from a user description or document, break the workflow into logical steps and call this for each.
 
-REQUIRED: 'template_id' (32-char hex) and 'step_data' (dict with 'title' field — other fields optional).
+REQUIRED: 'template_id' (32-char hex) and 'step_data' (dict with 'title'). An unknown key is refused with the full list of valid ones.
 
 step_data keys:
   - 'title': step name (REQUIRED)
-  - 'summary': HTML instructions for the step assignee ('description' is accepted as an alias)
-  - 'position': 1-based order in the workflow. Steps always append on creation, so this tool issues a follow-up reorder to place the step. Omit it when adding steps in order.
-  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'from', 'step': 'start_run'} (all four keys required together). 'option' is the direction and takes exactly TWO values: 'from' (the UI shows this as "after") or 'prior_to' (shown as "before"). The words 'after' and 'before' are display labels, never values. 'step' is the anchor, not the direction.
-  - 'start_date': dict {'value': int, 'unit': 'days'}
-  - 'assignees': member IDs (ints), 'guests': email addresses, 'groups': group IDs
-  - 'step_type': one of these 5 values (default 'task'):
-      'task'           — standard task, completed by assignee
-      'approval'       — approve/reject decision (MUST use this for any approval or review step — enables 'approved'/'rejected' automation conditions)
-      'expiring'       — auto-completes after deadline passes
-      'email'          — sends an email notification
-      'expiring_email' — sends email, auto-completes after deadline
-
-IMPORTANT: If a step involves approval, review, or sign-off, set step_type='approval'. Without this, automation rules that trigger on 'approved' or 'rejected' will not work. If a step is a notification or email alert, use 'email'.
+  - 'summary': HTML instructions for the assignee ('description' is an alias)
+  - 'position': 1-based order. Steps always append, so this tool issues a follow-up reorder. Omit when adding in order.
+  - 'deadline': dict {'value': int, 'unit': 'days', 'option': 'from', 'step': 'start_run'} (all four required together). 'option' is the DIRECTION and takes exactly TWO values: 'from' (shown in the UI as "after") or 'prior_to' (shown as "before"). Those two words are display labels, never values. 'step' is the ANCHOR, not the direction.
+  - 'start_date': dict {'value': int, 'unit': 'days'}. INERT unless you also send 'is_soft_start_date': False. Every new step is born "start anytime", which ignores start_date.
+  - 'assignees': member IDs (ints), 'guests': emails, 'groups': group IDs. On an 'email' or 'expiring_email' step these ARE the email's "To" line; there is no separate recipient field.
+  - 'allow_guest_owners': DEFAULTS TO TRUE, so every new step offers a Guest slot whether or not you pass guests. Send False if it should not.
+  - 'step_type': one of 5 values (default 'task'):
+      'task'           completed by the assignee
+      'approval'       approve/reject decision. MUST be used for any approval, review or sign-off step: it is what enables the 'approved' and 'rejected' automation conditions, which will not fire without it.
+      'expiring'       auto-completes at the deadline
+      'email'          "Email Draft": a human clicks SEND
+      'expiring_email' "Email Auto-Send": sends at deadline, self-completes
 
 Never call this without both parameters.""",
         tags=["templates", "workflow", "write", "management", "creation"],
