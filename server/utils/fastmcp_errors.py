@@ -191,6 +191,54 @@ def read_error_class(error: BaseException) -> Optional[str]:
     return value if value in TOOL_ERROR_CLASSES else None
 
 
+# ===========================================================================
+# Which upstream answers are EXPECTED, and therefore log at WARNING
+# ===========================================================================
+#
+# A member of this set is a definitive answer from api-v2 that is not a fault
+# of this server. It is logged at WARNING and creates no Sentry event. Anything
+# else, INCLUDING a missing status, is logged at ERROR.
+#
+#   400  the client's own input was missing, e.g. MissingOrgIdError when no
+#        X-Organization-ID header, JWT claim or env var is present (Sentry
+#        MCP-4T, issue #511). The user-facing message names the remedy.
+#   401  the credential is expired or no longer accepted.
+#   402  a plan limit refused the write. Today that is the trial cap
+#        ("Trial limit reached: 100 unique task assignments", code
+#        TRIAL_LIMIT_REACHED_100_U). Same class as 409 below: a gate working
+#        as designed, on customer-controlled state we cannot fix, whose own
+#        message names the remedy. Without it every trial org that reaches its
+#        cap pages us once per attempt (Sentry MCP-SERVER-5T, issue #1080).
+#   403  insufficient scope, or a business rule refusing the call.
+#   404  the resource was deleted, or the model referenced a stale id.
+#   409  a business rule refused the write, currently the allocated-seats gate
+#        (SEAT_POOL_EXHAUSTED, api-v2 #9206), which fires whenever an org
+#        invites, promotes or enables past its committed seat pool.
+#   422  request validation failed, e.g. a missing field on an approval task.
+#
+# ⚠️ A MISSING status is deliberately NOT a member, and must not become one.
+# `classify_upstream_status` records why: the SDK raises TallyfyError with
+# status_code=None when retries are exhausted on a transport failure, so "no
+# status at all" is the shape a real upstream outage takes. Demoting it would
+# remove the only signal that Tallyfy is unreachable.
+#
+# ⚠️ That leaves a second producer of a missing status, and it is a DIFFERENT
+# failure wearing the same shape: the SDK also raises a bare TallyfyError for
+# an argument it rejected LOCALLY, before any request went out
+# (`except ValueError as e: raise TallyfyError(f"Invalid step data: {e}")`).
+# Those are NOT fixed here, because widening this set cannot tell the two
+# apart. They are fixed where they belong, by refusing the bad shape at the
+# tool boundary so the SDK is never reached with it. See issue #1080 and
+# `tools/template_management.py::_validate_step_participants`.
+#
+# The membership is pinned as an EXACT set by
+# tests/unit/server/utils/test_fastmcp_errors_status_split.py. Exact rather
+# than a superset, because here an ADDITION is the dangerous direction: each
+# new member silences a class of error permanently, so it must be a reviewed
+# decision rather than a free one.
+EXPECTED_UPSTREAM_STATUSES = (400, 401, 402, 403, 404, 409, 422)
+
+
 _MAX_FIELD_ERRORS = 12
 _MAX_FIELD_ERROR_CHARS = 900
 
@@ -588,26 +636,11 @@ def handle_tallyfy_errors(operation_name: str):
             try:
                 return func(*args, **kwargs)
             except TallyfyError as e:
-                # Demote expected operational errors to WARNING — these are NOT bugs:
-                #   400: client-side input missing (e.g. MissingOrgIdError when no
-                #        X-Organization-ID header / JWT claim / env var present —
-                #        Sentry MCP-4T / issue #511). Not a server bug — the client
-                #        request was malformed and the user-facing message tells them
-                #        how to fix it.
-                #   401/403: expired/invalid JWT tokens
-                #   404: resource was deleted (LLM referenced stale ID)
-                #   409: a business rule refused the write — currently the
-                #        allocated-seats gate (SEAT_POOL_EXHAUSTED, api-v2 #9206),
-                #        which fires whenever an org invites / promotes / enables
-                #        past its committed seat pool. That is the gate working as
-                #        designed, on customer-controlled state we cannot fix, so
-                #        every seat-capped org would otherwise page us on each
-                #        attempt. The user-facing message names the remedy.
-                #   422: request validation failed (e.g. missing field for approval task)
-                # These should not create Sentry issues. Only true server errors (5xx)
-                # and unexpected client errors are logged at ERROR.
+                # See EXPECTED_UPSTREAM_STATUSES for what each member means and
+                # why it is there. A status OUTSIDE that set, and a MISSING
+                # status, are both logged at ERROR and reach Sentry.
                 status = getattr(e, "status_code", None)
-                if status in (400, 401, 403, 404, 409, 422):
+                if status in EXPECTED_UPSTREAM_STATUSES:
                     logger.warning(f"{operation_name} returned {status}: {e}")
                 else:
                     # Set Sentry tags so LoggingIntegration event has context

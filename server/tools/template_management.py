@@ -257,6 +257,148 @@ def _normalize_step_deadline(step_data: dict) -> None:
         step_data["deadline"] = deadline
 
 
+# The step fields the SDK checks LOCALLY, before a single byte goes to Tallyfy.
+# Each entry is (key, "what a valid value is"), and the wording is what the
+# caller reads back, so it names the shape rather than the failure.
+#
+# WHY THESE ARE CHECKED HERE TOO. The SDK's own check is correct, and its
+# REPORTING is not. Every one of these arms is
+#   except ValueError as e: raise TallyfyError(f"Invalid step data: {e}")
+# (tallyfy 1.3.12, template_management/basic_operations.py:501), which produces
+# a TallyfyError with NO status_code. `utils/fastmcp_errors.py` reads a missing
+# status as an exhausted transport, because that is the other thing a missing
+# status means, so a plain argument mistake is logged at ERROR and pages us as
+# an upstream outage. Sentry MCP-SERVER-5S is `assignees` arriving as a non
+# list, twice, from one OpenAI Codex session. Issue #1080.
+#
+# Refusing the shape here rather than widening the demote set is deliberate:
+# widening it cannot tell an argument mistake from a real outage, and it would
+# hide the caller's mistake instead of reporting it. The caller also gets the
+# answer without a round trip, and with the offending value named.
+#
+# This list is COMPLETE for the local arms this tool can reach, not a sample.
+# `position` is absent because it never reaches the SDK: add_step_to_template
+# pops it and issues the follow-up reorder api-v2 requires, and it is not in
+# _STEP_UPDATE_KEYS at all.
+_STEP_LIST_FIELDS = (
+    ("assignees", "a list of member ids (integers)"),
+    ("guests", "a list of guest email addresses"),
+    ("groups", "a list of group ids"),
+    ("tags", "a list of tag ids"),
+)
+
+# The wording for `deadline` deliberately repeats `_require_complete_step_
+# deadline`'s phrase "a dict carrying ...". The two guards answer DIFFERENT
+# questions about the same key and both are needed: this one asks "is it a dict
+# at all", on BOTH the create and update paths, because that is the shape the
+# SDK rejects locally; that one asks "are all four keys present", on the update
+# path ONLY, because forwarding an incomplete deadline on CREATE is a written
+# decision with its own test (a missing key already 422s loudly, and filling it
+# in here would point a deadline somewhere the caller never asked for).
+_STEP_OBJECT_FIELDS = (
+    ("deadline", "a dict carrying value, unit, option and step"),
+    ("start_date", "a dict carrying value and unit"),
+)
+
+
+def _validate_step_participants(step_data: dict) -> None:
+    """Refuse a step field whose SHAPE the SDK rejects locally, naming the value.
+
+    Mirrors the SDK's own predicates rather than inventing stricter ones, so the
+    two cannot disagree about what is acceptable (rule 26). That includes the
+    truthiness gate: the SDK reads `if 'assignees' in step_data and
+    step_data['assignees']`, so an empty list or None SKIPS its check entirely
+    and must skip this one too, or a legitimate "no assignees" call starts
+    failing here and nowhere else.
+
+    Does NOT validate email deliverability or id existence. Those are Tallyfy's
+    to decide, and the deployed SDK gets the email question wrong in a way this
+    function must not copy (tallyfy/sdk#73: it performs a live DNS MX lookup and
+    refuses every valid address on a domain that publishes no MX record, which
+    is Sentry MCP-SERVER-5X). Duplicating that verdict here would reject a valid
+    address one layer earlier.
+    """
+    for key, shape in _STEP_LIST_FIELDS:
+        if key not in step_data or not step_data[key]:
+            continue
+        value = step_data[key]
+        if not isinstance(value, list):
+            raise ToolError(
+                f"step_data.{key} must be {shape}, got "
+                f"{type(value).__name__} {value!r}. Nothing was sent."
+            )
+
+    assignees = step_data.get("assignees")
+    if assignees:
+        bad = [item for item in assignees if not isinstance(item, int)]
+        if bad:
+            raise ToolError(
+                "step_data.assignees must be a list of member ids (integers). "
+                f"These are not: {bad!r}. Use get_organization_users to look up "
+                "a member id, or pass an email in 'guests' instead. Nothing was "
+                "sent."
+            )
+
+    for key, shape in _STEP_OBJECT_FIELDS:
+        if key not in step_data or not step_data[key]:
+            continue
+        value = step_data[key]
+        if not isinstance(value, dict):
+            raise ToolError(
+                f"step_data.{key} must be {shape}, got "
+                f"{type(value).__name__} {value!r}. Nothing was sent."
+            )
+
+    if "max_assignable" in step_data:
+        value = step_data["max_assignable"]
+        # The SDK's own predicate, verbatim: None is allowed, anything else must
+        # be an int greater than zero.
+        if value is not None and not (isinstance(value, int) and value > 0):
+            raise ToolError(
+                "step_data.max_assignable must be a positive integer or null, "
+                f"got {type(value).__name__} {value!r}. Nothing was sent."
+            )
+
+
+def _resolve_template_name(sdk, org_id: str, template_name: str) -> str:
+    """Resolve a template name to its id, answering a miss as a TOOL error.
+
+    A name that matches nothing, or matches several templates, is a normal
+    outcome of asking for a template by name. It is not a failure of this
+    server, and it must not be reported as one.
+
+    The SDK raises TallyfyError with NO status_code for both outcomes
+    (`search_management/operations.py`, "No template found matching name: ..."
+    and "Multiple templates found matching ..."). `utils/fastmcp_errors.py`
+    reads a missing status as an exhausted transport, so without this wrapper
+    every mistyped or renamed template pages us as an upstream outage. That is
+    Sentry MCP-SERVER-5W, three events from one OpenAI Codex session on a
+    template name that does not exist in that organization. Issue #1080.
+
+    THE SIBLING ALREADY DID THIS AND THE ASYMMETRY IS THE TELL.
+    `tools/task_management.py::_search_process_by_name` wraps the identical SDK
+    call for PROCESSES in the identical way, so `get_tasks_for_process(
+    process_name=...)` has never paged on a name miss while
+    `get_template(template_name=...)` always has. Two tools doing the same
+    thing to different entities, one fixed and one not, is the shape rule 16 in
+    the repo CLAUDE.md is about.
+
+    Scoped to the NAME resolution alone, deliberately. `get_template(
+    template_id=...)` does not come through here, and neither does the template
+    FETCH that follows a successful resolution, so a genuine failure of either
+    still reaches Sentry.
+    """
+    from tallyfy import TallyfyError
+    try:
+        return sdk.templates.search_templates_by_name(org_id, template_name)
+    except TallyfyError as e:
+        raise ToolError(
+            f"{e} Use search_for_templates to find it by keyword, or "
+            f"get_all_templates to list what this organization has, then call "
+            f"get_template with the id."
+        )
+
+
 def _normalize_step_payload(step_data: dict, valid_keys, rejected_keys) -> dict:
     """Map caller-friendly aliases onto api-v2's field names and reject the rest.
 
@@ -296,13 +438,24 @@ def _normalize_step_payload(step_data: dict, valid_keys, rejected_keys) -> dict:
             + ", ".join(sorted(valid_keys))
         )
 
+    _validate_step_participants(normalized)
     _normalize_step_deadline(normalized)
 
     return normalized
 
 
 def _normalize_step_data(step_data: dict) -> dict:
-    """Normalize a step CREATE payload against CreateStepRequest's rules."""
+    """Normalize a step CREATE payload against CreateStepRequest's rules.
+
+    Deliberately does NOT call `_require_complete_step_deadline`. That helper
+    also refuses an INCOMPLETE deadline, and on the create path forwarding one
+    is a written decision with its own test: a missing key already fails loudly
+    at CreateStepRequest's required_with rules, and inventing the key here would
+    turn a visible 422 into a deadline pointing somewhere the caller never
+    asked for. See TestStepDeadlineOptionReachesTheApiAsACode. The NON-DICT
+    half, which is the part that produces a status-less TallyfyError, is covered
+    for both paths by `_validate_step_participants`.
+    """
     return _normalize_step_payload(
         step_data, _STEP_CREATE_KEYS, _STEP_REJECTED_KEYS
     )
@@ -539,7 +692,8 @@ get_template_steps(step_id=..., full_text=True).""",
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             if template_name.strip():
-                template = sdk.templates.get_template(org_id, template_name=template_name.strip())
+                resolved_id = _resolve_template_name(sdk, org_id, template_name.strip())
+                template = sdk.templates.get_template(org_id, template_id=resolved_id)
             else:
                 template = sdk.templates.get_template(org_id, template_id=template_id.strip())
             if not template:

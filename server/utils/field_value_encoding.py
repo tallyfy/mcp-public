@@ -248,6 +248,59 @@ def _is_clear(value: Any) -> bool:
     return value is None or value is False or value == 0 or not value
 
 
+def _reject_unusable_file_value(value: Any, label: str) -> None:
+    """Refuse a `file` value the DEPLOYED api-v2 cannot iterate, naming the shape.
+
+    This checks rather than coerces, because a file object carries an id or a
+    url that only the caller can supply. There is nothing to resolve it to and
+    inventing one would store a broken reference on a 2xx.
+
+    WHY IT IS WORTH A LOCAL REFUSAL. On `origin/production`,
+    `app/Models/Task.php::updateCaptureValues` does
+
+        if ($payload && $formField && $formField->field_type == 'file') {
+            foreach ($payload as $item) {
+
+    so a bare string reaches `foreach` and the request is an HTTP **500**:
+    "foreach() argument must be of type array|object, string given". That is
+    Sentry MCP-SERVER-5V, retried three times by the SDK and answered 500 each
+    time, so the input was deterministic rather than a flake. `Run.php` carries
+    the same loop for kickoff values.
+
+    api-v2 `ad5787b92` (PR 9604, 2026-07-23) adds a `case 'file':` arm to
+    `FormValuesValidator` that answers 422 instead, and names Sentry 4TA, 4TB
+    and 4TC. It is on api-v2 `master` and NOT on `origin/production`, which is
+    534 commits behind. So this states the required SHAPE rather than a status
+    code, per rule 18 in the repo CLAUDE.md: a status claim would be wrong in
+    one environment either way, while the shape is true in both.
+
+    Deliberately NARROW. It refuses only what provably breaks the loop, a value
+    that is not a list or a list holding something that is not an object. It
+    does NOT re-implement `FormValuesValidator`'s id / full_url / url,
+    uploaded_at and source rules: api-v2 is the authority on those, they answer
+    a clean 422 on master, and duplicating them here is how a local guard drifts
+    away from the contract it mirrors.
+
+    Clearing still passes: `empty($payload)` short circuits the branch on
+    production, so the caller is checked against `_is_clear` first.
+    """
+    shape = (
+        'a list of file objects, e.g. [{"id": 123, "filename": "report.pdf"}]. '
+        "Each entry needs at least one of id, full_url or url. Nothing was sent."
+    )
+    if not isinstance(value, list):
+        raise ToolError(
+            f'file field "{label}" must be {shape} Got '
+            f"{type(value).__name__} {value!r}."
+        )
+    bad = [item for item in value if not isinstance(item, dict)]
+    if bad:
+        raise ToolError(
+            f'file field "{label}" must be {shape} These entries are not '
+            f"objects: {bad!r}."
+        )
+
+
 def coerce_field_value(
     value: Any,
     field_type: Optional[str],
@@ -260,7 +313,14 @@ def coerce_field_value(
     Non-choice types and unknown types pass through untouched - this function
     only rewrites what it can prove it understands. Empty values pass through
     too, because clearing a field is legitimate on every type.
+
+    `file` is the one non-choice type that is CHECKED rather than coerced: see
+    `_reject_unusable_file_value`.
     """
+    if field_type == "file" and not _is_clear(value):
+        _reject_unusable_file_value(value, label)
+        return value
+
     if field_type not in CHOICE_FIELD_TYPES:
         return value
 
