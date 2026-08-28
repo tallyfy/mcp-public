@@ -573,7 +573,11 @@ CORRECT usage:
         annotations=ToolAnnotations(
             title="Update task comment",
             readOnlyHint=False,
-            destructiveHint=False,
+            # Destructive because 'content' is required and REPLACES the comment
+            # body outright. This tool surfaces no revision history and offers no
+            # undo, so the text the author wrote is gone. See #1013, the per-tool
+            # pass #653 left unfinished.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

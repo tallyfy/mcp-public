@@ -429,14 +429,56 @@ def flag_downstream_auth_failure(
 
 
 def _record_decision(decision: str) -> str:
-    """Count one decision and hand it back. Must never break a request."""
+    """Count one decision and hand it back. Must never break a request.
+
+    ⚠️ The swallow is deliberate and the log level is NOT (#1015). Recording a
+    metric must never take down a request, so the except stays. But it used to
+    log at DEBUG, which production does not emit, and the result was a counter
+    that could stop recording in complete silence: nothing in the process said
+    so, no test could notice (the suite replaces this module with a stub), and
+    on a dashboard a broken counter is indistinguishable from one that has
+    simply never fired. WARNING is the difference between a failure that is
+    swallowed and a failure that is hidden.
+    """
     try:
         from metrics import record_auth_challenge
 
         record_auth_challenge(decision)
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("Could not record auth-challenge decision: %s", exc)
+        logger.warning(
+            "Could not record auth-challenge decision %r: %s. The challenge "
+            "decision itself is unaffected, but mcp_server_auth_challenge_total "
+            "is now under-counting and must not be read as authoritative.",
+            decision, exc,
+        )
     return decision
+
+
+def _initialize_challenge_metric_series() -> None:
+    """Publish every decision series at zero, at import, so the metric is legible.
+
+    See ``metrics.initialize_auth_challenge_series`` for why: a labelled counter
+    with no children emits no samples, so "never fired" and "not wired" look the
+    same, and #1015 exists because nobody could tell which one production was in.
+
+    Never raises. This runs at import of a middleware the server cannot start
+    without, so a metrics problem must not be able to stop the server booting --
+    the same fail-safe reasoning the module docstring gives for everything else
+    here. It logs at WARNING rather than DEBUG for the reason above.
+    """
+    try:
+        from metrics import initialize_auth_challenge_series
+
+        initialize_auth_challenge_series(CHALLENGE_DECISIONS)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Could not pre-create mcp_server_auth_challenge_total series: %s. "
+            "The challenge path still works; the metric will be absent until "
+            "its first increment, so an empty reading proves nothing.", exc,
+        )
+
+
+_initialize_challenge_metric_series()
 
 
 class DownstreamAuthChallengeMiddleware:

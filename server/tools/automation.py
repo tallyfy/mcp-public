@@ -571,7 +571,10 @@ def register_automation_tools(mcp):
 
     @mcp.tool(
         name="create_automation_rule",
-        description="""Create conditional automation (if-then rules) for workflow templates.
+        description="""Create conditional automation (if-then rules) for templates.
+
+A conditional form SECTION ("section C only if amount > 5000") is TWO rules: hide that
+step by default AND show it when the field says so. One alone leaves it always visible.
 
 REQUIRED: 'template_id' (32-char hex) + 'automation_data' (dict with `conditions`+`actions`).
 
@@ -586,19 +589,19 @@ Field/kickoff ops: contains, not_contains, equals, not_equals, equals_any,
 greater_than, less_than, is_empty, is_not_empty
 
 EVERY condition needs a `statement` key (null for step ops). AND/OR goes on EACH
-condition as `logic`:"and"|"or". No top-level condition_logic exists.
+condition as `logic`:"and"|"or", never top-level.
 
 EXAMPLE (ids are 32-char hex, no hyphens) - SHOW a step when a kickoff
-field = "Yes" (to hide it: action_verb "hide"):
+field = "Yes" (hide: action_verb "hide"):
 {"alias":"Show legal","conditions":[{"conditionable_id":"<ko_field_id>","conditionable_type":"kickoff","operation":"equals","statement":"Yes","logic":"and"}],"actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
 
-Same envelope for other actions, swapping the "actions" entry:
+Same envelope, swapping the "actions" entry:
   deadline: {..,"action_type":"deadline","deadline":{"value":3,"unit":"days","option":"from"}}
   assign:   {..,"action_type":"assignment","action_verb":"assign","assignees":{"users":[12345]}}
 
 Every action needs `target_step_id`. deadline needs ALL of value/unit/option
 (unit minutes|hours|days|weeks|months, option before|from). webhook needs webhook_url+alias_name.
-Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name, NOT "automated_alias"); if you omit it this tool fills one in.""",
+Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name, NOT "automated_alias"); this tool fills one in if omitted.""",
         tags=["automation", "rules", "conditional", "write"],
         annotations=ToolAnnotations(
             title="Create automation rule",

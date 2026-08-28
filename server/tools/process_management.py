@@ -210,9 +210,11 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         },
         description="""Launch a new workflow process (run) from a template.
 
-REQUIRED: 'template_id' (32-char hex) and 'name'. Generate a short descriptive
-instance name from the template name and context (e.g. "Onboarding - Jane Doe").
-Do not ask the user for a name unless they want to pick one.
+REQUIRED: 'template_id' (32-char hex) and 'name'. Name it after the template plus
+the real-world thing it tracks: "Onboarding - Jane Doe". Generate it yourself; ask
+only if the user wants to pick. Launch ONE process per real-world thing (per hire,
+per client, per order). At volume the fix is fewer LAUNCHES, not fewer processes:
+repeat this call per item (e.g. per spreadsheet row) - that IS the bulk path.
 
 TWO DIFFERENT FORM SURFACES:
 
@@ -220,12 +222,12 @@ TWO DIFFERENT FORM SURFACES:
     Defined at TEMPLATE level. Call `get_kickoff_fields(template_id)` first for
     field IDs, types and options.
 
-    ONE OBJECT keyed by each field's `timeline_id` — not a list, not labels:
+    ONE OBJECT keyed by each field's `timeline_id` - not a list, not labels:
       prerun={"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6": "Acme Corp"}
 
     Values follow the field type. Bare scalar for text/textarea/date/email. For
     dropdown/radio/multiselect pass the option's id OR its exact text
-    (multiselect: a list of them) — this tool resolves each to the shape the API
+    (multiselect: a list of them) - this tool resolves each to the shape the API
     needs, so never hand-build {"id","text"} or recall that multiselect entries
     need "selected":true. table: one entry per column. file: a list of objects,
     each with "filename" plus one of id/full_url/url. assignees_form:
@@ -240,11 +242,9 @@ CORRECT:
     prerun={"<customer_name_field_id>": "Acme Corp"}, owner_id=12345)
 
 WRONG:
-  launch_process(template_id="abc123...")  ← no name, fails
-  launch_process(..., prerun={"Customer name": "Acme"})  ← LABEL not timeline_id:
-    matches no field, so it is DROPPED — a 201 with an empty kickoff form
-  launch_process(..., prerun=[{"<field_id>": "Acme"}])  ← legacy list; accepted
-    and folded, but send the object""",
+  launch_process(template_id="abc123...")  <- no name, fails
+  launch_process(..., prerun={"Customer name": "Acme"})  <- LABEL not timeline_id:
+    matches no field, so it is DROPPED - a 201 with an empty kickoff form""",
         tags={"processes", "workflow", "runs", "write", "create", "launch"},
         annotations=ToolAnnotations(
             title="Launch process",

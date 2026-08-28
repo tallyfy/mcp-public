@@ -1059,40 +1059,39 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         name="create_standalone_task",
         description="""Create a standalone (one-off) task with explicit structured fields.
 
-NOTE: no process is created by default (is_oneoff_task: true), so the task will not appear
-in get_organization_runs. Only the fan-out flag below creates one.
+NOTE: no process is created by default (is_oneoff_task: true), so the task will not
+appear in get_organization_runs. Only the fan-out flag below creates one.
 
-REQUIRED: title, deadline, at least one assignee.
+REQUIRED: title, deadline, at least one assignee. If deadline or assignee is
+missing, ASK the user before calling.
 
-DEADLINE: natural language, e.g. "April 12 2026 at 3pm", "next Monday at noon",
-"tomorrow at 5pm". Resolved to UTC using the org timezone automatically.
+DEADLINE: natural language, e.g. "Friday at 5pm", "April 12 2026 at 3pm". Resolved
+to UTC using the org timezone automatically.
 
-TASK TYPE: task (default) | approval | expiring | email | expiring_email
+TASK TYPE: task (default) | approval | expiring (auto-completes at deadline) |
+'email' (a DRAFT: a human reviews and clicks SEND) |
+'expiring_email' (auto-sends at the deadline, then completes itself).
+For requests to send automatically, choose 'expiring_email'.
 
 ASSIGNEES: one or more of user_names, user_emails, guest_emails, group_names.
 
-FAN OUT TO MANY PEOPLE (separate_task_for_each_assignee=True):
-Use whenever the user wants the SAME thing from SEVERAL people AND wants to track
-who has done it: "ask 6 people to submit timesheets by Friday 5pm", a survey, a
-poll, a compliance attestation. Creates ONE process holding ONE task per assignee,
-so anyone can see who is done and who is not. Groups expand to one task per member.
-Returns {run_id, task_count, tasks}. WITHOUT this flag you get one SHARED task and
-cannot tell the people apart.
+FAN OUT (separate_task_for_each_assignee=True): the SAME thing from SEVERAL people,
+tracked per person - "6 people submit timesheets by Friday", a poll, an
+attestation. Creates ONE process holding one task per assignee; groups expand to
+one task per member. Returns {run_id, task_count, tasks}. task_count is the TRUE
+total; 'tasks' may be TRIMMED, with a '_truncated' marker ("Showing N of M
+tasks") - report task_count, never len(tasks).  Without this flag you get one
+SHARED task and cannot tell people apart.
 
-run_id: 32-char hex process ID. Attaches this ad-hoc task to an EXISTING process
-(e.g. a later round of the same fan-out) rather than standing alone. That process
-must allow ad-hoc tasks or the API refuses it.
+PROJECT CONTAINER: for one-off project work with no template, start with the
+fan-out flag (even for ONE assignee) to mint a process container, then attach
+every further task via run_id=<that process id>. run_id also attaches an ad-hoc
+task to any existing process that allows ad-hoc tasks; otherwise the API refuses.
 
-form_fields: questions to put on the task. Each entry needs label, field_type and
-required (pass it explicitly, there is no default). dropdown/radio/multiselect
-also need options, radio needs 2 or more. Read answers back with get_task.
-  form_fields=[{"label": "Hours worked", "field_type": "text", "required": True}]
-
-CORRECT usage:
-- create_standalone_task(title="Review budget", deadline="tomorrow at 3pm", user_emails=["john@example.com"])
-- create_standalone_task(title="Submit your timesheet", deadline="Friday at 5pm", user_emails=["a@x.com","b@x.com"], separate_task_for_each_assignee=True)
-
-If the user doesn't specify a deadline or assignee, ASK them before calling the tool.""",
+form_fields: questions on the task. Each entry needs label, field_type and
+required (explicit - no default); dropdown/radio/multiselect also need options
+(radio: 2+). Read answers back with get_task.
+  form_fields=[{"label": "Hours worked", "field_type": "text", "required": True}]""",
         tags={"tasks", "workflow", "create", "write"},
         annotations=ToolAnnotations(
             title="Create standalone task",
@@ -1259,8 +1258,8 @@ APPROVAL TASKS need is_approved:
     task_type="task"           -> do NOT pass is_approved (regular completion)
     task_type="approval"       -> MUST pass is_approved=True or is_approved=False
     task_type="expiring"       -> do NOT pass is_approved (completing acknowledges it)
-    task_type="expiring_email" -> do NOT pass is_approved (completing acknowledges it)
-    task_type="email"          -> do NOT pass is_approved (regular completion)
+    task_type="expiring_email" -> do NOT pass is_approved (completing acknowledges it; this type auto-sends at the deadline)
+    task_type="email"          -> do NOT pass is_approved (regular completion; this type is a draft a human reviews and sends)
 
   is_approved is honored ONLY for approval tasks. On task/email it is ignored. On
   expiring or expiring_email it is NOT ignored: is_approved=False would record the
@@ -1444,7 +1443,12 @@ Never call this without run_id and task_id.""",
         annotations=ToolAnnotations(
             title="Update task",
             readOnlyHint=False,
-            destructiveHint=False,
+            # Destructive because every field here REPLACES rather than appends.
+            # owners={"users": [], "guests": [], "groups": []} unassigns everyone
+            # on a live task, and title, summary, deadline and taskdata each
+            # overwrite whatever was stored. None of it is recoverable through
+            # this tool. See #1013, the per-tool pass #653 left unfinished.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

@@ -15,7 +15,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from sentry_config import init_sentry_server
 from utils.tallyfy_auth_provider import build_auth_provider
-from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, DownstreamAuthChallengeMiddleware, ToolScopeEnforcementMiddleware
+from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, DownstreamAuthChallengeMiddleware, ToolScopeEnforcementMiddleware, RemovedToolHintsMiddleware
 from routes import register_all_routes
 from tools.user_management import register_user_management_tools
 from tools.task_management import register_task_management_tools
@@ -29,11 +29,12 @@ from tools.comment_management import register_comment_management_tools
 from tools.tag_management import register_tag_management_tools
 from tools.folder_management import register_folder_management_tools
 from tools.user_interaction import register_user_interaction_tools
-from tools.api_fallback import register_api_fallback_tool
+from tools.api_fallback import register_api_fallback_tool, report_fallback_flag_state
 from tools.template_mapping_validation import register_template_mapping_validation_tools
+from tools.org_context import register_org_context_tools
 from utils.org_id_middleware import OrgIdMiddleware
 from utils.tallyfy_spec_cache import SPEC_CACHE
-from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ACCEPTED_MCP_RESOURCES, ENFORCE_AUDIENCE, SERVER_VERSION
+from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ACCEPTED_MCP_RESOURCES, ENFORCE_AUDIENCE, SERVER_VERSION, INSTRUCTIONS_TEMPLATE
 
 # Load environment variables from .env file
 load_dotenv()
@@ -139,52 +140,11 @@ auth_handler = build_auth_provider(
 # Create MCP server with explicit capability declaration and server metadata
 # This ensures standards compliance with Anthropic Claude Connectors Directory
 # and OpenAI ChatGPT App submission requirements
-_INSTRUCTIONS_TEMPLATE = """# Tallyfy Workflow Automation
-
-Connect Tallyfy and run your operations right from chat: launch and track
-workflows, complete and assign tasks, manage approvals, search across your
-organization, and build or edit templates, all in your own authenticated
-Tallyfy account.
-
-## Try these to start
-
-- "Launch the Employee Onboarding workflow for Jane Doe"
-- "Show me my open tasks" (or "what is Sarah working on?")
-- "What templates do we have for customer onboarding?"
-- "Create an approval workflow for vendor onboarding"
-- "Complete the 'Send welcome email' task"
-
-## Template Creation Best Practices
-
-When building a template from a user's description, document, or image:
-
-1. **create_template** — create the shell (title, type, summary).
-2. **add_step_to_template** — add each step in order. Choose the right step_type:
-   - `approval` for any approve/reject or review step (enables approved/rejected automation conditions)
-   - `email` for notification-only steps
-   - `expiring` for steps that auto-complete after a deadline
-   - `task` for standard work items (default)
-3. **add_form_field_to_step** — add data-capture fields to steps that collect information (costs, dates, file uploads, selections). Most steps that "clarify", "submit", or "request" something need form fields.
-4. **add_kickoff_field** — add pre-launch fields for data collected BEFORE the workflow starts (e.g. requester name, department, priority, description of the request).
-5. **create_automation_rule** — add if-then rules for conditional branching:
-   - Steps that should only appear after an approval → hide by default, show when the approval step is approved
-   - Cancellation/rejection paths → show cancel steps when an approval is rejected
-   - Every conditional branch in a flowchart needs both a "show" rule for the happy path AND a "hide" rule (or hide-by-default + show) for the alternative path
-6. **launch_process** — optionally offer to launch a test run.
-
-Tallyfy steps are sequential. To model parallel paths from a flowchart, use visibility automations to show/hide steps based on conditions rather than expecting simultaneous execution.
-
-## Technical details
-
-- **Tools**: {tool_count} tools (static list). Resources: supported. Prompts, logging, completions, and tasks are not supported.
-- **Authentication**: OAuth 2.1 with a Tallyfy-issued JWT (RS256) on every request, so the assistant only ever sees what the signed-in user can see.
-- **Responses**: capped at 25KB (auto-compacted); HTTP streaming supported; graceful error messages.
-- **Rate limiting**: unauthenticated requests are IP-limited; authenticated requests have higher limits.
-
-## Support
-
-For docs or help: https://tallyfy.com/products/pro/integrations/mcp-server/
-"""
+# The instructions template lives in constants.py (INSTRUCTIONS_TEMPLATE) so
+# tests can import and pin it without importing this module, whose import
+# has side effects (Sentry init, a thread pool). The .format(tool_count=...)
+# call below is the only consumer; any literal brace in the template other
+# than {tool_count} crashes startup, which test_server_instructions.py guards.
 
 # `version=` is NOT optional in practice. FastMCP's constructor does
 #     version=_coerce_version(version) or fastmcp.__version__
@@ -227,6 +187,7 @@ register_folder_management_tools(mcp)
 register_user_interaction_tools(mcp)
 register_api_fallback_tool(mcp)
 register_template_mapping_validation_tools(mcp)
+register_org_context_tools(mcp)
 
 # Enforce the token's mcp_scopes per tool (#559). This is a FastMCP TOOL
 # middleware, so it is added here with mcp.add_middleware() rather than to the
@@ -241,6 +202,12 @@ register_template_mapping_validation_tools(mcp)
 # its absence would 403 Tallyfy's own products. See utils/tool_scopes.py.
 #
 # Mode: MCP_TOOL_SCOPE_ENFORCEMENT = enforce (default) | log | off.
+# Answer the 7 tool names removed in #492 with the current path (#1030).
+# Registered BEFORE ToolScopeEnforcementMiddleware because first-added is
+# outermost: a removed name must get its hint even when the caller's scopes
+# would also have denied it -- a scope denial for a tool that no longer
+# exists sends the caller off to re-authorize for nothing.
+mcp.add_middleware(RemovedToolHintsMiddleware())
 mcp.add_middleware(ToolScopeEnforcementMiddleware())
 
 # Register all routes and resources
@@ -251,7 +218,7 @@ register_all_routes(mcp)
 # works at import time even when the importer (uvicorn) has a running event loop.
 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
     tool_count = _ex.submit(lambda: len(asyncio.run(mcp.list_tools()))).result()
-mcp.instructions = _INSTRUCTIONS_TEMPLATE.format(tool_count=tool_count)
+mcp.instructions = INSTRUCTIONS_TEMPLATE.format(tool_count=tool_count)
 logging.info(f"   Registered tools: {tool_count}")
 
 
@@ -291,6 +258,11 @@ _mcp_lifespan = app.router.lifespan_context
 
 @asynccontextmanager
 async def _combined_lifespan(scope_app):
+    # Announce the API-fallback flag as this process actually sees it (#1009).
+    # It runs HERE, on the deployed server, because that is the only place the
+    # question can be answered: the deploy deliberately excludes environment
+    # files, so no repo-side check can ever see the real value.
+    report_fallback_flag_state()
     await _start_spec_cache()
     async with _mcp_lifespan(scope_app):
         yield

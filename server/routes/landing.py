@@ -64,7 +64,7 @@ _LANDING_HTML = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tallyfy MCP Server — Workflow Automation for AI Assistants</title>
+    <title>Tallyfy MCP Server: Workflow Automation for AI Assistants</title>
     <meta name="description" content="Run your operations from your AI assistant. The Tallyfy MCP server exposes 100+ tools for workflow automation across Claude, ChatGPT, Cursor, and more.">
     <meta property="og:title" content="Tallyfy MCP Server">
     <meta property="og:description" content="Workflow automation for AI assistants. Connect Tallyfy to Claude, ChatGPT, Cursor, and any MCP-compatible client.">
@@ -305,11 +305,11 @@ _LANDING_HTML = """<!DOCTYPE html>
 
     <h2 style="margin-top: 12px;">Try these once connected</h2>
     <ul class="prompts">
-        <li>&ldquo;Launch the Employee Onboarding workflow for Jane Doe&rdquo;</li>
-        <li>&ldquo;Show me my open tasks&rdquo; &middot; &ldquo;What is Sarah working on?&rdquo;</li>
-        <li>&ldquo;What templates do we have for customer onboarding?&rdquo;</li>
-        <li>&ldquo;Create an approval workflow for vendor onboarding&rdquo;</li>
-        <li>&ldquo;Complete the &lsquo;Send welcome email&rsquo; task&rdquo;</li>
+        <li>&ldquo;Turn this SOP document into a runnable Tallyfy template&rdquo;</li>
+        <li>&ldquo;Launch our client-onboarding process for Acme Corp&rdquo;</li>
+        <li>&ldquo;What did my team complete this week?&rdquo;</li>
+        <li>&ldquo;Build a process for handling customer refunds and test it with me&rdquo;</li>
+        <li>&ldquo;Ask 8 people to confirm their off-site attendance by Friday and track who has answered&rdquo;</li>
     </ul>
 
     <div class="badges">

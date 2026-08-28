@@ -86,7 +86,7 @@ def _sanitize_api_error(message: str) -> str:
 # failing" could never answer it, and an operator had to infer the answer from
 # Sentry's SILENCE instead. Recorded on #603 as its fifth suppression point.
 #
-# THE CAUSE IS DECORATOR ORDER, not a broken counter. 107 of the 110 tools are
+# THE CAUSE IS DECORATOR ORDER, not a broken counter. 107 of the 113 tools are
 # declared as
 #
 #     @track_tool_execution("get_tags")     <- classifies the exception

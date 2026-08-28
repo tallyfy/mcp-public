@@ -9,7 +9,7 @@ from prometheus_client import Counter, Histogram, Gauge, Info
 import time
 import inspect
 from functools import wraps
-from typing import Callable, Any
+from typing import Callable, Any, Iterable
 import logging
 from constants import (
     SENSITIVE_KEYS,
@@ -377,7 +377,7 @@ def track_tool_execution(tool_name: str):
 
             except Exception as e:
                 # Prefer the class @handle_tallyfy_errors stamped on the way
-                # past. That decorator sits INSIDE this one on 107 of the 110
+                # past. That decorator sits INSIDE this one on 107 of the 113
                 # tools, so by the time we get here it has already replaced the
                 # original TallyfyError with a ToolError -- and the class-name
                 # test below then matches neither name and labels EVERYTHING
@@ -609,3 +609,39 @@ def record_auth_challenge(decision: str):
         decision: one of middleware.downstream_auth_challenge.CHALLENGE_DECISIONS
     """
     auth_challenge_total.labels(decision=decision).inc()
+
+
+def initialize_auth_challenge_series(decisions: Iterable[str]) -> None:
+    """Create every child of ``auth_challenge_total`` at zero, once, at startup.
+
+    WHY THIS EXISTS (#1015)
+    -----------------------
+    A labelled Prometheus counter has NO children until something calls
+    ``.labels()``, so before its first increment the metric contributes no
+    samples at all and Prometheus never ingests a series for it. That makes two
+    completely different situations look identical from a dashboard:
+
+        never fired          -- the code ran, decided nothing, and is healthy
+        not wired            -- the code cannot record, and nobody will find out
+
+    Those need opposite responses, and #1015 was filed because the estate could
+    not tell them apart: ``mcp_server_auth_challenge_total`` had zero series in
+    both environments and that reading was, on its own, unfalsifiable.
+
+    Pre-creating the whole vocabulary at zero settles it permanently. From here
+    on, five series present and all at zero means "this path has not been taken",
+    and the series being ABSENT means the recording is broken. A dashboard can
+    finally distinguish them, and an alert can be written against either.
+
+    ⚠️ Takes the vocabulary as an ARGUMENT rather than importing it. The closed
+    set lives in ``middleware.downstream_auth_challenge`` beside the code that
+    branches on it, and importing it here would pull ``middleware/__init__`` in,
+    which imports ``request_logging``, which imports this module at module scope
+    -- a cycle. Passing it in keeps one source of truth and no cycle.
+
+    Args:
+        decisions: the complete closed vocabulary, i.e.
+            ``middleware.downstream_auth_challenge.CHALLENGE_DECISIONS``.
+    """
+    for decision in decisions:
+        auth_challenge_total.labels(decision=decision)

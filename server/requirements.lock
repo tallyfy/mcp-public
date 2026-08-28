@@ -20,6 +20,12 @@ authlib==1.7.2
     # via fastmcp-slim
 beartype==0.22.9
     # via py-key-value-aio
+boto3==1.39.4
+    # via -r requirements.txt
+botocore==1.39.17
+    # via
+    #   boto3
+    #   s3transfer
 cachetools==7.1.7
     # via py-key-value-aio
 caio==0.12.2
@@ -98,6 +104,10 @@ jeepney==0.9.0
     # via
     #   keyring
     #   secretstorage
+jmespath==1.1.0
+    # via
+    #   boto3
+    #   botocore
 joserfc==1.7.4
     # via
     #   authlib
@@ -186,7 +196,9 @@ pyjwt[crypto]==2.13.0
 pyperclip==1.11.0
     # via fastmcp-slim
 python-dateutil==2.9.0.post0
-    # via dateparser
+    # via
+    #   botocore
+    #   dateparser
 python-dotenv==1.2.2
     # via
     #   -r requirements.txt
@@ -226,6 +238,8 @@ rpds-py==2026.6.3
     # via
     #   jsonschema
     #   referencing
+s3transfer==0.13.1
+    # via boto3
 secretstorage==3.5.0
     # via keyring
 sentry-sdk==2.57.0
@@ -266,6 +280,7 @@ uncalled-for==0.4.0
     # via fastmcp-slim
 urllib3==2.7.0
     # via
+    #   botocore
     #   requests
     #   sentry-sdk
 uvicorn==0.35.0

@@ -382,6 +382,43 @@ def get_user_id_from_token() -> Optional[str]:
     return None
 
 
+def get_verified_org_claim() -> Optional[str]:
+    """The ``org_id`` claim on the VERIFIED token, or None if it carries none.
+
+    ``get_authenticated_credentials`` deliberately falls back to the
+    request-scoped org id (an ``X-Organization-ID`` header, or this user's
+    persisted organization) when the token names no organization. That is
+    correct for every tool that reaches Tallyfy's API, because api-v2 enforces
+    membership on the way through, so a header naming an organization the
+    caller does not belong to is refused there.
+
+    It is NOT correct for a tool whose only access-control decision is the org
+    id itself. Org memory is stored on R2 under a per-org key and no API call
+    happens, so a header would BE the authorization. This accessor exists so
+    such a tool can require the claim and refuse otherwise, rather than
+    inheriting a fallback designed for a different threat model.
+
+    Returns the claim value, or None when the token has no ``org_id`` claim or
+    cannot be decoded. It never consults the header, the persisted org, or
+    ``TALLYFY_ORG_ID``, which is the whole point.
+
+    It deliberately does NOT fall back to ``get_jwt_claims()``. That accessor's
+    own documentation says its claims come from an unverified decode and are
+    "never for authorization decisions", and a truthy value here skips the
+    membership check entirely. Returning None instead costs one API call and
+    keeps the only unverified source out of an access-control path.
+    """
+    access_token = get_access_token()
+    if not access_token:
+        return None
+    try:
+        claims = jwt.decode(access_token.token, options={"verify_signature": False})
+    except jwt.DecodeError:
+        return None
+    org_id = claims.get("org_id")
+    return org_id if isinstance(org_id, str) and org_id else None
+
+
 def get_jwt_scopes() -> Tuple[str, ...]:
     """OAuth ``scope`` / ``scp`` scopes on the VERIFIED access token.
 

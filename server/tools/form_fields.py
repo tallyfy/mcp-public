@@ -577,7 +577,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="delete_form_field",
-        description="Delete a form field from a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). NOTE: if the field is referenced by an automation rule (visibility condition) in another step, deletion fails with a 403 error; remove the automation rule first. Never call this without all three parameters.",
+        description="Delete a form field from a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). WARNING: the API does not stop this when an automation depends on the field. The delete goes through, answers 204 No Content, and every automation rule condition pointing at this field is removed along with it, silently, with nothing in the response saying so. The automation itself survives without that condition, so a rule that used to fire on this field can start behaving differently. This cannot be undone. PRE-FLIGHT: call analyze_template_automations first and look for a condition whose 'conditionable_type' is \"Capture\" and whose 'conditionable_id' equals this field_id. If one exists, name the affected automations to the user and get agreement before deleting. Never call this without all three parameters.",
         tags=["forms", "fields", "ui", "write", "management", "deletion"],
         annotations=ToolAnnotations(
             title="Delete form field",
@@ -938,6 +938,11 @@ Kickoff fields are filled out BEFORE a process starts; they collect initializati
 (e.g. customer name, start date, priority). This is different from step form fields which
 are filled out DURING the process.
 
+WHAT BELONGS HERE: only what is ALWAYS needed to start and is known at submission, plus
+whatever names or routes the process. Everything else belongs on the step where that work
+happens (add_form_field_to_step). Porting a long paper or Google form wholesale into kickoff
+recreates the problem the customer came with; split it by section instead.
+
 REQUIRED: 'template_id' (32-char hex) and 'field_data' (dict).
 
 SUPPORTED `field_type` ENUM (same as step fields):
@@ -1201,8 +1206,15 @@ REQUIRED: 'template_id' (32-char hex) and 'field_id' (32-char hex).
 WARNING: Deleting a kickoff field removes it permanently and drops all collected data
 for that field across existing process runs. This cannot be undone.
 
-NOTE: If the field is used in an automation rule (visibility condition), the deletion
-will fail with a 403 error; remove the automation rule first.
+WARNING: the API does not stop this when an automation depends on the field. The delete
+goes through, answers 204 No Content, and every automation rule condition pointing at this
+field is removed along with it, silently, with nothing in the response saying so. The
+automation itself survives without that condition, so a rule that used to fire on this
+field can start behaving differently. This cannot be undone.
+
+PRE-FLIGHT: call analyze_template_automations first and look for a condition whose
+'conditionable_type' is "Prerun" and whose 'conditionable_id' equals this field_id. If one
+exists, name the affected automations to the user and get agreement before deleting.
 
 Never call this without both parameters.""",
         tags=["forms", "fields", "kickoff", "prerun", "write", "deletion"],

@@ -289,6 +289,28 @@ EXEMPT_TOOLS: Dict[str, str] = {
         "every client needs its own user and organization id before it can "
         "address any other call, whatever scopes it holds."
     ),
+    "search_product_docs": (
+        "Searches the PUBLIC documentation index at answers.tallyfy.com, "
+        "which serves the published docs with no auth by design. Makes no "
+        "Tallyfy API call and reaches no customer or org resource, so there "
+        "is no resource family to gate."
+    ),
+    "get_org_context": (
+        "Reads the org memory document from the MCP server's own R2 store, so "
+        "no mcp_scopes resource family covers it. Siloing does not rest on "
+        "that absence: the tool takes no org parameter, and the org id is "
+        "either a verified token claim or is checked against the caller's "
+        "membership via the Tallyfy API before anything is read. Revisit if a "
+        "memory scope pair is ever minted (#1036)."
+    ),
+    "update_org_context": (
+        "Writes the org memory document to the MCP server's own R2 store, so "
+        "no mcp_scopes resource family covers it. Same protection as "
+        "get_org_context: no org parameter exists, and the org id is either a "
+        "verified token claim or is confirmed against the caller's membership "
+        "before anything is written. Revisit if a memory scope pair is ever "
+        "minted (#1036)."
+    ),
     "get_organization": (
         "Organization bootstrap. Reads /organizations/{org}, which carries no "
         "resource segment, so api-v2's EnforceMcpTokenScopes returns null for "

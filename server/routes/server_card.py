@@ -28,10 +28,23 @@ _SERVER_CARD = {
     "displayName": "Tallyfy Workflow Automation",
     "description": (
         "Run your operations from your AI assistant. Launch workflows, complete "
-        "tasks, manage approvals, and update templates in Tallyfy — all from "
+        "tasks, manage approvals, and update templates in Tallyfy, all from "
         "natural conversation."
     ),
     "tagline": "Automate tasks, processes, and approvals with AI.",
+    # Kept in sync with the "Try these" list in constants.INSTRUCTIONS_TEMPLATE
+    # and the landing page -- tests/unit/server/test_server_instructions.py
+    # pins all three surfaces to the same five prompts.
+    "examplePrompts": [
+        "Turn this SOP document into a runnable Tallyfy template",
+        "Launch our client-onboarding process for Acme Corp",
+        "What did my team complete this week?",
+        "Build a process for handling customer refunds and test it with me",
+        (
+            "Ask 8 people to confirm their off-site attendance by Friday"
+            " and track who has answered"
+        ),
+    ],
     "category": "productivity",
     "iconUrl": "https://tallyfy.com/tallyfy-logo-icon.svg",
     "logoUrl": "https://tallyfy.com/tallyfy-logo-icon.svg",
@@ -70,13 +83,13 @@ _SERVER_CARD = {
         "tasks": False,
     },
     "summary": {
-        # Kept static deliberately — Smithery's scanner reads this as a fixed
+        # Kept static deliberately. Smithery's scanner reads this as a fixed
         # document. Drift is prevented by a test, not by computing it here:
         # tests/unit/server/routes/test_server_card.py asserts these values
         # against routes.capabilities.category_breakdown(), which counts the
         # tools each module actually registers. Update both or neither.
-        "toolCount": 110,
-        "toolCategories": 14,
+        "toolCount": 113,
+        "toolCategories": 15,
         "categories": [
             "user_management",
             "task_management",
@@ -92,6 +105,7 @@ _SERVER_CARD = {
             "user_interaction",
             "template_mapping_validation",
             "api_fallback",
+            "org_context",
         ],
     },
 }

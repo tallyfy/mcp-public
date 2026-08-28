@@ -1697,9 +1697,27 @@ Never call this without both required parameters.""",
             "openai/toolInvocation/invoking": "Building your template...",
             "openai/toolInvocation/invoked": "Template created",
         },
-        description="""Create a new template (checklist/blueprint). This is the first step when building a workflow from a user's description, uploaded document, or image — create the template shell here, then call add_step_to_template for each step, add_form_field_to_step for form fields, add_kickoff_field for pre-launch fields, and create_automation_rule for if-then logic.
+        description="""Create a new template (the reusable recipe - Tallyfy's checklist/blueprint
+object). Step 1 of the build chain: then add_step_to_template per step,
+add_form_field_to_step for in-step data, add_kickoff_field for pre-launch data,
+create_automation_rule for if-then logic, and offer launch_process for a test run
+named after a real example.
 
-REQUIRED: 'title' (template name). Optional: 'type' ('procedure' for multi-step workflows, 'form' for data collection, 'document' for reference docs), 'summary', 'guidance', 'starred'. Never call this without title.""",
+BEFORE calling this: mirror the user's goal in one plain-English sentence, sketch
+the likely steps, and ask only the 2-3 questions that change the design (where
+does this data live today; how many per month and how much do they vary; who does
+what). Never create silently from a vague ask. And check the object type: a
+TEMPLATE is the recipe, a PROCESS is one launched instance - "run onboarding for
+Jane" means launch_process on an existing template, not this tool.
+
+VARIANTS: when two workflows share most steps, build ONE template plus a kickoff
+field that captures the variant plus step-level show/hide automation rules -
+NOT near-duplicate templates. Low overlap: separate templates.
+
+REQUIRED: 'title' (short and noun-like: "Employee Onboarding", not a sentence).
+Optional: 'type' ('procedure' for multi-step workflows, 'form' for data
+collection, 'document' for reference docs), 'summary', 'guidance', 'starred'.
+Never call this without title.""",
         tags=["templates", "blueprints", "write", "create"],
         annotations=ToolAnnotations(
             title="Create template",

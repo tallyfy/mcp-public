@@ -3,8 +3,13 @@ Search Tools
 Tools for searching tasks, processes, templates, and snippets
 """
 
+import json
 import logging
+import re
+import urllib.parse
 from typing import Annotated, Any, Dict, List, Optional
+
+import httpx
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.tool import ToolResult
@@ -34,6 +39,16 @@ DEFAULT_SEARCH_TYPES = ["blueprint", "process", "task", "snippet"]
 # tasks that live inside a process. Bound the fan-out at this many fill-ins per
 # page to keep latency predictable; LLM is signaled via a meta flag when capped.
 RUN_ID_FILLIN_CAP = 25
+
+# search_product_docs (#1033): the Answers API serves the published
+# docs index publicly by design -- no auth, no org data. The `tyfy` collection
+# is the live one (verified 2026-08-27: `tyfy` answers with results, `pro` is
+# empty). Result urls are site-relative (/pro/...), completed against the
+# public docs site.
+ANSWERS_SEARCH_BASE = "https://answers.tallyfy.com/collections/tyfy/search"
+DOCS_SITE_BASE = "https://tallyfy.com/products"
+DOCS_RESULT_CAP = 5
+_MARK_TAGS = re.compile(r"</?mark>")
 
 
 def _fill_in_run_ids(
@@ -453,3 +468,126 @@ WRONG usage (will fail):
                 content=output,
                 structured_content=None
             )
+
+    @mcp.tool(
+        name="search_product_docs",
+        meta={
+            "openai/toolInvocation/invoking": "Searching Tallyfy docs...",
+            "openai/toolInvocation/invoked": "Docs search complete",
+        },
+        description="""Search Tallyfy's official product documentation and return the top matching pages.
+
+Use this when the user asks HOW Tallyfy works or how to do something in the product: features, settings, limits, integrations, billing, troubleshooting. Answer from what it returns and link the page, instead of guessing product behavior from memory.
+
+RETURNS: up to 5 results as {title, snippet, url, score}, plus 'total'. score is relevance from 0 to 1; results below about 0.5 are weak matches, so treat an all-low-score page of results as the docs not covering the topic. Snippets are plain text with the matched terms; each url is a full https://tallyfy.com/products/... link you can give the user directly.
+
+ZERO RESULTS IS A REAL ANSWER: it means the docs do not cover that topic. Say so honestly instead of inventing product behavior. Rephrase and retry at most once.
+
+SCOPE: searches ONLY the public documentation site. It never sees customer data or org content. For the user's own templates, processes or tasks, use search_all or the other search tools.
+
+CORRECT usage:
+- search_product_docs(query="conditional visibility") - how a feature works
+- search_product_docs(query="SSO SAML setup") - configuration guidance
+
+WRONG usage:
+- search_product_docs(query="Acme onboarding process") - NO! That is org data: use search_all""",
+        tags={"search", "documentation", "read-only"},
+        annotations=ToolAnnotations(
+            title="Search Tallyfy product documentation",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("search_product_docs")
+    def search_product_docs(query: SearchQuery) -> ToolResult:
+        """
+        Search the public Tallyfy product documentation via the Answers API.
+
+        Parameters
+        ----------
+        query : str
+            What to look for, in plain words.
+
+        Returns
+        -------
+        ToolResult
+            JSON with ``results`` (up to 5 of ``{title, snippet, url, score}``)
+            and ``total``. ``total: 0`` with an empty list is a real answer.
+        """
+        # Public by design: answers.tallyfy.com serves the published docs
+        # index with no auth (recorded in tallyfy/answers). No Tallyfy API
+        # call, no credentials, no org data -- which is also why this tool is
+        # in EXEMPT_TOOLS and EXEMPT_FROM_TALLYFY_ERRORS, each with the
+        # reason written beside it.
+        encoded = urllib.parse.quote(query, safe="")
+        url = f"{ANSWERS_SEARCH_BASE}/{encoded}"
+        try:
+            response = httpx.get(url, timeout=5.0)
+        except httpx.TimeoutException:
+            raise ToolError(
+                "Documentation search timed out after 5 seconds. Try once "
+                "more; if it still fails, say the docs were unreachable "
+                "rather than guessing."
+            )
+        except httpx.HTTPError as exc:
+            raise ToolError(
+                f"Documentation search is unreachable ({type(exc).__name__}). "
+                "Say the docs could not be checked rather than guessing."
+            )
+        if response.status_code != 200:
+            raise ToolError(
+                f"Documentation search returned HTTP {response.status_code}. "
+                "Say the docs could not be checked rather than guessing."
+            )
+        try:
+            body = response.json()
+        except ValueError:
+            raise ToolError(
+                "Documentation search returned a response that is not JSON. "
+                "Say the docs could not be checked rather than guessing."
+            )
+        # Valid JSON of the wrong shape (a list, null, or results-as-dict)
+        # must steer exactly like any other failure -- this API's shape is
+        # not under this repo's control, and an unguarded body.get here
+        # surfaces as a raw AttributeError the model can only guess about.
+        # Only an absent/null results field means "no results"; any other
+        # non-list value is a shape change, not an empty answer.
+        raw_results = body.get("results") if isinstance(body, dict) else None
+        if raw_results is None:
+            raw_results = []
+        if not isinstance(body, dict) or not isinstance(raw_results, list):
+            raise ToolError(
+                "Documentation search returned an unexpected response shape. "
+                "Say the docs could not be checked rather than guessing."
+            )
+        results = []
+        for item in raw_results[:DOCS_RESULT_CAP]:
+            if not isinstance(item, dict):
+                continue
+            snippet = _MARK_TAGS.sub("", str(item.get("snippet") or ""))
+            page_url = str(item.get("url") or "")
+            entry = {
+                "title": item.get("title") or "",
+                "snippet": snippet,
+                "url": DOCS_SITE_BASE + page_url if page_url.startswith("/") else page_url,
+            }
+            # The backend fuzzy-matches, so even nonsense returns 5 rows
+            # (measured: nonsense scores about 0.3-0.35, real matches 0.6-0.9).
+            # The score is the only signal separating them; passing it through
+            # is what lets the model treat weak matches as weak.
+            score = item.get("score")
+            if isinstance(score, (int, float)) and not isinstance(score, bool):
+                entry["score"] = round(float(score), 2)
+            results.append(entry)
+
+        return ToolResult(
+            content=json.dumps({
+                "results": results,
+                "total": body.get("total", len(results)),
+                "query": query,
+            }, indent=1),
+            structured_content=None,
+        )

@@ -12,6 +12,9 @@ Available middleware:
   A FastMCP tool middleware, NOT an ASGI one -- it is added with
   mcp.add_middleware(), not app.add_middleware(), because it needs the tool
   name that only exists inside the JSON-RPC body.
+- RemovedToolHintsMiddleware: Answers the 7 tool names removed in #492 with
+  a ToolError naming the current path, instead of a bare unknown-tool error.
+  Also a FastMCP tool middleware, registered above scope enforcement.
 """
 
 from middleware.request_logging import RequestLoggingMiddleware
@@ -19,6 +22,7 @@ from middleware.auth_error import AuthErrorMiddleware
 from middleware.rate_limit import RateLimitMiddleware
 from middleware.downstream_auth_challenge import DownstreamAuthChallengeMiddleware
 from middleware.tool_scope_enforcement import ToolScopeEnforcementMiddleware
+from middleware.removed_tool_hints import RemovedToolHintsMiddleware
 
 __all__ = [
     "RequestLoggingMiddleware",
@@ -26,4 +30,5 @@ __all__ = [
     "RateLimitMiddleware",
     "DownstreamAuthChallengeMiddleware",
     "ToolScopeEnforcementMiddleware",
+    "RemovedToolHintsMiddleware",
 ]

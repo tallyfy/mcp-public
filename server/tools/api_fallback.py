@@ -26,7 +26,7 @@ would look tidier and would break the server's own advertised identity:
 ``routes/capabilities.py::_count_tools_in_module`` registers each tools module
 against a stub and counts what comes back, so on a deployment with the flag off
 it would report ``Universal API Fallback: 0`` and take the advertised total to
-108 instead of 110 - on exactly the deployments the directory reviewers and the
+111 instead of 113 - on exactly the deployments the directory reviewers and the
 published tool manifest describe. ``tests/unit/server/routes/test_server_card.py``
 would then fail against a server that is behaving correctly. Leave it alone.
 
@@ -38,8 +38,9 @@ operator half is not lost - it goes to ``logger.warning`` in ``_execute``, where
 somebody who can act on it will see it. See #981.
 
 **Why the refusal does NOT say "only Tallyfy can enable it".** That reads as
-true because the flag is off in Tallyfy's hosted service, and it is false on the
-other supported deployment. ``server/**/*.py`` is published to the public mirror
+true from inside a Tallyfy-hosted environment where the flag happens to be off,
+and it is false on the other supported deployment. ``server/**/*.py`` is
+published to the public mirror
 ``tallyfy/mcp-public``, whose README carries a "Run it yourself" section, so
 running this server yourself is a real path rather than a hypothetical. On one
 of those the person running the container is the ONLY party who can flip the
@@ -87,6 +88,41 @@ logger = logging.getLogger(__name__)
 _audit_logger = logging.getLogger("tallyfy_api_call_audit")
 
 
+FALLBACK_FLAG_ENV = "MCP_ENABLE_API_FALLBACK"
+
+# The four values `fallback_flag_state()` can return. They are deliberately
+# FOUR and not two: see that function's docstring for why `unset` and
+# `unreadable` must never collapse into `disabled`.
+FLAG_ENABLED = "enabled"
+FLAG_DISABLED = "disabled"
+FLAG_UNSET = "unset"
+FLAG_UNREADABLE = "unreadable"
+
+FALLBACK_FLAG_STATES = (FLAG_ENABLED, FLAG_DISABLED, FLAG_UNSET, FLAG_UNREADABLE)
+
+
+def _value_enables_fallback(raw: str) -> bool:
+    """The ONE predicate, so the gate and the report cannot disagree about a value.
+
+    `_ENABLED` and `fallback_flag_state()` both go through this, so for any
+    given raw value they reach the same verdict, whatever whitespace or casing
+    an operator wrote. Rule 16 (share the helper rather than copy the sibling),
+    applied to the one comparison that decides whether the escape hatch is live.
+
+    Note it does NOT strip. A value of `" true "` is not `true` to the gate, so
+    it must not be `enabled` to the report either. A `.strip()` added to one
+    caller alone would be a report that contradicts the running server.
+
+    ⚠️ Sharing the predicate does not make the two answers identical in every
+    circumstance, and the docstring here used to imply it did. `_ENABLED` is a
+    snapshot taken at import while the report is read at call time, so they
+    describe the same value only for as long as the environment does not change
+    under the process. That is the normal case, and the difference is the point:
+    the report is the one that can still be right if it ever stops being true.
+    """
+    return raw.lower() == "true"
+
+
 # Environment flag, read once at import. It is per-DEPLOYMENT and
 # all-or-nothing: this line is the only gate, and the check in `_execute` is the
 # only place it is consulted.
@@ -96,7 +132,125 @@ _audit_logger = logging.getLogger("tallyfy_api_call_audit")
 # appeared exactly once under `server/`, in this comment. So it described a
 # per-org warm-up that does not exist, to the one audience (an operator) who
 # would act on it.
-_ENABLED = os.getenv("MCP_ENABLE_API_FALLBACK", "false").lower() == "true"
+_ENABLED = _value_enables_fallback(os.getenv(FALLBACK_FLAG_ENV, "false"))
+
+
+def fallback_flag_state() -> str:
+    """Read the flag from the LIVE process environment, at CALL time.
+
+    ⚠️ This is deliberately NOT `_ENABLED`. That constant is read once at
+    import and is a boolean, so it can answer "will the gate refuse" and
+    nothing else. This answers the question an operator and an auditor
+    actually have, which is "what is THIS deployment configured to do", and it
+    reads `os.environ` when asked so a report cannot be a stale snapshot.
+
+    **Four states, and the two extra ones are the whole point.** Collapsing
+    them into a boolean is what made the claim this function exists to replace
+    unfalsifiable:
+
+    ``enabled``
+        Set to a value the gate accepts. The escape hatch is live here.
+    ``disabled``
+        Set, to something that is not ``true``. Somebody configured it off.
+        A set-but-empty value lands here, which is correct: it is what the
+        gate does with it. That shape has bitten this repo twice already
+        (``MCP_ENFORCE_JWT_AUDIENCE=""`` and ``MCP_TOOL_SCOPE_ENFORCEMENT=""``),
+        so it must be distinguishable from a variable nobody set.
+    ``unset``
+        Genuinely absent. The gate refuses, because ``false`` is the default,
+        but NOBODY CHOSE THAT, and the two are different facts. This is the
+        normal state of a fresh self-hosted container: ``README.public.md``
+        says the server needs no configuration to start.
+    ``unreadable``
+        The environment could not be read at all. Reported as its own state
+        and never as ``disabled``, because "off" and "could not tell" are
+        different answers and only one of them is evidence.
+
+    Returns
+    -------
+    str
+        One of ``FALLBACK_FLAG_STATES``.
+    """
+    try:
+        raw = os.environ.get(FALLBACK_FLAG_ENV)
+    except Exception:
+        # Exercised by rebinding this module's ``os`` to a stub whose
+        # ``environ.get`` raises, in
+        # tests/unit/server/tools/test_api_fallback_flag_state.py. Reading a
+        # mapping in-process is not otherwise expected to fail. The branch
+        # exists so that a read which DOES fail can never render as "off":
+        # a check that reports "off" when it means "could not tell" is the
+        # defect this whole function replaces, one layer down.
+        return FLAG_UNREADABLE
+
+    if raw is None:
+        return FLAG_UNSET
+    return FLAG_ENABLED if _value_enables_fallback(raw) else FLAG_DISABLED
+
+
+def report_fallback_flag_state(log: Optional[logging.Logger] = None) -> str:
+    """Announce the live flag value into the server's own log, at startup.
+
+    Called once from `server.py`'s ASGI lifespan, so it runs ON the deployed
+    server and reads the environment that server was actually given.
+
+    **Why the log and not the public `/health` response.** The operator half of
+    this flag already goes to `logger.warning` in `_execute` (see the note
+    there), and the module docstring records why the variable name is kept out
+    of anything a customer sees. `/health` is unauthenticated on
+    `mcp.tallyfy.com` and its own docstring states that nothing
+    configuration-shaped may be added to it; publishing "the universal API
+    escape hatch is live here" to any anonymous caller is a new disclosure
+    rather than a reporting channel. The log reaches exactly the audience that
+    can act on it and nobody else.
+
+    **What this can and cannot tell you.** It reports the environment of the
+    process it runs in. It is not, and cannot be, a repo-side assertion about
+    what any OTHER deployment is set to: the deploy excludes the env files by
+    design, so nothing in this repository can answer that question. Reading a
+    given environment means reading it there, with
+    ``docker exec <container> printenv MCP_ENABLE_API_FALLBACK`` plus its rc
+    controls.
+
+    Returns
+    -------
+    str
+        The state it reported, so a caller (or a test) can assert on it.
+    """
+    log = log or logger
+    state = fallback_flag_state()
+
+    if state == FLAG_ENABLED:
+        log.warning(
+            "%s=true on this deployment: tallyfy_api_read and tallyfy_api_write "
+            "are LIVE, so the model can reach any Tallyfy endpoint the caller's "
+            "scopes allow. Spec validation, the path block-list, the scope gate "
+            "and write audit logging all still apply.",
+            FALLBACK_FLAG_ENV,
+        )
+    elif state == FLAG_DISABLED:
+        log.info(
+            "%s is set to a value other than 'true' on this deployment: the API "
+            "fallback tools are registered but refuse every call.",
+            FALLBACK_FLAG_ENV,
+        )
+    elif state == FLAG_UNSET:
+        log.info(
+            "%s is not set on this deployment, so the API fallback tools take "
+            "their default and refuse every call. Not set is reported separately "
+            "from set-to-false on purpose: only one of them is a choice somebody "
+            "made.",
+            FALLBACK_FLAG_ENV,
+        )
+    else:
+        log.error(
+            "%s could not be read from this process environment. This is NOT a "
+            "report that the API fallback is off; it is a report that the value "
+            "is unknown here.",
+            FALLBACK_FLAG_ENV,
+        )
+
+    return state
 
 
 # Deliberately split. Never merge these back into one union on one tool:
@@ -254,9 +408,21 @@ async def _execute(
     # ``scope`` / ``scp`` claims -- and a Tallyfy MCP token carries neither, so
     # it returned ``()`` for every real caller and the fail-closed branch denied
     # EVERY write to a path in ``_WRITE_SCOPE_RULES``, including from a token
-    # that genuinely held the required scope. It was invisible because
-    # MCP_ENABLE_API_FALLBACK is off in every deployment and because it failed
-    # toward "denied", which is the safe half.
+    # that genuinely held the required scope. It was invisible because it failed
+    # toward "denied", which is the safe half, and because on most deployments
+    # nothing reaches this line at all: the flag above is off by default, so the
+    # refusal in ``_execute`` returns first.
+    #
+    # ⚠️ That is "most", not "every", and the difference is #1009. This comment
+    # used to assert a single universal value for the flag. There is no such
+    # value: it is a PER-DEPLOYMENT setting, it differs between deployments, and
+    # at the time of writing it is on in at least one of Tallyfy's own. Whoever
+    # runs the deployment decides: Tallyfy support on Tallyfy's hosted service,
+    # or the operator of the server if it is self-hosted. Nothing in this
+    # repository can tell you what a given environment is set to -- the deploy
+    # excludes the env files on purpose -- so read it there with
+    # ``docker exec <container> printenv MCP_ENABLE_API_FALLBACK``, or from the
+    # startup line ``report_fallback_flag_state`` writes on the server itself.
     #
     # ``get_mcp_scopes()`` returns ``None`` for a token with no such claim, and
     # ``check`` treats that as ungated -- deliberately matching #853's tool-name
