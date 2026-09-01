@@ -277,6 +277,16 @@ API_DURATION_BUCKETS = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 # `tool_name`, which carries ~79 distinct values, and no member may ever be
 # derived from message text or from anything a caller supplies -- otherwise a
 # single request could mint unbounded Prometheus time series.
+#
+# `payload_rejected` AND `upstream_unavailable` BOTH ARRIVE WITH NO HTTP STATUS
+# AND MEAN OPPOSITE THINGS, which is exactly why they are two members rather
+# than one. `upstream_unavailable` is "Tallyfy could not be reached", the only
+# signal an operator has that the API is down. `payload_rejected` is "the SDK
+# refused the arguments before opening a socket", which says nothing at all
+# about Tallyfy's health. Folding the second into the first would let a model
+# mistyping a field name look, on the dashboard, exactly like an outage. They
+# are told apart by EXCEPTION TYPE, never by the absent status. See #835 and
+# `utils/fastmcp_errors.is_preflight_payload_error`.
 TOOL_ERROR_CLASS_ATTR = "_tallyfy_error_class"
 
 TOOL_ERROR_CLASSES: FrozenSet[str] = frozenset({
@@ -289,6 +299,7 @@ TOOL_ERROR_CLASSES: FrozenSet[str] = frozenset({
     "client_error",          # any other upstream 4xx
     "upstream_error",        # upstream 5xx
     "upstream_unavailable",  # TallyfyError with no int status: retries exhausted
+    "payload_rejected",      # the SDK refused the payload BEFORE any request
     "internal_error",        # an unexpected exception inside the tool body
     "tool_rejected",         # the tool's own code raised ToolError
     "unknown",               # nothing above applied
@@ -515,6 +526,12 @@ processes track each real-world instance of it; tasks are the steps people
 complete. You have {tool_count} tools acting as the signed-in user, who sees only
 their own organization.
 
+Tool search returns few matches, so search by CATEGORY name, not a bare noun
+like "template": Template Management, Process Management, Task Management,
+Form Fields, Automation, Search, User Management, Group Management,
+Comment Management, Tag Management, Folder Management, User Interaction,
+Template Mapping Validation, Org Memory, Universal API Fallback.
+
 ## The mental model (get the object right first)
 
 - A TEMPLATE is the reusable recipe (steps, form fields, rules). Built once, launched many times.
@@ -627,8 +644,7 @@ them correct it. Never store credentials or conversation history there.
 
 ## Technical
 
-{tool_count} tools (static list). Resources supported; prompts, logging,
-completions and tasks are not. OAuth 2.1 with a Tallyfy-issued JWT (RS256) on
-every request. Responses cap at 25KB (auto-compacted). Docs and help:
+Protocol, auth, scopes, per-category tool counts and the 25KB response cap: read
+the tallyfy://capabilities resource. Docs and help:
 https://tallyfy.com/products/pro/integrations/mcp-server/
 """

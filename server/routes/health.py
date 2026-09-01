@@ -19,32 +19,49 @@ That is not a small gap, because it is the signal everything else trusted:
   "Health endpoints cannot distinguish 'deployed' from 'never restarted';
   version-stamp the running container instead."
 
-⚠️ **THAT BUILD STAMP IS DELIBERATELY NOT IN THIS RESPONSE, and putting it back
-is a decision rather than an improvement.** A ``releaseId`` field carrying
-``MCP_GIT_SHA`` was written here and removed before shipping. Both deploy
-workflows read the same value over ssh instead
-(``docker exec <container> printenv MCP_GIT_SHA``), which detects a stale
-container exactly as well because they are already on the droplet.
+✅ **THAT DECISION WAS REVERSED BY #998 ON 2026-08-25, AND THE BUILD STAMP IS
+BACK. Do not restore the old wording from a stale copy; read both halves.** From
+2026-08-23 this docstring said the opposite, and it was correct for its date: a
+``releaseId`` field carrying ``MCP_GIT_SHA`` had been written here and removed
+before shipping, on the grounds that ``server/`` is mirrored to the PUBLIC repo
+``tallyfy/mcp-public``, so publishing the running commit beside public source
+names precisely which patches an environment is missing. Production SHAs are
+already public in the mirror's own commit messages (``Sync from production
+<7 chars>``); STAGING's were not, and staging runs ahead of production, so a
+staging stamp is a preview of unreleased fixes. That argument is unchanged and
+is the real cost of this endpoint's new answer.
 
-The reason is where this response goes. ``server/`` is mirrored to the PUBLIC
-repo ``tallyfy/mcp-public``, so the full source of this server is readable by
-anyone, and this endpoint needs no credential. Publishing the running commit
-beside public source states precisely which patches an environment is missing,
-and lets anyone watch in real time how long production stays unpatched after a
-fix lands. Production SHAs are ALREADY public in the mirror's own commit
-messages (``Sync from production <7 chars>``), so the marginal disclosure there
-is small -- but the mirror syncs on ``production`` only, so STAGING's commit
-would have been newly published, and staging runs ahead of production. That is
-a preview of unreleased fixes.
+**What outweighed it, per #998.** Reading the stamp over ssh
+(``docker exec <container> printenv MCP_GIT_SHA``) works only for the two deploy
+workflows, because they are already on the droplet. Nobody else can run it. So a
+deploy was unverifiable from CI, from a dashboard, from an alert, and from an
+incident: during the 2026-08-24 connector investigation the only way to
+establish which code was live was to ssh to the droplet and read a source file
+inside a container. The same response also could not say WHICH environment you
+had reached, so a probe accidentally pointed at the wrong host answered
+confidently and wrongly. Both environments returned a byte-identical 289 bytes.
+
+**What is still withheld, so the reversal stays narrow.** ``/ready`` is
+unchanged: a load balancer needs the verdict, not the build. Nothing
+configuration-shaped is added -- ``environment`` is clamped to a fixed
+four-value enum before it is rendered, so an operator who puts a URL or a
+hostname in ``TALLYFY_ENVIRONMENT`` gets ``unknown`` rather than a leak, and
+``releaseId`` is emitted only when the value is SHAPED like a git object name.
+Everything the "NOT REPORTED" warning below forbids is still forbidden.
 
 Format. The MCP specification defines NO health endpoint: its liveness
 mechanism is the JSON-RPC ``ping`` utility, and readiness is really the
 ``initialize`` handshake. So an HTTP health endpoint is a DEPLOYMENT
 convention, and the convention followed here is IETF
 draft-inadarei-api-health-check-06 (`application/health+json`): a top-level
-`status`, plus optional `version`, `serviceId` and a `checks` object keyed
-``component:measurement``. The draft's optional ``releaseId`` is deliberately
-NOT emitted; see the warning above.
+`status`, plus optional `version`, `serviceId`, ``releaseId`` and a `checks`
+object keyed ``component:measurement``.
+
+``version`` is the package version and does not move on a deploy, so it cannot
+tell two builds of one release apart; ``releaseId`` is the running commit and is
+the field that can. ``environment`` is NOT in the draft at all -- it is a local
+extension, because the draft has no field for "which deployment am I" and the
+two hosts are otherwise indistinguishable from outside the container.
 
 ⚠️ ONE DELIBERATE DEVIATION from that draft: it specifies the status vocabulary
 `pass` / `warn` / `fail`, and this returns `healthy` / `degraded` / `unhealthy`
@@ -72,16 +89,78 @@ not on a public liveness probe.
 
 import logging
 import os
+import re
 from typing import Any, Dict, Tuple
 
 from starlette.responses import JSONResponse
 
 from constants import SERVER_VERSION
+from durable_event_log import _environment as _raw_environment
 
 logger = logging.getLogger(__name__)
 
 HEALTH_MEDIA_TYPE = "application/health+json"
 SERVICE_ID = "tallyfy-mcp-server"
+
+# Both of the values below are ABSENT-vs-UNKNOWN sentinels, not decoration
+# (#998 criterion 3). A caller has to be able to tell "this build carries no
+# SHA" from "this is an older build of the endpoint that has no such field",
+# and a field that disappears when unset destroys exactly that distinction:
+# absent reads as the old shape. So the key is always present.
+BUILD_SHA_UNKNOWN = "unknown"
+ENVIRONMENT_UNKNOWN = "unknown"
+
+# A git object name and nothing else. This is a FAIL-CLOSED SHAPE GATE, not
+# validation for its own sake: `MCP_GIT_SHA` is set by the deploy shell, and if
+# somebody ever exports a branch name, a URL or a path into it, that string
+# would otherwise be published verbatim on a public unauthenticated endpoint.
+# Anything not shaped like a SHA is reported as unknown.
+#
+# The upper bound is 64, not 40, ON PURPOSE. `MCP_GIT_SHA` is `github.sha`,
+# which is a 40-hex SHA-1 name today, but a git object name under SHA-256 is
+# 64. A bound of 40 would clamp a correct value to "unknown" on the day that
+# changed, and it would do it SILENTLY and in the safe direction, so nothing
+# would go red and the field would simply stop answering. Widening costs
+# nothing: the constraint that matters is "hex, no separators", which is what
+# keeps a branch name, a path or a URL out of a public response.
+_SHA_RE = re.compile(r"\A[0-9a-f]{7,64}\Z")
+
+# The environment label is a CLOSED ENUM for the same reason. Everything in this
+# response is a boolean, a count or a fixed enum (see the warning below), and an
+# env var read straight through would be the first value here an operator could
+# turn into a leak without touching this file.
+ENVIRONMENTS = ("production", "staging", "development")
+
+
+def _build_sha() -> str:
+    """The running build's commit, or an explicit unknown.
+
+    Sourced from ``MCP_GIT_SHA`` ONLY. It deliberately does not fall back to
+    ``SENTRY_RELEASE`` the way ``constants._resolve_sentry_release`` does:
+    that value lives in the droplet's env file, nobody edits it, and both MCP
+    Sentry projects carried a stale ``*@1.2.0`` across dozens of deploys. A
+    fallback that cannot move per deploy would make this field answer "yes I
+    know the build" while naming the wrong one, which is worse than unknown.
+    """
+    sha = (os.getenv("MCP_GIT_SHA") or "").strip().lower()
+    return sha if _SHA_RE.match(sha) else BUILD_SHA_UNKNOWN
+
+
+def _environment_label() -> str:
+    """Which deployment this process is, as a fixed enum.
+
+    The resolution ORDER is not ours and must not be re-derived here: it is
+    ``durable_event_log._environment``, whose comment records the droplet
+    measurement behind it (the server containers carry ``TALLYFY_ENVIRONMENT``
+    with ``ENVIRONMENT`` unset, and the host is the other way round). Importing
+    it rather than copying the tuple is deliberate -- two copies of a three-name
+    precedence list drift, and the drift is silent in both directions.
+
+    What IS ours is the clamp. That helper returns whatever the variable holds;
+    this endpoint is public, so an unrecognised value becomes ``unknown``.
+    """
+    label = (_raw_environment() or "").strip().lower()
+    return label if label in ENVIRONMENTS else ENVIRONMENT_UNKNOWN
 
 # draft-inadarei per-check vocabulary. The top-level vocabulary differs on
 # purpose; see the module docstring.
@@ -199,9 +278,14 @@ def register_health_routes(mcp):
         status, checks, http_status = await _evaluate(mcp)
         return JSONResponse(
             {
+                # `status` and `checks` keep their exact pre-#998 shape, so
+                # anything already reading this endpoint is unaffected. The two
+                # new keys are additive.
                 "status": status,
                 "serviceId": SERVICE_ID,
                 "version": SERVER_VERSION,
+                "releaseId": _build_sha(),
+                "environment": _environment_label(),
                 "checks": checks,
             },
             status_code=http_status,

@@ -68,6 +68,43 @@ events carry the real ``org_id`` (from the verified JWT context, falling back to
 the ``org_id`` tool argument) and the real ``user_id`` (the JWT ``sub``), because
 "which customer did this happen to" is the first question anyone asks.
 
+Claimed is not verified, and an auth failure has nothing verified (#996)
+-----------------------------------------------------------------------
+A 401 is exactly the request whose credential was NOT accepted, so it has no
+verified identity by construction. Storing the organization it NAMED in the
+``org_id`` column reads as though the caller proved it, and that misreading has
+already cost a session: on 2026-08-24 an investigation was opened into an outage
+for ``49b796c6b1e422181141ab801bfeb8bd``, an organization with zero rows in the
+production database, because 39 rows attributed to it outranked the 3 rows of the
+only real customer in the data.
+
+So on ``mcp_auth_failure`` this module blanks the top-level ``org_id`` and puts
+the caller's claim in ``details.claimed_org_id`` instead. The demotion happens
+HERE rather than at the call site, for the same reason tool arguments are
+excluded by the ``emit`` signature: a rule a call site has to remember is a rule
+a new call site will forget.
+
+``details.org_id_source`` then names where the claim came from, or why there is
+none, from the closed vocabulary in :data:`ORG_ID_SOURCES`. Every row carries it,
+so "95.8 percent of these rows name nobody" becomes a question the data answers
+rather than one it poses.
+
+``details.transport`` names how the credential arrived - ``oauth`` for a brokered
+MCP token, ``direct`` for a raw Tallyfy session token - derived by the server from
+the presented credential. It is NOT ``details.client_type``, which is whatever
+free text the caller put in ``X-Client-Type`` and which is therefore evidence
+about the caller's manners rather than about the transport.
+
+``details.synthetic`` is true when the caller declared itself test traffic with
+:data:`SYNTHETIC_HEADER`. A harness that fires authentication negative controls
+at this server **should** set it, which is the wording ``CLAUDE.md`` uses, and
+then a verification run cannot be mistaken for a customer. No harness sets it
+today - measured 2026-08-31 on ``origin/develop``, the only sender of the header
+in this repository is a test - so until one is labelled the ``environment``
+filter is doing the whole job. It is a declaration, not a detection: an
+unlabelled harness still needs that filter, which is why the documented triage
+query in ``scripts/auth_failure_triage.py`` applies both.
+
 Failure of this module is NOT silent
 ------------------------------------
 A POST that fails bumps ``mcp_server_event_log_total{status="fail"}`` **and**
@@ -126,6 +163,63 @@ _CATEGORY_BY_EVENT = {
 #: and not the other would either be rejected at emit or raise a KeyError while
 #: building the payload.
 EVENT_TYPES = frozenset(_CATEGORY_BY_EVENT)
+
+#: How the credential reached this server, derived by the SERVER from what was
+#: presented, never from a caller-supplied header (#996 AC2).
+#:
+#: The discriminator is the ``mcp_scopes`` claim, and it is the same one
+#: ``utils.auth_context.get_mcp_scopes`` already documents at length: a token
+#: minted by ``McpAccessTokenService::issue`` carries it, and a raw Tallyfy
+#: session token forwarded by chat.tallyfy.com or the desktop AI shell does not.
+TRANSPORT_OAUTH = "oauth"
+TRANSPORT_DIRECT = "direct"
+TRANSPORT_NONE = "none"
+TRANSPORT_UNKNOWN = "unknown"
+
+#: Closed vocabulary. A value outside it is still stored, because a telemetry
+#: module must not drop a row over a label, but nothing in the estate should
+#: produce one.
+TRANSPORTS = frozenset(
+    {TRANSPORT_OAUTH, TRANSPORT_DIRECT, TRANSPORT_NONE, TRANSPORT_UNKNOWN}
+)
+
+#: Where the organization on this row came from, or why there is none (#996 AC1).
+#: The three ``none_*`` members are the "should say why" half: a row naming no
+#: organization is a real answer only if it says which kind of nothing it is.
+ORG_SOURCE_VERIFIED_TOKEN = "verified_token"
+ORG_SOURCE_TOKEN_CLAIM = "token_claim"
+ORG_SOURCE_HEADER = "header"
+ORG_SOURCE_TOOL_ARGUMENT = "tool_argument"
+ORG_SOURCE_SESSION_STORE = "session_store"
+ORG_SOURCE_NONE_NO_BEARER = "none_no_bearer"
+ORG_SOURCE_NONE_UNPARSABLE_BEARER = "none_unparsable_bearer"
+ORG_SOURCE_NONE_NO_ORG_CLAIM = "none_no_org_claim"
+ORG_SOURCE_UNSPECIFIED = "unspecified"
+
+ORG_ID_SOURCES = frozenset(
+    {
+        ORG_SOURCE_VERIFIED_TOKEN,
+        ORG_SOURCE_TOKEN_CLAIM,
+        ORG_SOURCE_HEADER,
+        ORG_SOURCE_TOOL_ARGUMENT,
+        ORG_SOURCE_SESSION_STORE,
+        ORG_SOURCE_NONE_NO_BEARER,
+        ORG_SOURCE_NONE_UNPARSABLE_BEARER,
+        ORG_SOURCE_NONE_NO_ORG_CLAIM,
+        ORG_SOURCE_UNSPECIFIED,
+    }
+)
+
+#: The one way a caller declares itself test traffic. A dedicated header rather
+#: than a convention inside ``X-Client-Type``: the #890 verification harness was
+#: identifiable only because somebody happened to set a custom client type by
+#: hand, and "identifiable by luck" is what #996 exists to remove.
+SYNTHETIC_HEADER = "x-tallyfy-synthetic"
+
+#: Values of :data:`SYNTHETIC_HEADER` that mean yes. Anything else, including the
+#: header being absent, means no - so the failure direction is "treated as real
+#: customer traffic", which is the direction that gets looked at.
+SYNTHETIC_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 DEFAULT_HTTP_TIMEOUT_S = 3.0
 DEFAULT_MAX_QUEUE_SIZE = 500
@@ -192,6 +286,17 @@ def session_ref(session_id: Optional[str]) -> str:
         return hashlib.sha256(str(session_id).encode("utf-8")).hexdigest()[:16]
     except Exception:  # pragma: no cover - encode() on an exotic object
         return ""
+
+
+def _clean_org(value: Optional[str]) -> str:
+    """Normalise an organization id, treating the display placeholder as absent.
+
+    ``unknown`` is what ``request_logging`` prints when it has no organization.
+    It is not an organization, and storing it would make an unattributable row
+    look attributable to a company literally named "unknown".
+    """
+    org = (value or "").strip()
+    return "" if org in ("", "unknown") else org
 
 
 def _ingest_url() -> str:
@@ -281,8 +386,18 @@ class ServerEventLog:
         session_id: Optional[str] = None,
         client_type: Optional[str] = None,
         mcp_method: Optional[str] = None,
+        claimed_org_id: Optional[str] = None,
+        org_id_source: Optional[str] = None,
+        transport: Optional[str] = None,
+        synthetic: bool = False,
     ) -> None:
-        """Queue one failure event. Sync, non-blocking, never raises."""
+        """Queue one failure event. Sync, non-blocking, never raises.
+
+        ``org_id`` is the organization the request RESOLVED. ``claimed_org_id``
+        is the organization the caller NAMED. On ``mcp_auth_failure`` the two
+        collapse into the second one, because nothing authenticated - see
+        :meth:`_build`.
+        """
         try:
             if event not in EVENT_TYPES:
                 # A name outside the vocabulary would land as a row no dashboard
@@ -304,6 +419,10 @@ class ServerEventLog:
                 session_id=session_id,
                 client_type=client_type,
                 mcp_method=mcp_method,
+                claimed_org_id=claimed_org_id,
+                org_id_source=org_id_source,
+                transport=transport,
+                synthetic=synthetic,
             )
             self._append(payload)
             self._ensure_worker()
@@ -323,12 +442,28 @@ class ServerEventLog:
         session_id: Optional[str],
         client_type: Optional[str],
         mcp_method: Optional[str],
+        claimed_org_id: Optional[str] = None,
+        org_id_source: Optional[str] = None,
+        transport: Optional[str] = None,
+        synthetic: bool = False,
     ) -> Dict[str, Any]:
-        # `unknown` is what the middleware uses as its display placeholder. It
-        # is not an org, and storing it would make an unattributable row look
-        # attributable to an org literally named "unknown".
-        org = (org_id or "").strip()
-        if org in ("", "unknown"):
+        org = _clean_org(org_id)
+        # The claim defaults to whatever the request resolved: on every event
+        # except an auth failure those are the same organization, and saying so
+        # explicitly means one predicate reads every row rather than two.
+        claimed = _clean_org(claimed_org_id) or org
+
+        # 🔴 THE ONE INVARIANT (#996). A 401 or 403 on the MCP transport is a
+        # request whose credential this server did NOT accept, so there is no
+        # verified identity on it and the `org_id` column must stay empty. The
+        # organization the caller named survives in `claimed_org_id`, where its
+        # name says what it is worth.
+        #
+        # Enforced here rather than at the call site on purpose. `emit` has
+        # exactly one caller today (middleware/request_logging.py) and will have
+        # more, and a rule each of them has to remember is a rule one of them
+        # will not.
+        if event == EVENT_AUTH_FAILURE:
             org = ""
 
         details: Dict[str, Any] = {
@@ -336,13 +471,23 @@ class ServerEventLog:
             "mcp_method": mcp_method or None,
             "status_code": status_code,
             "duration_ms": duration_ms,
+            # Free text from X-Client-Type. Kept because it is occasionally the
+            # only fingerprint on a row, and deliberately NOT read as the
+            # transport: the caller chooses it.
             "client_type": client_type or None,
+            "transport": (transport or TRANSPORT_UNKNOWN),
+            "claimed_org_id": claimed or None,
+            # Always present, so "this row names nobody" is a statement with a
+            # reason attached rather than a silence.
+            "org_id_source": (org_id_source or ORG_SOURCE_UNSPECIFIED),
             # Groups the calls of one connector conversation, which is how you
             # find the rest of a customer's failing session. Hashed, never raw -
             # see session_ref().
             "session_ref": session_ref(session_id) or None,
             "error_message": redact(error_message) or None,
         }
+        if synthetic:
+            details["synthetic"] = True
         return {
             "event": event,
             "timestamp": _now_rfc3339(),
@@ -521,4 +666,21 @@ __all__ = [
     "EVENT_AUTH_FAILURE",
     "EVENT_UPSTREAM_REJECTED",
     "DEFAULT_INGEST_URL",
+    "TRANSPORT_OAUTH",
+    "TRANSPORT_DIRECT",
+    "TRANSPORT_NONE",
+    "TRANSPORT_UNKNOWN",
+    "TRANSPORTS",
+    "ORG_ID_SOURCES",
+    "ORG_SOURCE_VERIFIED_TOKEN",
+    "ORG_SOURCE_TOKEN_CLAIM",
+    "ORG_SOURCE_HEADER",
+    "ORG_SOURCE_TOOL_ARGUMENT",
+    "ORG_SOURCE_SESSION_STORE",
+    "ORG_SOURCE_NONE_NO_BEARER",
+    "ORG_SOURCE_NONE_UNPARSABLE_BEARER",
+    "ORG_SOURCE_NONE_NO_ORG_CLAIM",
+    "ORG_SOURCE_UNSPECIFIED",
+    "SYNTHETIC_HEADER",
+    "SYNTHETIC_TRUTHY",
 ]

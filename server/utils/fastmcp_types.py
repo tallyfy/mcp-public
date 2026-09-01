@@ -409,6 +409,34 @@ OptionalBool = Annotated[Optional[bool], Field(
     description="Optional boolean parameter"
 )]
 
+# `top_secret` was an OptionalBool, which publishes the schema entry "Optional
+# boolean parameter" and says nothing at all. #585 asked for two things: that the
+# written value be readable back, and that the flag have a documented purpose.
+# The read half is done (`_task_after_write` echoes it, and TaskTransformer emits
+# it on every task read); this is the half a read path cannot fix, because a model
+# handed a bare boolean has no way to know what setting it does.
+#
+# The behaviour is read from api-v2 `app/Scopes/SecretTaskScope.php`, not from a
+# doc page: the scope returns early for an org admin, and for everyone else
+# restricts the query to `top_secret = false` OR the caller being one of the
+# task's owners.
+#
+# It lives here rather than in either tool description for two reasons. A
+# parameter description is published in the JSON schema and does NOT count against
+# the 2000-BYTE tool-description cap, and `update_standalone_task` sits at 1917
+# bytes with 83 to spare while `update_task` sits at 1964 with 36. And
+# `update_task` takes the identical flag, so one shared type is the only shape
+# these two cannot drift apart in (rule 16).
+TopSecretFlag = Annotated[Optional[bool], Field(
+    description=(
+        "Restrict who can see this task. true hides it from every member of the "
+        "organization EXCEPT its assignees and organization admins; false makes it "
+        "visible to the organization as usual. Omit to leave the current setting "
+        "alone. Read the stored value back with get_task or get_standalone_task, "
+        "which return top_secret on every task."
+    )
+)]
+
 # List types for bulk operations
 UserIdList = Annotated[Optional[List[int]], Field(
     description="List of user IDs for bulk operations",

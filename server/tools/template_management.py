@@ -5,7 +5,7 @@ Tools for managing templates, steps, and template health
 
 import logging
 import re
-from typing import Any
+from typing import Any, Dict
 
 from email_validator import validate_email, EmailNotValidError
 from fastmcp.exceptions import ToolError
@@ -29,6 +29,7 @@ from utils.fastmcp_types import (
 )
 from utils.sdk_serializer import (
     serialize_dataclass,
+    unwrap_fractal,
     compact_result,
     compact_dict_list_field,
     window_longest_text,
@@ -399,6 +400,77 @@ def _resolve_template_name(sdk, org_id: str, template_name: str) -> str:
         )
 
 
+# The includes this server asks for on a whole-template read. Seeded from the
+# list `sdk.templates.get_template` sends, because that list was already correct
+# and api-v2 honours all four.
+#
+# The two do NOT have to stay in step, and it would be wrong to add a guard
+# saying they must: `get_template` no longer calls the SDK method, so this
+# constant is the authority for what goes on the wire and the SDK's copy governs
+# nothing on this path. `assess_template_health` still uses the SDK method and
+# therefore still gets the SDK's list, which is fine because it reads a
+# template's shape rather than its tags.
+_TEMPLATE_INCLUDES = "steps,automated_actions,prerun,tags"
+
+
+def _get_template_raw(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
+    """GET a template with its includes, and KEEP the ones the SDK model drops.
+
+    Deliberately not routed through `sdk.templates.get_template`. That method
+    already puts `?with=steps,automated_actions,prerun,tags` on the wire and
+    api-v2 does return the tags: `ChecklistTransformer` lists `tags` in
+    `$availableIncludes` and `includeTags` emits them through
+    `TagChecklistTransformer`. The value then disappears, because
+    `tallyfy.models.Template` declares 43 fields and none of them is `tags`, so
+    `Template.from_dict()` copies what it knows and drops the rest.
+
+    Measured 2026-09-01 against the pinned SDK: the three tag-ish attributes the
+    model DOES declare are `industry_tags`, `topic_tags` and `tag_process`, none
+    of which is the organization tag set that `tag_template` writes. So a tag
+    written by `tag_template` was unreadable by every read tool in this server,
+    which is issue #596: the write returns success and nothing can confirm it.
+
+    This is the same failure class, and the same remedy, as
+    `task_management._get_task_with_form_fields` (rule 24 in the repo
+    CLAUDE.md): the request parameter lands, the value never arrives, and
+    nothing errors. Asserting that the include was requested does NOT prove it
+    comes back, so the tests for this assert on the returned payload.
+
+    `steps` and `prerun` are unwrapped alongside `tags` because Fractal wraps
+    every include the same way; `steps` in particular must stay a plain list or
+    `compact_dict_list_field` cannot trim an oversize template.
+    """
+    response = sdk._make_request(
+        "GET",
+        f"organizations/{org_id}/checklists/{template_id}",
+        params={"with": _TEMPLATE_INCLUDES},
+    )
+    raw = unwrap_fractal(
+        response, ("steps", "tags", "automated_actions", "prerun")
+    )
+    if not raw:
+        return {}
+
+    content = serialize_dataclass(raw)
+    tags = raw.get("tags")
+    if isinstance(tags, list):
+        # Re-attached AFTER serialisation, and unconditionally, because
+        # `serialize_dataclass` strips an empty list. Surfacing the include is
+        # only half of #596: a template with no tags would otherwise have no
+        # `tags` key, which is byte-identical to the field not being surfaced at
+        # all, so `untag_template` stays unverifiable while `tag_template`
+        # becomes verifiable. Measured live on the test org 2026-09-01 against
+        # this function without these four lines: after `tag_template` the key
+        # was present, and after `untag_template` it was gone.
+        #
+        # Compaction strips exactly the values that answer "no": a null
+        # `disabled_at` on an enabled guest, an empty `tags` on an untagged
+        # template. Whenever a read is added so a write can be verified, ask
+        # what it looks like when the answer is no.
+        content["tags"] = tags
+    return content
+
+
 def _normalize_step_payload(step_data: dict, valid_keys, rejected_keys) -> dict:
     """Map caller-friendly aliases onto api-v2's field names and reject the rest.
 
@@ -693,9 +765,9 @@ get_template_steps(step_id=..., full_text=True).""",
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             if template_name.strip():
                 resolved_id = _resolve_template_name(sdk, org_id, template_name.strip())
-                template = sdk.templates.get_template(org_id, template_id=resolved_id)
             else:
-                template = sdk.templates.get_template(org_id, template_id=template_id.strip())
+                resolved_id = template_id.strip()
+            template = _get_template_raw(sdk, org_id, resolved_id)
             if not template:
                 return ToolResult(content={}, structured_content=None)
             # Whole-template reads have no size control of their own: compact_result
@@ -704,7 +776,7 @@ get_template_steps(step_id=..., full_text=True).""",
             # instead of being handed over the 25KB ceiling silently.
             return ToolResult(
                 content=compact_dict_list_field(
-                    serialize_dataclass(template), "steps", item_label="steps"
+                    template, "steps", item_label="steps"
                 ),
                 structured_content=None
             )

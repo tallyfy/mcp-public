@@ -17,7 +17,7 @@ for tool chaining.
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from dataclasses import fields, is_dataclass
 
 from utils.response_sanitizer import sanitize_for_user_text
@@ -163,6 +163,53 @@ def serialize_dataclass(
     if _sanitize:
         return sanitize_for_user_text(serialized)
     return serialized
+
+
+def unwrap_fractal(response: Any, includes: Iterable[str] = ()) -> Dict[str, Any]:
+    """Unwrap a RAW api-v2 body and its named Fractal includes, keeping every key.
+
+    This is the shape half of the "read the raw body, not the SDK dataclass"
+    pattern. It does no serialising: the caller decides which serialiser to
+    apply, because a task strips noise fields a template does not.
+
+    **Why raw bodies are read at all.** Every list model in ``tallyfy.models``
+    is a fixed allowlist. ``Model.from_dict`` copies the attributes it declares
+    and drops the rest of the body on the floor, with no error and no log line.
+    Measured 2026-09-01 against the pinned SDK: ``Task`` declares 43 fields and
+    none of them is ``summary``, ``original_summary`` or ``top_secret``;
+    ``Template`` declares 43 and none of them is ``tags``; ``GuestDetails``
+    reads ``disabled_on``, a key the guest route has never emitted (it exists
+    on the organization-members pivot, a different resource), while the key that
+    actually carries a guest's live state is ``disabled_at``. So a field can be
+    requested on the wire, returned by api-v2, and still never reach the caller.
+    That is `tallyfy/sdk#33`, and until it ships this is the way round it.
+
+    Two envelope shapes are handled, both seen in real responses:
+
+    * the outer Fractal envelope, ``{"data": {...}}``, unwrapped to the object;
+    * a named include, which arrives Fractal-wrapped a SECOND time as
+      ``{"tags": {"data": [...]}}``, unwrapped to a plain list so callers do
+      not each have to know that api-v2 double-wraps an include.
+
+    An include that is absent is left absent rather than materialised as ``[]``,
+    because "not requested" and "requested and empty" are different answers and
+    a caller verifying a write needs to tell them apart.
+
+    Anything that is not a dict yields ``{}``, matching the established
+    sentinel: ``ToolResult`` requires non-None content and an empty payload is
+    how this server says "nothing came back".
+    """
+    raw = response.get("data", response) if isinstance(response, dict) else response
+    if not isinstance(raw, dict):
+        return {}
+
+    raw = dict(raw)
+    for key in includes:
+        wrapped = raw.get(key)
+        if isinstance(wrapped, dict) and "data" in wrapped:
+            raw[key] = wrapped.get("data") or []
+
+    return raw
 
 
 def compact_dict_list_field(

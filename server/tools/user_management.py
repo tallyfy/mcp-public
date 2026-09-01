@@ -3,11 +3,13 @@ User Management Tools
 Tools for managing organization users
 """
 
-from typing import List, Optional
+import logging
+from typing import Any, Dict, List, Optional
 
 from fastmcp.tools.tool import ToolResult
 from fastmcp.exceptions import ToolError
 from tallyfy import TallyfySDK
+from tallyfy.models import Guest
 from mcp.types import ToolAnnotations
 
 from utils.fastmcp_types import (
@@ -25,9 +27,136 @@ from utils.fastmcp_types import (
 )
 from utils.fastmcp_errors import handle_tallyfy_errors
 from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
-from utils.sdk_serializer import serialize_dataclass, serialize_paginated_response
+from utils.sdk_serializer import (
+    serialize_dataclass,
+    serialize_paginated_response,
+    unwrap_fractal,
+)
 from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
+
+logger = logging.getLogger(__name__)
+
+
+def _get_guest_raw(sdk, org_id: str, email: str) -> Dict[str, Any]:
+    """GET a guest and KEEP the field that says whether they are disabled.
+
+    Deliberately not routed through `sdk.users.get_guest`. That method returns
+    a `Guest`, whose `details` is a `GuestDetails`, and `GuestDetails.from_dict`
+    reads a key named `disabled_on`. The guest route has never emitted that
+    key (api-v2 does emit `disabled_on` elsewhere, on the organization-members
+    pivot in OrganizationTransformer, which is a different resource).
+    `GuestTransformer::guestDetails` emits `disabled_at`, from
+    `$orgGuest->pivot->disabled_at`. One character apart, so the single field
+    carrying a guest's live state was dropped on the floor and every read of a
+    guest came back with no way to tell an enabled one from a disabled one.
+    That is issue #590.
+
+    `disabled_at` IS the live state, read from api-v2's own service rather than
+    inferred: `GuestService::disable` sets `disabled_at` and `disabled_by`, and
+    `GuestService::enable` sets `disabled_at` back to null while stamping
+    `reactivated_at` and `reactivated_by`. So `disabled_by` and `reactivated_at`
+    are historical breadcrumbs that survive the opposite operation, exactly as
+    #590 reported, and neither answers the question.
+
+    ⚠️ `details.status` is NOT the disabled indicator, and it is the field
+    somebody looking for one will reach first. Neither `disable` nor `enable`
+    touches `pivot->status`; it is a separate lifecycle value that is frequently
+    null, and `serialize_dataclass` strips nulls, which is why it appears in no
+    response and why its absence looked like the bug.
+
+    Reading raw also recovers `cadence_days`, `associated_members`, `last_city`,
+    `last_country` and the pivot's own `last_accessed_at`, all of which
+    `GuestDetails` declares no attribute for.
+    """
+    response = sdk._make_request("GET", f"organizations/{org_id}/guests/{email}")
+    raw = unwrap_fractal(response)
+    if not raw:
+        return {}
+    return _with_guest_id(raw, serialize_dataclass(_with_disabled_flag(raw)))
+
+
+def _with_guest_id(raw: Dict[str, Any], content: Dict[str, Any]) -> Dict[str, Any]:
+    """Put back the identifier the raw read costs us, because a caller needs it.
+
+    Reading raw recovers everything `GuestDetails` drops, and loses the one field
+    the SDK ADDS. `guest_id` is not sent by api-v2: `Guest.from_dict` derives it
+    from `link` by pulling the segment after `/guest/`, and it is the guest's
+    access code, not the numeric `id` the body carries.
+
+    That matters because this tool's own description tells the caller to hand it
+    to `get_guest_tasks`, and `OptionalGuestId` describes itself as "extracted
+    from the guest link URL" with a 40-character example. Measured live on the
+    test org 2026-09-01, in one run: `get_guest_tasks(guest_id="48418")`, the
+    numeric id, answers **404 Resource not found**, while the code out of the
+    same guest's `link` answers 200 with data and meta. So the numeric id is not
+    a substitute, and a response carrying it and not the code sends the caller
+    somewhere that does not exist.
+
+    Derived through the SDK's own extractor rather than reimplemented here, so
+    the two cannot disagree about the URL shape. That is a `_`-prefixed method
+    on a pinned dependency, which is a coupling, so
+    `test_the_sdk_still_exposes_the_extractor_this_depends_on` fails loudly if a
+    bump removes it. Without that pin the field would go quietly missing again,
+    which is the failure this whole function exists to undo.
+
+    Absent or unparseable `link` yields no key, rather than a null or a guess: a
+    caller that reads a key and gets nothing usable is worse off than one that
+    sees the field is absent.
+    """
+    guest_id = Guest._extract_guest_id(raw.get("link"))
+    if guest_id:
+        # Assigned after serialisation for the same reason `is_disabled` is: the
+        # value is derived rather than present in the body, so it has to be put
+        # somewhere the serialiser has already finished with.
+        content = dict(content)
+        content["guest_id"] = guest_id
+    return content
+
+
+def _with_disabled_flag(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Add an explicit `is_disabled` boolean, but ONLY when it can be answered.
+
+    This is not decoration on top of `details.disabled_at`, it is what makes
+    that field usable. `serialize_dataclass` strips null and empty values, so an
+    ENABLED guest carries `disabled_at: null` and the key vanishes from the
+    response entirely. Absence would then mean either "this guest is enabled" or
+    "this tool still cannot see the field", which is the ambiguity #590 is
+    about. A `False` survives serialisation, so the boolean says it out loud.
+
+    The guard is the point. When `details` is missing or is not a dict the read
+    did not deliver what it should have, so NOTHING is emitted rather than
+    `False`. Defaulting to `False` there would report every unreadable guest as
+    enabled, which is a check that cannot fail in the direction that matters:
+    an operator confirming a disable would be told the disable had not worked
+    when the truth is that the tool could not tell.
+    """
+    details = raw.get("details")
+    if not isinstance(details, dict):
+        return raw
+    result = dict(raw)
+    result["is_disabled"] = bool(details.get("disabled_at"))
+    return result
+
+
+def _guest_after_write(sdk, org_id: str, email: str) -> Dict[str, Any]:
+    """Read a guest back after a disable or enable that already succeeded.
+
+    `sdk.users.disable_guest` and `enable_guest` both return a bare `True`, so
+    the tools built on them answered `True` while their docstrings promised an
+    "Updated guest object with disabled status". api-v2 does return the guest
+    from both routes; the SDK simply discards the body.
+
+    Never fatal, for the same reason as `task_management._task_after_write`: the
+    write has already happened, so raising here would report a landed change as
+    a failure and invite a retry. A failed read-back degrades to the plain
+    acknowledgement rather than to a wrong answer about the guest's state.
+    """
+    try:
+        return _get_guest_raw(sdk, org_id, email)
+    except Exception as exc:  # noqa: BLE001 - degraded read, never fatal
+        logger.warning("Post-write guest read-back failed for %s: %s", email, exc)
+        return {}
 
 
 def register_user_management_tools(mcp):
@@ -451,13 +580,19 @@ Use get_guest(email=...) to read a guest's current profile.""",
             email: Guest's email address (REQUIRED)
 
         Returns:
-            Updated guest object with disabled status
+            The guest as it now stands, read back after the write, with
+            `is_disabled` true. An empty dict means the disable itself
+            succeeded and only the confirming read failed; it does NOT mean
+            the guest is still enabled.
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            guest = sdk.users.disable_guest(org_id, email)
+            sdk.users.disable_guest(org_id, email)
+            # The SDK returns a bare `True`, so without this read-back the tool
+            # answers `True` while its own docstring promises a guest object
+            # carrying the new state. #590 is about exactly that gap.
             return ToolResult(
-                content=serialize_dataclass(guest) if guest else {},
+                content=_guest_after_write(sdk, org_id, email),
                 structured_content=None
             )
 
@@ -484,13 +619,17 @@ Use get_guest(email=...) to read a guest's current profile.""",
             email: Guest's email address (REQUIRED)
 
         Returns:
-            Updated guest object with enabled status
+            The guest as it now stands, read back after the write, with
+            `is_disabled` false. An empty dict means the enable itself
+            succeeded and only the confirming read failed.
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            guest = sdk.users.enable_guest(org_id, email)
+            sdk.users.enable_guest(org_id, email)
+            # Sibling of disable_guest (rule 16). Same bare `True` from the SDK,
+            # same read-back, so `is_disabled` flips back to False visibly.
             return ToolResult(
-                content=serialize_dataclass(guest) if guest else {},
+                content=_guest_after_write(sdk, org_id, email),
                 structured_content=None
             )
 
@@ -498,7 +637,18 @@ Use get_guest(email=...) to read a guest's current profile.""",
         name="get_guest",
         description="""Get a single guest's profile by email address.
 
-Returns guest profile data including name, contact info, last accessed time, and status.
+Returns name, contact info, last accessed time, and whether the guest is
+currently disabled.
+
+WHETHER A GUEST IS DISABLED: read the top-level 'is_disabled' boolean. It is
+always present and it is the answer. 'details.disabled_at' carries the
+timestamp when there is one.
+
+Do NOT read 'details.status' for this. It is a separate value that
+disable_guest and enable_guest never touch, and it is often empty.
+'details.disabled_by' and 'details.reactivated_at' are history, not current
+state: each one survives the opposite operation, so a guest who was disabled
+and then re-enabled still carries a disabled_by.
 
 NOTE: This returns the guest's profile only, not their tasks. To get tasks
 assigned to a guest, use get_guest_tasks(guest_email="...") or
@@ -527,13 +677,16 @@ CORRECT usage:
             email: Guest email address (required)
 
         Returns:
-            Dict with guest profile data (email, name, last_accessed_at, details).
+            Dict with guest profile data (email, name, last_accessed_at,
+            details), plus a top-level `is_disabled` boolean derived from
+            `details.disabled_at`. `is_disabled` is omitted only when the
+            response carried no `details` object at all, which means the read
+            could not answer rather than that the guest is enabled.
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.users.get_guest(org_id, email)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=_get_guest_raw(sdk, org_id, email),
                 structured_content=None
             )
 

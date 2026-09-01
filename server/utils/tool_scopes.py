@@ -17,6 +17,69 @@ which is already the wire-value list this server publishes in its OAuth discover
 documents, and which matches ``McpAccessTokenService::SUPPORTED_SCOPES`` in
 api-v2 one-for-one: six families times read/write.
 
+CURRENT REACH: this gate refuses nothing, and has never refused anything
+--------------------------------------------------------------------------
+**Read this before citing per-tool scope enforcement as a security control.**
+The code below is correct and is live in production in ``enforce`` mode. It has
+also never denied a real credential and cannot, because every access token in
+circulation grants all twelve scopes. Nothing here is broken; there is simply
+nothing to refuse.
+
+**Measured 2026-08-30 on ``develop``, in process, by running ``decide()`` over
+tools DISCOVERED by walking the ``tools/`` package.** Re-derive it rather than
+quoting it, with ``python3 scripts/scope_reach_report.py``:
+
+===================================================  ==================
+grant                                                denied of 113
+===================================================  ==================
+observed: all 12 scopes                                        **0**
+observed: 11 scopes, omits ``mcp.processes.read``               **0**
+CONTROL: empty grant ``[]``                                    104
+CONTROL: ``mcp.tasks.read`` only                                96
+===================================================  ==================
+
+**The control rows are what make the zeros mean anything.** A run in which they
+are also ``0`` is a run where discovery broke, and every figure in it must be
+discarded; the report script refuses to print a table at all in that case.
+
+The two observed grants are the ONLY two scope strings production has ever
+issued, both read read-only from the logging stack's ``system_events``. The
+second grant denies nothing either, because a write scope satisfies a read
+requirement in the same family (see ``scope_satisfied`` below).
+
+The row counts, organisation counts and observation dates behind those two
+strings live on tallyfy/mcp#1003 and are deliberately not repeated here: this
+file is published to the public mirror ``tallyfy/mcp-public``, and those figures
+describe Tallyfy's customer base rather than this server's behaviour. Do not
+paste them back in.
+
+Two limits on that, stated so nobody reads more into it:
+
+* Consent logging does not reach back to the first token this server ever
+  issued, so whether narrower grants existed before logging began is unknown.
+  The start date is on tallyfy/mcp#1003.
+* This says nothing about api-v2's ``EnforceMcpTokenScopes``, which is a separate
+  control on a separate service.
+
+**Would a denial be noticed?** Yes, and the query plus its control live beside
+the report script, in ``scripts/scope_reach_report.py`` as ``MONITORING_QUERY``.
+It searches ``system_events`` for every marker
+``middleware/tool_scope_enforcement.py`` emits on a denial, and it ships with the
+control that makes its zero readable: a control of ``0`` means the probe is
+broken and the ``0`` is meaningless rather than clean.
+
+**Do not prove the deny path by sending a scope-limited token to production or
+staging.** Use ``decide()`` in process. A fabricated credential fired at an
+instrumented system becomes a permanent row that makes the next investigation's
+negative control return a false positive, and this estate has already done that
+twice.
+
+Tracked as tallyfy/mcp#1003. That issue records **0 of 110** measured on
+``origin/production`` at ``1e47610`` on 2026-08-25; both figures are correct for
+their date and their ref, and 110 to 113 is three tools added since (all three
+exempt: ``search_product_docs``, ``get_org_context``, ``update_org_context``).
+Do not edit either number to match the other.
+
 THE ONE RULE THAT MUST NOT BE BROKEN
 ------------------------------------
 **A token carrying no ``mcp_scopes`` claim is not gated at all.** api-v2's

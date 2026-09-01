@@ -137,6 +137,7 @@ ERROR_CLASS_UPSTREAM_ERROR = "upstream_error"
 ERROR_CLASS_UPSTREAM_UNAVAILABLE = "upstream_unavailable"
 ERROR_CLASS_INTERNAL_ERROR = "internal_error"
 ERROR_CLASS_TOOL_REJECTED = "tool_rejected"
+ERROR_CLASS_PAYLOAD_REJECTED = "payload_rejected"
 ERROR_CLASS_UNKNOWN = "unknown"
 
 _STATUS_ERROR_CLASSES = {
@@ -168,6 +169,96 @@ def classify_upstream_status(status: Any) -> str:
     if 500 <= status < 600:
         return ERROR_CLASS_UPSTREAM_ERROR
     return ERROR_CLASS_UNKNOWN
+
+
+# ===========================================================================
+# Pre-flight SDK payload errors: refused before a socket was opened (#835)
+# ===========================================================================
+#
+# The SDK's `TallyfyPayloadError` family is raised by the payload builders
+# BEFORE any HTTP request is made, so there is no status to attach and
+# `status_code` is None. `EXPECTED_UPSTREAM_STATUSES` therefore cannot demote
+# it and it lands at ERROR, which pages Sentry.
+#
+# WHY THAT MATTERS, AND WHY IT IS NOT THEORETICAL. Six builders are reached by
+# tools that splat an LLM-supplied free-form dict straight in
+# (`update_template_metadata`, `update_form_field`, `add_form_field_to_step`,
+# `add_step_to_template`, `create_automation_rule`, `update_automation_rule`,
+# all typed `GenericDict`). The SDK ships a hint map -- `description` to
+# `summary`, `name` to `title` -- precisely BECAUSE models pass those names. So
+# the expected failure is a model getting a field name slightly wrong, which is
+# routine, and every occurrence would page an operator who can do nothing about
+# it. That is the "alert nobody can act on" that trains people to ignore the
+# channel, which is #603's whole subject.
+#
+# ⚠️ A STATUS TEST CANNOT DO THIS JOB, and that is the entire reason this is a
+# TYPE test. `EXPECTED_UPSTREAM_STATUSES` says in its own comment that a
+# missing status must never join it, because an exhausted transport also has
+# no status and demoting it would remove the only signal that Tallyfy is
+# unreachable. Both failures wear the same shape. The exception TYPE is the one
+# thing that separates them, which is why the fix lives here rather than as a
+# new member of that tuple.
+#
+# ⚠️ `side_effect_possible` IS THE WRONG DISCRIMINATOR, and it is the obvious
+# one to reach for. Read off the SDK on origin/main: the flag is declared on
+# the BASE class as `side_effect_possible: bool = False`, and
+# `TallyfyNotDeliveredError` -- a ConnectTimeout, i.e. Tallyfy being
+# unreachable -- also carries False. Keying on it would demote every plain
+# `TallyfyError` with no status, destroying exactly the signal the paragraph
+# above protects. Only `TallyfyIndeterminateError` sets it True.
+#
+# ⚠️ `TallyfyNotDeliveredError` IS NOT A MEMBER OF THIS FAMILY. It is a sibling
+# of `TallyfyError`, not a subclass of `TallyfyPayloadError`, so the isinstance
+# test below already excludes it. Stated explicitly because #835's own summary
+# table lists it beside the payload errors, and a future reader widening this
+# to "the SDK errors with no status" would silence an outage.
+#
+# THE IMPORT IS DEFENSIVE ON PURPOSE. The pin is an exact `tallyfy==1.3.12` in
+# every install path, and `tallyfy/payload.py` does not exist at that tag
+# (verified: `git cat-file -e v1.3.12:tallyfy/payload.py` fails, while the same
+# path resolves on origin/main). A plain `from tallyfy import
+# TallyfyPayloadError` would therefore fail at import time and take the server
+# down today, to guard against something the pinned SDK cannot yet raise. With
+# the class absent the tuple is empty, `isinstance(x, ())` is False, and this
+# whole path is inert -- which is correct, because nothing can produce one.
+try:  # pragma: no cover - exercised by whichever SDK version is installed
+    from tallyfy import TallyfyPayloadError as _TallyfyPayloadError
+except ImportError:  # SDK older than the payload-error family (<= 1.3.12)
+    _TallyfyPayloadError = None
+
+#: Exception types that mean "refused locally, nothing was sent". Module-level
+#: so a test can substitute a stand-in on an SDK that predates the real class,
+#: and so the predicate below reads it at call time rather than capturing it.
+PREFLIGHT_PAYLOAD_ERROR_TYPES: tuple = (
+    (_TallyfyPayloadError,) if _TallyfyPayloadError is not None else ()
+)
+
+
+def is_preflight_payload_error(error: BaseException) -> bool:
+    """True when the SDK refused the payload before any request went out.
+
+    Deliberately NOT keyed on a missing status, on `side_effect_possible`, or
+    on the exception's class NAME -- see the block comment above for why each
+    of those three is wrong. Subclasses (`TallyfyUnknownFieldError`,
+    `TallyfyMissingFieldError`, `TallyfyEmptyPayloadError`) are covered by
+    inheritance rather than by enumeration, so a new one added by the SDK is
+    handled without a change here.
+    """
+    return isinstance(error, PREFLIGHT_PAYLOAD_ERROR_TYPES)
+
+
+def classify_tool_error(error: BaseException, status: Any) -> str:
+    """Error-class label for a failed tool call, status or no status.
+
+    A pre-flight payload rejection has no status, and `classify_upstream_status`
+    correctly maps "no status" to `upstream_unavailable` because that is what an
+    exhausted transport looks like. Applying that to a caller's bad field name
+    would count a model's typo as evidence that Tallyfy is down, so the type
+    test runs first and only then does the status decide.
+    """
+    if is_preflight_payload_error(error):
+        return ERROR_CLASS_PAYLOAD_REJECTED
+    return classify_upstream_status(status)
 
 
 def tag_error_class(error: BaseException, error_class: str) -> BaseException:
@@ -399,12 +490,41 @@ _CREDENTIAL_401_MESSAGES = frozenset({
 #: 401 bodies that are about the OBJECT, not the credential. Re-authenticating
 #: cannot fix any of these, so challenging on one sends a client round the OAuth
 #: loop over a correct rejection -- #592 arriving one status code down.
+#:
+#: 🔴 TWO ENTRIES HERE DIFFER BY A SINGLE TRAILING FULL STOP, THEY COME FROM
+#: DIFFERENT MIDDLEWARE, AND NEITHER COVERS THE OTHER. Do not "tidy" one into
+#: the other, and do not delete either as a duplicate:
+#:
+#:     "unauthorized"   <- Support.php:18,          abort(401, 'Unauthorized')
+#:     "unauthorized."  <- ExplicitUserAccess.php:36, response('Unauthorized.', 401)
+#:
+#: `_normalized_401_message` folds case and strips surrounding whitespace and
+#: does NOT strip punctuation, so the two are distinct keys in this frozenset.
+#: The wire shapes differ too: Support.php goes through Laravel's exception
+#: handler and arrives as JSON `{"message": "Unauthorized", "code": ...}`, while
+#: ExplicitUserAccess.php returns a PLAIN-TEXT body, so `response_data` is a
+#: `str`. Collapsing them would re-open whichever one got deleted.
 _NON_CREDENTIAL_401_MESSAGES = frozenset({
     # api-v2 app/Services/GuestTasksMessagingService.php:120
     #   throw new UserException('Unauthorized action', 401);
     # The guest is authenticated fine; that thread is not theirs.
     "unauthorized action",
-    # api-v2 app/Http/Middleware/ExplicitUserAccess.php:36
+    # api-v2 app/Http/Middleware/Support.php:18  -- NO trailing full stop (#1196)
+    #   return abort(401, 'Unauthorized');
+    # The `support` middleware guarding /api/support/* (routes/api.php:845 and
+    # :648). It refuses a caller who is authenticated perfectly well but is not
+    # a SUPPORT user, which is an account property. Re-authenticating cannot
+    # grant it, so a challenge here asks the client to do something that cannot
+    # possibly help.
+    #
+    # This reaches us as JSON, unlike its near-twin below: `abort()` raises an
+    # HttpException, app/Exceptions/Handler.php falls through to
+    # `setErrorResponse($e, 0, ['error' => true])`, and
+    # app/Helpers/errors-helper.php:56 emits
+    #   {"message": "Unauthorized", "code": "UNAUTHORIZED", "error": true}
+    # so `_extract_primary_message` reads response_data["message"].
+    "unauthorized",
+    # api-v2 app/Http/Middleware/ExplicitUserAccess.php:36  -- WITH a full stop
     #   return response('Unauthorized.', Response::HTTP_UNAUTHORIZED);
     # A PLAIN-TEXT body, so response_data is a `str`. The SDK renders it as
     # "API request failed with status 401: Unauthorized." and
@@ -639,8 +759,21 @@ def handle_tallyfy_errors(operation_name: str):
                 # See EXPECTED_UPSTREAM_STATUSES for what each member means and
                 # why it is there. A status OUTSIDE that set, and a MISSING
                 # status, are both logged at ERROR and reach Sentry.
+                #
+                # The one exception to "a missing status logs at ERROR" is a
+                # pre-flight payload rejection, which never reached Tallyfy at
+                # all and so cannot be evidence of anything wrong with it. It
+                # is recognised by exception TYPE, not by the absent status,
+                # because an exhausted transport has the same absent status and
+                # must keep paging. See is_preflight_payload_error (#835).
                 status = getattr(e, "status_code", None)
-                if status in EXPECTED_UPSTREAM_STATUSES:
+                preflight = is_preflight_payload_error(e)
+                if preflight:
+                    logger.warning(
+                        f"{operation_name} rejected before sending "
+                        f"({type(e).__name__}): {e}"
+                    )
+                elif status in EXPECTED_UPSTREAM_STATUSES:
                     logger.warning(f"{operation_name} returned {status}: {e}")
                 else:
                     # Set Sentry tags so LoggingIntegration event has context
@@ -713,7 +846,7 @@ def handle_tallyfy_errors(operation_name: str):
                             f"Could not {operation_name} — {api_msg} "
                             f"{_auth_error_hint(decision)}"
                         ),
-                        classify_upstream_status(status),
+                        classify_tool_error(e, status),
                     )
 
                 # Raise descriptive ToolError carrying the API's own message only.
@@ -721,7 +854,7 @@ def handle_tallyfy_errors(operation_name: str):
                 # _build_error_message's docstring above, which is the contract.
                 raise tag_error_class(
                     ToolError(_build_error_message(operation_name, e)),
-                    classify_upstream_status(status),
+                    classify_tool_error(e, status),
                 )
             except ToolError as e:
                 # Re-raise ToolError directly (already properly formatted).

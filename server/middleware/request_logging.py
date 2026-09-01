@@ -28,14 +28,33 @@ from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response, StreamingResponse
 
 import metrics
-from utils.org_id_middleware import get_org_id
+from utils.org_id_middleware import ORG_ID_HEADERS, get_org_id
 from constants import MCP_SESSION_TIMEOUT
 from durable_event_log import (
     EVENT_AUTH_FAILURE,
     EVENT_TOOL_ERROR,
     EVENT_UPSTREAM_REJECTED,
+    ORG_SOURCE_HEADER,
+    ORG_SOURCE_NONE_NO_BEARER,
+    ORG_SOURCE_NONE_NO_ORG_CLAIM,
+    ORG_SOURCE_NONE_UNPARSABLE_BEARER,
+    ORG_SOURCE_SESSION_STORE,
+    ORG_SOURCE_TOKEN_CLAIM,
+    ORG_SOURCE_TOOL_ARGUMENT,
+    SYNTHETIC_HEADER,
+    SYNTHETIC_TRUTHY,
+    TRANSPORT_DIRECT,
+    TRANSPORT_NONE,
+    TRANSPORT_OAUTH,
+    TRANSPORT_UNKNOWN,
     get_event_log,
 )
+
+# The org_id header spellings OrgIdMiddleware accepts, as lowercase str (it
+# holds them as bytes). Imported rather than re-listed so a spelling added there
+# is automatically recognised here - the same reasoning utils/auth_context.py
+# gives for its own copy of this line.
+_ORG_ID_HEADER_NAMES = frozenset(name.decode("ascii") for name in ORG_ID_HEADERS)
 
 
 # Maximum bytes the middleware will buffer to inspect a tools/call response
@@ -130,6 +149,94 @@ def _get_short_session_id(session_id: str) -> str:
     return session_id[-4:] if len(session_id) >= 4 else session_id.ljust(4, '-')
 
 
+def resolve_transport(auth_header, jwt_claims):
+    """How the credential arrived: ``oauth``, ``direct``, ``none`` or ``unknown``.
+
+    Derived by the SERVER from what was presented (#996 AC2). It is deliberately
+    not ``X-Client-Type``, which is free text the caller picks and which read
+    ``direct`` on all 39 rows of the burst that started #996 while also reading
+    ``issue890-verify`` on the two rows that gave that burst away.
+
+    The discriminator is the ``mcp_scopes`` claim, and it is the one this
+    codebase already relies on: ``McpAccessTokenService::issue`` mints it on
+    every OAuth-brokered MCP token, and a raw Tallyfy session token forwarded by
+    chat.tallyfy.com or the desktop AI shell carries no such claim
+    (``utils.auth_context.get_mcp_scopes`` documents both halves).
+
+    The claims come from OrgIdMiddleware's UNVERIFIED decode, which is correct
+    here and would not be for an authorization decision: the question is what
+    shape of credential the caller presented, not whether it was any good. On a
+    401 the answer is still wanted, and by then there is nothing verified left
+    to read.
+    """
+    if not auth_header or "bearer" not in auth_header.lower():
+        return TRANSPORT_NONE
+    if not jwt_claims:
+        # A bearer arrived and did not decode as a JWT, or the path skipped
+        # OrgIdMiddleware entirely. Either way this row cannot say.
+        return TRANSPORT_UNKNOWN
+    return TRANSPORT_OAUTH if "mcp_scopes" in jwt_claims else TRANSPORT_DIRECT
+
+
+def resolve_claimed_org(*, resolved_org, resolved_source, jwt_claims, has_auth):
+    """The organization the caller NAMED, and where the name came from (#996 AC1).
+
+    Returns ``(claimed_org_id, org_id_source)``. Never asserts that anything was
+    verified: on an auth failure nothing was, which is why the shipper blanks the
+    ``org_id`` column for that event and keeps only this pair.
+
+    When no organization can be named at all the source is one of the ``none_*``
+    reasons, because "953 of 995 rows name nobody" is only actionable once the
+    rows say which kind of nobody. Three kinds exist and they want different
+    fixes: no credential was sent, one was sent and was not a JWT, or one was
+    sent and simply named no organization.
+    """
+    org = (resolved_org or "").strip()
+    if org and org != "unknown":
+        return org, resolved_source
+    claim = (jwt_claims or {}).get("org_id")
+    if claim:
+        return str(claim), ORG_SOURCE_TOKEN_CLAIM
+    if not has_auth:
+        return None, ORG_SOURCE_NONE_NO_BEARER
+    if not jwt_claims:
+        return None, ORG_SOURCE_NONE_UNPARSABLE_BEARER
+    return None, ORG_SOURCE_NONE_NO_ORG_CLAIM
+
+
+def request_is_synthetic(request):
+    """True when the caller declared itself test traffic (#996 AC5).
+
+    One dedicated header, checked for an explicit truthy value. Absent means
+    real, so an unlabelled harness is treated as a customer - the direction that
+    gets investigated rather than the direction that gets ignored.
+    """
+    try:
+        value = request.headers.get(SYNTHETIC_HEADER, "")
+    except Exception:
+        return False
+    return str(value).strip().lower() in SYNTHETIC_TRUTHY
+
+
+def _org_source_from_context(request):
+    """Whether an org in the ContextVar came from a header or the session store.
+
+    ``OrgIdMiddleware`` writes both into one ContextVar and ``get_org_id()``
+    cannot tell them apart, which ``utils/auth_context.py`` says in as many
+    words. The request is still here though, so the header half is directly
+    observable: a header present means the header is what set it, and its
+    absence leaves the per-user store as the only remaining way the value got
+    there.
+    """
+    try:
+        for name in request.headers.keys():
+            if name.lower() in _ORG_ID_HEADER_NAMES:
+                return ORG_SOURCE_HEADER
+    except Exception:
+        pass
+    return ORG_SOURCE_SESSION_STORE
+
+
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log HTTP requests with timing, status, and authentication info."""
 
@@ -145,6 +252,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         has_auth = "Bearer" in auth_header
         # Get org_id from context
         org_id = get_org_id() or 'unknown'
+        # Which of the three possible origins produced the value in `org_id`.
+        # Tracked at every assignment rather than reconstructed at the end,
+        # because by then the three are indistinguishable.
+        org_id_source = _org_source_from_context(request)
 
         # Extract MCP session ID for request grouping
         mcp_session_id = request.headers.get("mcp-session-id", "")
@@ -180,6 +291,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                             body_org_id = arguments.get("org_id", "")
                             if body_org_id:
                                 org_id = body_org_id
+                                org_id_source = ORG_SOURCE_TOOL_ARGUMENT
                     except json.JSONDecodeError:
                         pass
             except Exception:
@@ -416,6 +528,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 org_id_from_context = get_org_id()
                 if org_id_from_context:
                     org_id = org_id_from_context
+                    org_id_source = _org_source_from_context(request)
                 # Record transaction data
                 if should_trace and transaction:
                     transaction.set_data("duration_ms", duration * 1000)
@@ -564,6 +677,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # dies with the container; this call is the only thing that outlives a
         # deploy. It is deliberately the LAST statement before the response is
         # returned, so it can never change what the caller receives.
+        claimed_org_id, claimed_org_source = resolve_claimed_org(
+            resolved_org=org_id,
+            resolved_source=org_id_source,
+            jwt_claims=claims,
+            has_auth=has_auth,
+        )
         self._record_failure_durably(
             mcp_error=mcp_error,
             mcp_error_msg=mcp_error_msg,
@@ -575,6 +694,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             duration=duration,
             session_id=mcp_session_id,
             client_type=client_type,
+            claimed_org_id=claimed_org_id,
+            org_id_source=claimed_org_source,
+            transport=resolve_transport(auth_header, claims),
+            synthetic=request_is_synthetic(request),
             is_noise=(
                 is_scanner
                 or is_oauth_discovery
@@ -599,6 +722,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         duration: float,
         session_id,
         client_type,
+        claimed_org_id=None,
+        org_id_source=None,
+        transport=None,
+        synthetic: bool = False,
         is_noise: bool,
     ) -> None:
         """Ship one failure to the off-box record. Never raises, never blocks.
@@ -611,6 +738,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         of the whole change: a tool rejected by api-v2 comes back as HTTP 200
         with ``isError:true`` inside the result (#652), so a status-code-only
         rule records nothing for the exact failure mode that prompted #890.
+
+        ``org_id`` is what the request resolved and ``claimed_org_id`` is what
+        the caller named. On an auth failure the shipper drops the first and
+        keeps the second, because a 401 verified nothing (#996). That demotion
+        deliberately does NOT happen here: putting it in the shipper means the
+        next call site inherits it without knowing the rule exists.
         """
         try:
             if is_noise:
@@ -638,6 +771,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 error_message=mcp_error_msg,
                 session_id=session_id,
                 client_type=client_type,
+                claimed_org_id=claimed_org_id,
+                org_id_source=org_id_source,
+                transport=transport,
+                synthetic=synthetic,
             )
         except Exception as exc:  # pragma: no cover - emit already swallows
             logging.debug("event_log wiring failed (%s)", type(exc).__name__)

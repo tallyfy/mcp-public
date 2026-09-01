@@ -30,12 +30,14 @@ from utils.fastmcp_types import (
     OptionalString,
     OptionalInt,
     OptionalBool,
+    TopSecretFlag,
     PageNumber,
 )
 from utils.sdk_serializer import (
     serialize_dataclass,
     serialize_task,
     compact_dict_list_field,
+    unwrap_fractal,
 )
 from utils.pagination import fetch_single_page
 from tools.form_fields import (
@@ -235,16 +237,7 @@ def _serialize_task_response(response: Any) -> Dict[str, Any]:
     Anything that is not a dict yields `{}`, because `ToolResult` requires
     non-None content and an empty payload is the established sentinel.
     """
-    raw = response.get("data", response) if isinstance(response, dict) else response
-    if not isinstance(raw, dict):
-        return {}
-
-    raw = dict(raw)
-    fields = raw.get("form_fields")
-    if isinstance(fields, dict):
-        raw["form_fields"] = fields.get("data") or []
-
-    return serialize_task(raw)
+    return serialize_task(unwrap_fractal(response, ("form_fields",)))
 
 
 def _complete_task_raw(
@@ -297,6 +290,38 @@ def _reopen_task_raw(sdk, org_id: str, run_id: str, task_id: str) -> Any:
         "DELETE",
         f"organizations/{org_id}/runs/{run_id}/completed-tasks/{task_id}",
     )
+
+
+# Fields a caller can WRITE through the update tools that `tallyfy.models.Task`
+# has no attribute for, so no update response can ever echo them back.
+#
+# Measured 2026-09-01 against the pinned SDK: `Task` declares 43 fields and
+# neither of these is among them, while api-v2 emits both on a single-task GET
+# (`TaskTransformer.php:89` for `top_secret` unconditionally, and `:99` for
+# `summary` whenever `isSingleTaskDetailRequest()` is true, which it is on any
+# `.../tasks/{task}` route). So a re-read recovers them and nothing else can.
+#
+# ⚠️ This is a claim about the SDK, so it is asserted rather than trusted:
+# `test_task_management.py::TestTheEchoGapIsRealAndNarrow` fails if a future SDK
+# release adds either attribute, and carries a control proving the probe can see
+# the fields the model DOES declare. When that goes red the right response is to
+# delete the member and stop the extra GET, not to weaken the test.
+_FIELDS_THE_SDK_TASK_MODEL_CANNOT_ECHO = ("summary", "top_secret")
+
+
+def _write_needs_read_back(**written: Any) -> bool:
+    """True when the caller wrote a field the update response cannot show them.
+
+    One implementation for `update_task` and `update_standalone_task`, because
+    the previous two copies both gated on `summary` alone and both therefore
+    left `top_secret` unverifiable (#585). Two copies of a rule is how the two
+    tools disagreed about which writes are confirmable; rule 16.
+
+    Keyword-only so the call site names each field it is asking about, which is
+    what makes a missed field visible in review rather than positional.
+    """
+    return any(written.get(name) is not None
+               for name in _FIELDS_THE_SDK_TASK_MODEL_CANNOT_ECHO)
 
 
 def _task_after_write(sdk, endpoint: str, task_id: str) -> Dict[str, Any]:
@@ -1467,7 +1492,7 @@ Never call this without run_id and task_id.""",
         status: OptionalString = None,
         position: OptionalInt = None,
         max_assignable: OptionalInt = None,
-        top_secret: OptionalBool = None,
+        top_secret: TopSecretFlag = None,
         prevent_guest_comment: OptionalBool = None,
         started_at: OptionalString = None,
         task_type: OptionalString = None,
@@ -1502,19 +1527,20 @@ Never call this without run_id and task_id.""",
             status: Task status string
             position: Task position (1-based)
             max_assignable: Maximum number of assignees who must complete the task
-            top_secret: Hide task from non-assignees
+            top_secret: Hide the task from every member except its assignees and
+                organization admins (api-v2 SecretTaskScope). Reads back on
+                get_task / get_standalone_task, so a write is verifiable.
             prevent_guest_comment: Prevent guests from commenting
             started_at: Task start timestamp in "YYYY-MM-DD HH:MM:SS" format
             task_type: Task type string
             webhook: Webhook URL to notify on task updates
 
         Returns:
-            Updated task object. When `summary` was supplied, the task is
-            re-read so the response carries the STORED `summary` and
-            `original_summary` rather than the values sent; the SDK's Task
-            dataclass has no field for either, so nothing else could show them
-            (#633). Updates that do not touch `summary` issue no extra request
-            and are unchanged.
+            Updated task object. When `summary` or `top_secret` was supplied,
+            the task is re-read so the response carries the STORED values
+            rather than the ones sent; the SDK's Task dataclass has a field for
+            neither, so nothing else could show them (#633, #585). Updates that
+            touch neither issue no extra request and are unchanged.
         """
         if owners is not None and not isinstance(owners, dict):
             raise ToolError(
@@ -1558,10 +1584,11 @@ Never call this without run_id and task_id.""",
             content = serialize_task(result) if result else {}
             # Rule 12: a 2xx does not mean the value landed - read it back. Here
             # the caller structurally CANNOT, because the object the SDK returns
-            # has no `summary` attribute to read (#633; see _task_after_write).
-            # Gated on the caller having supplied a summary, so every other
-            # update issues exactly the requests it issued before.
-            if summary is not None and content:
+            # has no `summary` or `top_secret` attribute to read (#633, #585;
+            # see _task_after_write). Gated on the caller having supplied one of
+            # them, so every other update issues exactly the requests it did
+            # before.
+            if _write_needs_read_back(summary=summary, top_secret=top_secret) and content:
                 content.update(_task_after_write(
                     sdk,
                     f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}",
@@ -1682,7 +1709,7 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
         taskdata: Optional[Dict[str, Any]] = None,
         status: OptionalString = None,
         max_assignable: OptionalInt = None,
-        top_secret: OptionalBool = None,
+        top_secret: TopSecretFlag = None,
         prevent_guest_comment: OptionalBool = None,
         started_at: OptionalString = None,
         task_type: OptionalString = None,
@@ -1715,15 +1742,18 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
                 {"users","guests","groups"}.
             status: Task status string
             max_assignable: Maximum number of assignees who must complete the task
-            top_secret: Hide task from non-assignees (only assignees and admins can see it)
+            top_secret: Hide the task from every member except its assignees and
+                organization admins (api-v2 SecretTaskScope). Reads back on
+                get_task / get_standalone_task, so a write is verifiable.
             prevent_guest_comment: Prevent guests from commenting
             started_at: Task start timestamp in "YYYY-MM-DD HH:MM:SS" format
             task_type: Task type (task, approval, expiring, email, expiring_email)
             webhook: Webhook URL to notify on task updates
 
         Returns:
-            Updated task object. Same `summary` read-back as `update_task`, for
-            the same reason and on the one-off endpoint (#633).
+            Updated task object. Same read-back as `update_task`, covering both
+            `summary` and `top_secret`, for the same reason and on the one-off
+            endpoint (#633, #585).
         """
         if owners is not None and not isinstance(owners, dict):
             raise ToolError(
@@ -1772,9 +1802,10 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
             )
             content = serialize_task(result) if result else {}
             # Sibling of update_task (rule 16). Same SDK dataclass, same dropped
-            # `summary`, same read-back - and the one-off ENDPOINT, because the
-            # run-scoped path 404s for a task that belongs to no run.
-            if summary is not None and content:
+            # `summary` and `top_secret`, same read-back - and the one-off
+            # ENDPOINT, because the run-scoped path 404s for a task that belongs
+            # to no run.
+            if _write_needs_read_back(summary=summary, top_secret=top_secret) and content:
                 content.update(_task_after_write(
                     sdk, f"organizations/{org_id}/tasks/{task_id}", task_id
                 ))
