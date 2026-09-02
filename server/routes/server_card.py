@@ -16,7 +16,7 @@ References:
 
 from starlette.responses import JSONResponse
 
-from constants import SERVER_VERSION
+from constants import MCP_RESOURCE_URL, SERVER_VERSION
 from routes.oauth import SUPPORTED_SCOPES
 
 
@@ -58,9 +58,28 @@ _SERVER_CARD = {
         "required": True,
         "schemes": ["oauth2"],
         "oauth2": {
-            "authorizationServer": "https://go.tallyfy.com",
-            "discoveryUrl": "https://mcp.tallyfy.com/.well-known/oauth-authorization-server",
-            "resource": "https://mcp.tallyfy.com",
+            # This MCP server IS the authorization server a client talks to:
+            # routes/oauth.py's own /.well-known/oauth-authorization-server
+            # document names MCP_RESOURCE_URL as its `issuer` (via
+            # _get_base_url()'s fallback), and that same server proxies
+            # /mcp/oauth/authorize with a 302 to Tallyfy's account.tallyfy.com
+            # upstream, forwarding /register and /token over HTTP. It used to
+            # hardcode go.tallyfy.com here, a second literal that drifted from
+            # the real issuer -- go.tallyfy.com serves the legacy web app and
+            # answers OAuth requests with an HTML page, not JSON (issue #1133).
+            # Derive from the same constant so the two documents cannot
+            # disagree again.
+            "authorizationServer": MCP_RESOURCE_URL,
+            # Same reasoning as authorizationServer above, and #1136 is what
+            # happens when only one of the three is derived. These two stayed
+            # hardcoded to the production hostname, so on staging the card told
+            # a scanner to fetch PRODUCTION's discovery document and named
+            # PRODUCTION as the resource, while oauth-protected-resource and
+            # oauth-authorization-server on that same host both correctly said
+            # staging. Invisible in production, because there the literal
+            # happens to equal the real value.
+            "discoveryUrl": f"{MCP_RESOURCE_URL}/.well-known/oauth-authorization-server",
+            "resource": MCP_RESOURCE_URL,
             # Derived from the OAuth discovery document, never hand-listed.
             # A literal list here silently under-declares the moment a scope is
             # added: this advertised 6 of 12 for months (issue #860), and it is

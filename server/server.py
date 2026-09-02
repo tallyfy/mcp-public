@@ -89,7 +89,8 @@ for logger_name, level_name in SUPPRESSED_LOGGERS.items():
 #
 # Authentication Flow:
 # 1. Discovery: ChatGPT/Claude Desktop queries /.well-known/openid-configuration
-# 2. OAuth Flow: Client connects directly to Tallyfy API (go.tallyfy.com) for OAuth 2.1
+# 2. OAuth Flow: Client is 302-proxied by THIS server to Tallyfy's OAuth 2.1
+#    authorization server (account.tallyfy.com); register and token are forwarded
 # 3. Token Usage: Client uses JWT token from Tallyfy API to access MCP tools
 # 4. Validation: MCP Server validates JWT signature using Tallyfy's public key
 #
