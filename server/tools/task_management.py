@@ -1692,7 +1692,10 @@ Never call this without task_id. Do NOT pass a run_id: standalone tasks don't us
         annotations=ToolAnnotations(
             title="Update standalone task",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): the one-off twin of update_task. owners replaces the assignee list so a
+            # bucket passed as [] unassigns everyone, and title, summary, deadline
+            # and taskdata each overwrite the stored value.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

@@ -1220,7 +1220,9 @@ REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'description
         annotations=ToolAnnotations(
             title="Edit step description",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): summary is overwritten outright and never merged, with no revision history
+            # and no undo.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),
@@ -1291,7 +1293,9 @@ Never call this without all three parameters.""",
         annotations=ToolAnnotations(
             title="Update a step in place",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): title renames and summary overwrites, and an assignees, guests or groups
+            # list passed as [] genuinely clears that bucket.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),
@@ -1778,7 +1782,9 @@ Never call this without template_id.""",
         annotations=ToolAnnotations(
             title="Update template",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): users and groups are full replacement lists, so [] clears every permission,
+            # and title, summary and guidance overwrite the stored values.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

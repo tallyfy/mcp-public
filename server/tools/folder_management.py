@@ -220,7 +220,8 @@ Never call this without name.""",
         annotations=ToolAnnotations(
             title="Update folder",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): name overwrites the stored value, with no history and no undo.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

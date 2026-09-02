@@ -239,7 +239,9 @@ Never call this without both name and description.""",
         annotations=ToolAnnotations(
             title="Update group",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): members and guests are full replacement lists, so a bucket passed as []
+            # empties the group's membership.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

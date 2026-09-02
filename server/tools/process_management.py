@@ -392,7 +392,8 @@ REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'st
         annotations=ToolAnnotations(
             title="Update process",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): name and summary overwrite the stored values, with no history and no undo.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

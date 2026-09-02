@@ -336,7 +336,9 @@ Never call this without all four parameters.""",
         annotations=ToolAnnotations(
             title="Update form field",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): label, guidance, field_validation, options and columns each replace the
+            # stored value outright.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),
@@ -717,7 +719,9 @@ Never call this without all four parameters.""",
         annotations=ToolAnnotations(
             title="Update dropdown options",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): replaces the entire options list rather than appending, and dropping or
+            # renumbering an option id changes what already-collected data points at.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),
@@ -1086,7 +1090,9 @@ Never call this without all three parameters.""",
         annotations=ToolAnnotations(
             title="Update kickoff field",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): label, guidance, options, columns and default_value each replace the stored
+            # value outright.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

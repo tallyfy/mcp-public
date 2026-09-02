@@ -502,7 +502,9 @@ Use get_guest(email=...) to read a guest's current profile.""",
         annotations=ToolAnnotations(
             title="Set guest's associated members",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): associated_members is REQUIRED and replaces the whole list, so every call
+            # replaces and [] clears the association outright.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),
@@ -697,7 +699,9 @@ CORRECT usage:
         annotations=ToolAnnotations(
             title="Change user role",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): replaces the stored role, and a demotion revokes the access the previous
+            # role carried.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

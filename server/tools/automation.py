@@ -698,7 +698,9 @@ To keep a condition or action UNCHANGED, resend it verbatim including its `id`."
         annotations=ToolAnnotations(
             title="Update automation rule",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): the PUT replaces conditions and actions wholesale, so a list shorter than the
+            # stored one force-deletes the remainder at HTTP 200.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),

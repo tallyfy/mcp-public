@@ -228,7 +228,8 @@ def register_tag_management_tools(mcp):
         annotations=ToolAnnotations(
             title="Update tag",
             readOnlyHint=False,
-            destructiveHint=False,
+            # destructiveHint (#1020, per #653's rule): title and color overwrite the stored values, with no history and no undo.
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),
