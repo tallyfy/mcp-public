@@ -609,7 +609,7 @@ def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
 #     VariableReplacement.php:270 skips any entry without it, so the field renders
 #     EMPTY wherever it is used as a variable. (`must_all_checked` is NOT the
 #     reason — it only fires from MarkTaskCompleteRequest.php:52, never on this path.)
-_TASKDATA_SHAPE_HELP = """FORM FIELD VALUES ('taskdata') — dict keyed by the form field's id. Send the value ITSELF:
+_TASKDATA_SHAPE_HELP = """FORM FIELD VALUES ('taskdata'): dict keyed by the form field's id. Send the value ITSELF:
 a {"value":...} wrapper is REJECTED by most types and stored VERBATIM by email
 (silent corruption). Never send one.
   text     -> scalar e.g. "Acme Corp"  ·  textarea -> string only (12345 -> 422)
@@ -889,12 +889,12 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
 IDENTIFICATION: Provide one of user_id, user_name, or user_email.
 
 CORRECT usage:
-- get_user_tasks(user_id=12345) — fastest, no lookup needed
-- get_user_tasks(user_name="Zurly Venom") — resolves name to ID automatically
-- get_user_tasks(user_email="zurly@example.com") — resolves email to ID automatically
+- get_user_tasks(user_id=12345): fastest, no lookup needed
+- get_user_tasks(user_name="Zurly Venom"): resolves name to ID automatically
+- get_user_tasks(user_email="zurly@example.com"): resolves email to ID automatically
 
 WRONG usage (will fail):
-- get_user_tasks() — NO! Must provide at least one identifier
+- get_user_tasks(): NO! Must provide at least one identifier
 
 GUEST USERS: This tool is for org members only. For guest tasks, use
 get_guest_tasks(guest_email="...") or get_guest_tasks(guest_id="...") instead.
@@ -1378,13 +1378,13 @@ Never call this without both required parameters.""",
         description="""Reopen a previously completed task. REQUIRED: 'run_id' (32-char hex process ID), 'task_id' (32-char hex), and 'reason' (string explanation for reopening).
 
 ⚠️ MANDATORY `reason` PARAMETER:
-  - The `reason` parameter is REQUIRED (not optional) — empty/whitespace-only strings raise ToolError.
+  - The `reason` parameter is REQUIRED (not optional). Empty/whitespace-only strings raise ToolError.
   - It mirrors the native Tallyfy UI, which requires a reason before reopening.
-  - The reason is automatically posted as a comment on the task for audit trail purposes — visible to all task participants and persisted permanently in the run history.
+  - The reason is automatically posted as a comment on the task for audit trail purposes, visible to all task participants and persisted permanently in the run history.
   - Length: keep it concise (1-2 sentences, ideally under 500 characters). Very long reasons are accepted by the API but may be truncated in some UI views.
-  - YOU MUST ASK THE USER for the reason before calling this tool. Do NOT invent, assume, or fabricate a reason — that would create a misleading audit trail.
+  - YOU MUST ASK THE USER for the reason before calling this tool. Do NOT invent, assume, or fabricate a reason. That would create a misleading audit trail.
 
-WHY: Reopening a task is a corrective action that affects workflow integrity. The audit comment ensures team members (assignees, owners, observers) understand WHY the task was reopened — preventing confusion ("Was the previous completion wrong? Did requirements change?").
+WHY: Reopening a task is a corrective action that affects workflow integrity. The audit comment ensures team members (assignees, owners, observers) understand WHY the task was reopened, preventing confusion ("Was the previous completion wrong? Did requirements change?").
 
 CORRECT usage:
   reopen_task(run_id="abc...", task_id="def...", reason="Incorrect completion, needs review")
@@ -1687,7 +1687,7 @@ CORRECT usage:
   update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": "new value"})
   update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": {"id": 2, "text": "Approved"}})
 
-Never call this without task_id. Do NOT pass a run_id — standalone tasks don't use one.""",
+Never call this without task_id. Do NOT pass a run_id: standalone tasks don't use one.""",
         tags={"tasks", "workflow", "write", "standalone", "update"},
         annotations=ToolAnnotations(
             title="Update standalone task",
@@ -1852,11 +1852,11 @@ Never call this without task_id. Do NOT pass a run_id — standalone tasks don't
 IDENTIFICATION: Provide guest_id or guest_email.
 
 CORRECT usage:
-- get_guest_tasks(guest_id="MITxZa1z2f5d81bb53f1da7c7fa95a2cfec5cbc2") — fastest, no lookup needed
-- get_guest_tasks(guest_email="guest@example.com") — resolves email to guest_id automatically
+- get_guest_tasks(guest_id="MITxZa1z2f5d81bb53f1da7c7fa95a2cfec5cbc2"): fastest, no lookup needed
+- get_guest_tasks(guest_email="guest@example.com"): resolves email to guest_id automatically
 
 WRONG usage (will fail):
-- get_guest_tasks() — NO! Must provide at least one identifier
+- get_guest_tasks(): NO! Must provide at least one identifier
 
 For org member tasks, use get_user_tasks() instead.
 For the current user's ACTIVE tasks, use get_my_tasks() (no identifier needed).

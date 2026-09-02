@@ -33,7 +33,7 @@ def register_user_interaction_tools(mcp):
             "RESPONSE FORMAT: When the user submits the form, the host forwards "
             "their answers back to the agent as a synthetic user turn shaped like "
             "{submitted: bool, fields: {<field_label>: <user_answer>}} where each "
-            "field_answer is typed per the field's `type` — string for text/textarea/"
+            "field_answer is typed per the field's `type`: string for text/textarea/"
             "select/radio, bool for checkbox/toggle, ISO-8601 string for date/datetime/"
             "timepicker, {start, end} object for daterange, or a file_id reference "
             "for file. If the user dismisses the form, `submitted` is false and `fields` "

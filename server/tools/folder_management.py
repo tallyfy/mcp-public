@@ -144,13 +144,13 @@ def register_folder_management_tools(mcp):
 REQUIRED: 'name' (folder name, max 32 chars).
 
 Optional:
-- 'folder_type': 'checklist' (DEFAULT — a folder that holds templates/blueprints)
+- 'folder_type': 'checklist' (DEFAULT, a folder that holds templates/blueprints)
   or 'run' (a folder that holds processes). Also accepts the aliases
   template/blueprint -> checklist and process -> run.
 - 'parent_id': 32-char hex ID of a parent folder, for nesting. The parent MUST
   be the same folder_type.
 
-CHOOSING folder_type MATTERS — it is fixed at creation and cannot be changed later:
+CHOOSING folder_type MATTERS. It is fixed at creation and cannot be changed later:
 - To file PROCESSES into it (add_object_to_folder(object_type="run"), or
   get_organization_runs(folder=...)), you MUST create it with folder_type="run".
   A default 'checklist' folder will reject processes.
@@ -258,7 +258,7 @@ Never call this without name.""",
 
     @mcp.tool(
         name="delete_folder",
-        description="Delete a folder permanently. REQUIRED: 'folder_id'. Contents are NOT deleted — processes/templates are moved out first. Never call this without folder_id.",
+        description="Delete a folder permanently. REQUIRED: 'folder_id'. Contents are NOT deleted. Processes/templates are moved out first. Never call this without folder_id.",
         tags=["folders", "organization", "write"],
         annotations=ToolAnnotations(
             title="Delete folder",
@@ -294,7 +294,7 @@ Never call this without name.""",
         description="""Add a process or template to a folder.
 
 REQUIRED: 'folder_id' (32-char hex), 'object_id' (32-char hex ID of the process or
-template), and 'object_type' — 'run' for processes, 'checklist'/'template' for templates.
+template), and 'object_type': 'run' for processes, 'checklist'/'template' for templates.
 
 THE FOLDER'S TYPE MUST MATCH object_type. Folder type is fixed at creation:
 - object_type='run' requires a folder created with create_folder(..., folder_type='run').
@@ -363,7 +363,7 @@ Never call this without all three parameters.""",
         name="remove_object_from_folder",
         description="""Remove an object from a folder using the folder-object relation ID.
 
-REQUIRED: 'folder_object_id' — a positive INTEGER (e.g. 12345), NOT a 32-char hex ID.
+REQUIRED: 'folder_object_id', a positive INTEGER (e.g. 12345), NOT a 32-char hex ID.
 This is the id of the folder-membership row itself, not the id of the process or
 template inside the folder. It is returned by add_object_to_folder and appears as
 the 'id' of the entries returned when listing a folder's objects.

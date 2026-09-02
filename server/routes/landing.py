@@ -53,10 +53,61 @@ _GCP_BANNER = """
 """
 
 
+_PROD_ENDPOINT = "https://mcp.tallyfy.com/"
+_STAGING_ENDPOINT = "https://staging.mcp.tallyfy.com/"
+
+_PROD_BADGE = (
+    '<span class="badge"><span class="dot"></span>'
+    "Production &middot; live now</span>"
+)
+_STAGING_BADGE = (
+    '<span class="badge"><span class="dot"></span>'
+    "Staging &middot; for testing, not for production use</span>"
+)
+
+_STAGING_NOTE = """
+    <div class="gcp-banner" role="note">
+        <strong>This is the staging server.</strong>
+        It runs the next release and its data is test data. Point a real AI client at
+        <code>mcp.tallyfy.com</code> instead. Use this one only to try a change before
+        it ships.
+    </div>
+"""
+
+
+def _is_staging(host: str) -> bool:
+    """True for the staging host, false for production and the Cloud Run mirror.
+
+    Anchored on the leading label rather than a bare substring, so the production
+    host can never match and a future host that merely CONTAINS the word is not
+    misread. The port is stripped because a Host header may carry one.
+    """
+    return (host or "").lower().split(":")[0].startswith("staging.")
+
+
 def _render_landing_for_host(host: str) -> str:
-    """Render the landing HTML, injecting a Cloud Run banner on mcp-gcp.tallyfy.com."""
-    banner = _GCP_BANNER if "mcp-gcp" in (host or "").lower() else ""
-    return _LANDING_HTML.replace("{GEMINI_BANNER}", banner)
+    """Render the landing HTML for the host that asked for it.
+
+    Every substitution is ``str.replace`` and never ``str.format``: the template
+    is full of literal CSS braces, so formatting it would raise.
+
+    The staging arm exists because this page told visitors to connect to
+    PRODUCTION while badging itself "Production, live now". It was byte-identical
+    to the production page and contained the word "staging" zero times, so
+    somebody sent a staging link to check a connector would copy the endpoint off
+    the page and point a real client at production.
+    """
+    lower = (host or "").lower()
+    banner = _GCP_BANNER if "mcp-gcp" in lower else ""
+    staging = _is_staging(lower)
+    if staging and not banner:
+        banner = _STAGING_NOTE
+    html = _LANDING_HTML.replace("{GEMINI_BANNER}", banner)
+    html = html.replace(
+        "{MCP_ENDPOINT}", _STAGING_ENDPOINT if staging else _PROD_ENDPOINT
+    )
+    html = html.replace("{ENV_BADGE}", _STAGING_BADGE if staging else _PROD_BADGE)
+    return html
 
 
 _LANDING_HTML = """<!DOCTYPE html>
@@ -70,7 +121,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <meta property="og:description" content="Workflow automation for AI assistants. Connect Tallyfy to Claude, ChatGPT, Cursor, and any MCP-compatible client.">
     <meta property="og:image" content="https://tallyfy.com/images/press/tallyfy-logo.png">
     <meta property="og:type" content="website">
-    <meta property="og:url" content="https://mcp.tallyfy.com/">
+    <meta property="og:url" content="{MCP_ENDPOINT}">
     <link rel="icon" href="https://tallyfy.com/favicon.ico">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -313,14 +364,14 @@ _LANDING_HTML = """<!DOCTYPE html>
     </ul>
 
     <div class="badges">
-        <span class="badge"><span class="dot"></span>Production &middot; live now</span>
+        {ENV_BADGE}
         <a class="badge" href="https://registry.modelcontextprotocol.io/?q=tallyfy" target="_blank" rel="noopener">Listed on the Official MCP Registry</a>
         <span class="badge">100+ tools</span>
         <span class="badge">Secure OAuth sign-in</span>
     </div>
 
     <h2>Endpoint</h2>
-    <code class="endpoint">https://mcp.tallyfy.com/</code>
+    <code class="endpoint">{MCP_ENDPOINT}</code>
 
     <h2>Connect from your AI client</h2>
 
@@ -400,7 +451,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <pre><code>JWT="&lt;your token&gt;"
 ORG="&lt;your org id&gt;"
 
-curl -X POST https://mcp.tallyfy.com/ \\
+curl -X POST {MCP_ENDPOINT} \\
   -H "Authorization: Bearer $JWT" \\
   -H "X-Tallyfy-Org-Id: $ORG" \\
   -H "Content-Type: application/json" \\

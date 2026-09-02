@@ -98,15 +98,15 @@ def register_process_management_tools(mcp):
 
     @mcp.tool(
         name="get_organization_runs",
-        description="""Get workflow processes (runs) in the organization. All parameters are optional — call with no parameters to get all runs, or use filters to narrow results.
+        description="""Get workflow processes (runs) in the organization. All parameters are optional. Call with no parameters to get all runs, or use filters to narrow results.
 
 FILTERS: status, archived, starred, checklist_id (template_id), tag, folder, groups, owners, run_type, me (bool)
 RUN STATUS VALUES: "active", "problem", "delayed", "complete", "improvement", "starred", "archived"
-ARCHIVED: archived="only" returns archived processes. status="archived" also works — this tool
+ARCHIVED: archived="only" returns archived processes. status="archived" also works: this tool
 translates it to archived="only" for you.
 RUN TYPE VALUES: "procedure", "form", "document"
 FOLDER: Pass folder ID or folder name (name is auto-resolved to ID).
-OWNERS: Pass numeric user IDs. Filters by collaborator presence (run owner OR task assignee) — NOT by strict process creator/started_by. Use owners= to find runs the user is involved in, not runs they personally launched.
+OWNERS: Pass numeric user IDs. Filters by collaborator presence (run owner OR task assignee), NOT by strict process creator/started_by. Use owners= to find runs the user is involved in, not runs they personally launched.
 
 PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. to retrieve subsequent pages.
 meta.total_pages shows how many pages exist. meta.total shows the real count.""",
@@ -453,7 +453,7 @@ REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'st
 
     @mcp.tool(
         name="archive_process",
-        description="Archive a completed process (run). REQUIRED: 'run_id' (32-char hex). CAUTION: Archived processes are HIDDEN from default views but NOT deleted — all data, tasks, comments, and form-field captures are preserved. Use reactivate_process(run_id) to restore an archived process to active status. To permanently delete a process you must use the universal write fallback (tallyfy_api_write) since no first-class delete tool is exposed. Archived processes can be retrieved via get_organization_runs(archived='only'). Never call this without run_id.",
+        description="Archive a completed process (run). REQUIRED: 'run_id' (32-char hex). CAUTION: Archived processes are HIDDEN from default views but NOT deleted. All data, tasks, comments, and form-field captures are preserved. Use reactivate_process(run_id) to restore an archived process to active status. To permanently delete a process you must use the universal write fallback (tallyfy_api_write) since no first-class delete tool is exposed. Archived processes can be retrieved via get_organization_runs(archived='only'). Never call this without run_id.",
         tags={"processes", "workflow", "runs", "write", "archive"},
         annotations=ToolAnnotations(
             title="Archive process",

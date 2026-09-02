@@ -1208,7 +1208,7 @@ Never call this without all three parameters.""",
 
     @mcp.tool(
         name="edit_description_on_step",
-        description="""Edit the description/summary of a specific step in a template. The description supports HTML — use this to add rich instructions, checklists, or converted document content to a step. When a user wants to convert a document to step instructions, read the document content yourself and write the HTML here.
+        description="""Edit the description/summary of a specific step in a template. The description supports HTML. Use this to add rich instructions, checklists, or converted document content to a step. When a user wants to convert a document to step instructions, read the document content yourself and write the HTML here.
 
 Only the description changes: this tool reads the step first and re-sends its
 existing title and assignees (members, guests and groups), which the API would
@@ -1478,7 +1478,7 @@ Use this data to suggest kickoff fields that would help initialize the workflow 
 - What existing kickoff fields already capture (avoid duplicates)
 - The template's domain and purpose (inferred from title, summary, and step content)
 - Field types: text, textarea, date, dropdown, multiselect, radio, file, table, assignees_form
-  (there is NO `number` and NO `checkbox` field type — add_kickoff_field rejects both)
+  (there is NO `number` and NO `checkbox` field type; add_kickoff_field rejects both)
 
 REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.""",
         tags=["templates", "workflow", "analysis", "kickoff", "read-only"],
@@ -1600,7 +1600,7 @@ covers and names the next offset, e.g. "characters 0 to 24461 of 60000 ... call 
 text_offset=24461". Keep calling with the offset you were given and join the parts in
 order; the final part says "This is the LAST part." Do not write a part back on its own.
 
-DO NOT call get_template just to read its steps — use this tool instead.""",
+DO NOT call get_template just to read its steps. Use this tool instead.""",
         tags=["templates", "steps", "workflow", "read-only"],
         annotations=ToolAnnotations(
             title="Get template steps",
@@ -1704,7 +1704,7 @@ Use this data to evaluate template health across these dimensions:
 
 Provide an overall health rating (excellent/good/fair/poor/critical) with specific recommendations.
 
-RETURNS: the template payload, trimmed when large — top-level keys include `id`, `title`, `summary`, `steps[]`, `automated_actions[]`, `prerun[]` (kickoff fields), and metadata. Synthesize this into a `health_rating` (one of: excellent, good, fair, poor, critical) plus a `recommendations` list (string array of specific, actionable improvements). The tool returns RAW data — the LLM is responsible for the rating + recommendations synthesis.
+RETURNS: the template payload, trimmed when large. Top-level keys include `id`, `title`, `summary`, `steps[]`, `automated_actions[]`, `prerun[]` (kickoff fields), and metadata. Synthesize this into a `health_rating` (one of: excellent, good, fair, poor, critical) plus a `recommendations` list (string array of specific, actionable improvements). The tool returns RAW data. The LLM is responsible for the rating + recommendations synthesis.
 
 SIZE: if the response carries "_truncated", later steps were dropped and are NOT in it; if it
 carries "_withheld", a named field was removed whole. The trim reaches the step list only, so
@@ -1762,12 +1762,12 @@ Updatable fields: title, summary, guidance, icon, alias, webhook, is_public, is_
 auto_naming, folderize_process, allow_launcher_change_name, is_pinned, default_folder,
 kickoff_title, kickoff_description.
 
-Safe to call with only the fields you want to change — this tool reads the template
+Safe to call with only the fields you want to change. This tool reads the template
 first and re-sends its existing permissions ('users' and 'groups'), which the API
 would otherwise clear on any update that omits them.
 
 To CHANGE who can access the template, pass the FULL replacement list, e.g.
-users=[20059, 20033] or groups=[] — these replace, they do not append.
+users=[20059, 20033] or groups=[]: these replace, they do not append.
 
 CORRECT usage:
   update_template(template_id="abc123...", template_data={"title": "New Template Name"})
@@ -1871,7 +1871,7 @@ Never call this without template_id.""",
 REQUIRED: 'template_id' (32-char hex) and 'new_name' (string).
 
 The clone copies steps, form fields and automation rules. Permissions are handled
-by the API's own clone semantics and are NOT controllable from here — there is no
+by the API's own clone semantics and are NOT controllable from here: there is no
 parameter to opt in or out.
 
 CORRECT usage:
@@ -1997,7 +1997,7 @@ Never call this without title.""",
 This is a RECOVERABLE soft delete, NOT a permanent one. The template is archived
 (hidden from default template lists) and its steps, form fields and automation rules
 are preserved. Tallyfy exposes a restore endpoint, so an archived template can be
-brought back — reassure the user rather than warning them the action is irreversible.
+brought back. Reassure the user rather than warning them the action is irreversible.
 
 References to the template from folders and similar relations ARE removed, and the
 response lists what was detached under `deleted_references`.

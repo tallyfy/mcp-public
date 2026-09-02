@@ -416,7 +416,7 @@ async def _execute(
     # ⚠️ That is "most", not "every", and the difference is #1009. This comment
     # used to assert a single universal value for the flag. There is no such
     # value: it is a PER-DEPLOYMENT setting, it differs between deployments, and
-    # at the time of writing it is on in at least one of Tallyfy's own. Whoever
+    # at the time of writing it is on in at least one real deployment. Whoever
     # runs the deployment decides: Tallyfy support on Tallyfy's hosted service,
     # or the operator of the server if it is self-hosted. Nothing in this
     # repository can tell you what a given environment is set to -- the deploy

@@ -169,8 +169,8 @@ def register_group_management_tools(mcp):
 
 REQUIRED: 'name' (group name, max 200 chars, must be unique in the organization)
 AND 'description' (non-empty string). The API rejects a create without a
-description, so ask the user for one — or pass a short factual summary of the
-group's purpose — rather than omitting it.
+description, so ask the user for one, or pass a short factual summary of the
+group's purpose, rather than omitting it.
 
 Optional: 'members' (list of numeric member user IDs), 'guests' (list of guest emails).
 

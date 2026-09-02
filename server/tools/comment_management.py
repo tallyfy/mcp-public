@@ -314,7 +314,7 @@ def register_comment_management_tools(mcp):
         description="""Get all comments (threads) on a task.
 
 REQUIRED: 'task_id' (32-char hex).
-Optional: 'run_id' (32-char hex process ID) — provide it if you have it to avoid an extra lookup.
+Optional: 'run_id' (32-char hex process ID), provide it if you have it to avoid an extra lookup.
 
 'run_id' identifies the PROCESS the task belongs to, so it is a DIFFERENT id from 'task_id'.
 If you only have the task id, omit 'run_id' entirely rather than repeating the task id there.
@@ -385,7 +385,7 @@ If run_id is omitted, it is resolved automatically from the task. Never call thi
 REQUIRED: 'task_id' (32-char hex) and 'content' (comment text).
 
 Optional:
-- 'run_id': process/run ID — pass it if you have it; you'll need it to call 'get_task_comments' later
+- 'run_id': process/run ID, pass it if you have it; you'll need it to call 'get_task_comments' later
 - 'label': "comment" (default) | "problem" | "resolve" | "improvement" | "advice"
 - 'state': "hide-for-guests" (Tallyfy's default) | "open" | "collapsed".
   This server adds no default; omit it and guests will NOT see the comment.
@@ -393,15 +393,15 @@ Optional:
 
 @MENTIONS: notification fires ONLY on @[<id>] markup in the stored body; the id may be a
 user id or a group id (a group notifies every member). 'sent_to' is rendered into the body
-as that, and you may write mentions into 'content' — @[20059], @20059, @alice@acme.com,
+as that, and you may write mentions into 'content': @[20059], @20059, @alice@acme.com,
 @"Alice Smith" and @alice all normalise to @[20059]. An unresolvable token stays plain text
 and notifies nobody, so prefer a numeric ID. A mention only NOTIFIES and usually grants no
 access, so never report that it did; a +email@domain mention DOES add an assignee.
 
 LABEL='resolve' SEMANTICS (issue #172):
 - If the task HAS an unresolved label='problem' thread, this clears that flag via the resolve endpoint, matching the native app. Pass 'run_id' to avoid an extra lookup.
-- If it has NO open problem flag, label='resolve' is cosmetic only — the comment is stored with the label but nothing is cleared. A WARNING is logged so that is visible.
-- To clear a specific known problem thread without a separate comment, call resolve_task_issues(task_id, thread_id) directly — unambiguous, and returns the outcome.
+- If it has NO open problem flag, label='resolve' is cosmetic only. The comment is stored with the label but nothing is cleared. A WARNING is logged so that is visible.
+- To clear a specific known problem thread without a separate comment, call resolve_task_issues(task_id, thread_id) directly: unambiguous, and returns the outcome.
 
 CORRECT usage:
   add_task_comment(task_id="abc123...", content="Everything is on track")
@@ -568,7 +568,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="update_task_comment",
-        description="Update an existing comment on a task. REQUIRED: 'task_id' (32-char hex), 'comment_id', and 'content' (new text). Optional: 'run_id' (pass if available), 'label', 'state', 'sent_to' (list of numeric user IDs to @mention — rendered into the body as @[<user_id>] markup, which is what notifies them; you can also write @[20059] / @20059 / @alice@acme.com / @\"Alice Smith\" / @alice directly in 'content' and it is normalised for you). Never call this without all three required parameters.",
+        description="Update an existing comment on a task. REQUIRED: 'task_id' (32-char hex), 'comment_id', and 'content' (new text). Optional: 'run_id' (pass if available), 'label', 'state', 'sent_to' (list of numeric user IDs to @mention, rendered into the body as @[<user_id>] markup, which is what notifies them; you can also write @[20059] / @20059 / @alice@acme.com / @\"Alice Smith\" / @alice directly in 'content' and it is normalised for you). Never call this without all three required parameters.",
         tags=["tasks", "comments", "threads", "write", "collaboration"],
         annotations=ToolAnnotations(
             title="Update task comment",

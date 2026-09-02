@@ -405,14 +405,14 @@ Optional: 'phone_1' (primary phone, max 20 chars), 'phone_2' (secondary phone,
 max 20 chars), 'company_name' (max 200 chars).
 
 NOTE the phone parameter names: the API stores two numbered phone fields,
-'phone_1' and 'phone_2'. There is no plain 'phone' field — a value sent as
+'phone_1' and 'phone_2'. There is no plain 'phone' field: a value sent as
 'phone' is silently discarded and the guest is created without it.
 
 CORRECT usage:
   create_guest(email="alice@vendor.com", first_name="Alice", last_name="Smith")
   create_guest(email="bob@vendor.com", first_name="Bob", last_name="Jones",
                phone_1="+1 314 555 0100", company_name="Vendor Inc")
-  create_guest(email="carol@vendor.com")   # legal — email is the only required field""",
+  create_guest(email="carol@vendor.com")   # legal: email is the only required field""",
         tags={"users", "guests", "write"},
         annotations=ToolAnnotations(
             title="Create guest",
@@ -481,12 +481,12 @@ CORRECT usage:
         description="""Set which organization members a guest is associated with.
 
 REQUIRED: 'email' (the guest to update) and 'associated_members' (list of numeric
-member user IDs — pass [] to clear). 'associated_members' REPLACES the whole list,
+member user IDs, pass [] to clear). 'associated_members' REPLACES the whole list,
 it does not append.
 
 THIS TOOL CANNOT EDIT A GUEST'S PROFILE. The update-guest endpoint accepts only the
 guest's email (to identify them) and associated_members; the API validates nothing
-else, so first_name, last_name, phone and company_name CANNOT be changed here — a
+else, so first_name, last_name, phone and company_name CANNOT be changed here: a
 request carrying them is accepted with a success status and those values are
 silently discarded. Do not tell the user a name or phone was updated.
 
