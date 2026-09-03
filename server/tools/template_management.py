@@ -2000,13 +2000,15 @@ Never call this without title.""",
         name="delete_template",
         description="""ARCHIVE a template. REQUIRED: 'template_id' (32-char hex).
 
-This is a RECOVERABLE soft delete, NOT a permanent one. The template is archived
-(hidden from default template lists) and its steps, form fields and automation rules
-are preserved. Tallyfy exposes a restore endpoint, so an archived template can be
-brought back. Reassure the user rather than warning them the action is irreversible.
+The TEMPLATE itself is recoverable. It is archived (hidden from default template
+lists), its steps, form fields and automation rules are preserved, and Tallyfy
+exposes a restore endpoint that brings the template back.
 
-References to the template from folders and similar relations ARE removed, and the
-response lists what was detached under `deleted_references`.
+ONE PART IS NOT RECOVERABLE. Say so; do not reassure the user that this is safe.
+Archiving permanently removes this template's embedded references from the BODY
+CONTENT of every OTHER template and step in the organization. Restoring the
+template does NOT put them back, and no restore path in the product recovers them.
+Processes already running are unaffected, so work in flight keeps its content.
 
 Permanently purging a template is a separate admin-only API operation that this tool
 does not perform, and it still requires the template to be archived first.
@@ -2037,7 +2039,8 @@ Never call this without template_id.""",
             template_id: Template ID to archive (REQUIRED - 32-character hex string)
 
         Returns:
-            Result of the archive operation, including `deleted_references`
+            True on success. Note the API's `deleted_references` payload is not
+            surfaced by the SDK, which returns a bare boolean
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:

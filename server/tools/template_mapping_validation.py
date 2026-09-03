@@ -179,6 +179,81 @@ def _shorthand_yields_anybody(act: Dict[str, Any]) -> bool:
     return bool(users or guests)
 
 
+# ---------------------------------------------------------------------------
+# Field-referenced assignees: vocabulary shared with tools/automation.py
+# ---------------------------------------------------------------------------
+# These live HERE rather than in automation.py because automation.py already
+# imports _has_assignees from this module, so this direction keeps the
+# dependency one-way and cannot cycle.
+#
+# They are shared rather than copied because a copy is exactly how mcp#1056's
+# fix broke this validator: automation.py learned to fold six aliases onto
+# `actionable_id` and this file kept checking the literal key, so a mapping
+# using `from_field` was reported as having no assignees while the build tool
+# would have built it correctly. server/CLAUDE.md:59 says this validator runs
+# BEFORE the build chain, so that error is what the model acts on.
+
+# What a model writes when it means "assign from this field". None is an api-v2
+# key; all fold onto actionable_id.
+ACTIONABLE_ID_ALIASES = (
+    "assignees_from_field",
+    "assignees_from",
+    "assign_from_field",
+    "from_field",
+    "field_ref",
+    "assignee_field_id",
+)
+
+ACTIONABLE_TYPE_MAP = {
+    # a form field ON A STEP
+    "capture": "Capture",
+    "field": "Capture",
+    "form_field": "Capture",
+    "step_field": "Capture",
+    "form": "Capture",
+    "input": "Capture",
+    # a KICKOFF field
+    "prerun": "Prerun",
+    "kickoff": "Prerun",
+    "kickoff_field": "Prerun",
+    "pre_run": "Prerun",
+    "launch_field": "Prerun",
+    # a STEP. Legal for a DEADLINE action, which anchors off another step's due
+    # date; DoableActionValidator's deadline arm carries an explicit
+    # `!== 'Step'` escape and its ASSIGNMENT arm carries none, so an assignment
+    # pointing at a Step is refused with 422. Measured on staging, not inferred.
+    "step": "Step",
+    "steps": "Step",
+    "task": "Step",
+}
+
+# Only these two are legal actionable types for an ASSIGNMENT action.
+ASSIGNMENT_ACTIONABLE_TYPES = ("Capture", "Prerun")
+
+
+def _actionable_id_of(act: Dict[str, Any]) -> Any:
+    """The field id this action carries, under the canonical key or any alias."""
+    if act.get("actionable_id"):
+        return act["actionable_id"]
+    for alias in ACTIONABLE_ID_ALIASES:
+        if act.get(alias):
+            return act[alias]
+    return None
+
+
+def _actionable_type_of(act: Dict[str, Any]) -> Any:
+    """The actionable type, resolved through the map.
+
+    An unrecognised value is returned AS WRITTEN rather than as None, so it
+    falls into the "not a legal type" branch with a message naming the legal
+    ones, instead of the misleading "you forgot actionable_type" branch.
+    """
+    raw = act.get("actionable_type")
+    if not raw:
+        return None
+    return ACTIONABLE_TYPE_MAP.get(str(raw).strip().lower(), raw)
+
+
 def _has_assignees(act: Dict[str, Any]) -> bool:
     """True when the action supplies somebody api-v2 will actually accept.
 
@@ -371,7 +446,32 @@ def validate_mapping(mapping: Dict[str, Any]) -> Dict[str, Any]:
                 # DoableActionValidator.php:49-58 skips this when the action reads
                 # its people off a form field, which is actionable_id/_type on the
                 # payload (AutomatedActionRequest.php:35-36, :103-104).
-                if not act.get("actionable_id") and not _has_assignees(act):
+                # The id is read through the SAME alias fold create_automation_rule
+                # applies, or a mapping written with a shorthand is reported as
+                # having no assignees while the build tool would accept it.
+                a_id = _actionable_id_of(act)
+                a_type = _actionable_type_of(act)
+                if a_id and not a_type:
+                    errors.append(
+                        f"automation '{alias}': a field reference needs "
+                        f"actionable_type alongside actionable_id - \"kickoff\" "
+                        f"for a kickoff field, \"field\" for a form field on a step"
+                    )
+                elif a_type and not a_id:
+                    errors.append(
+                        f"automation '{alias}': a field reference needs "
+                        f"actionable_id alongside actionable_type"
+                    )
+                elif a_id and a_type not in ASSIGNMENT_ACTIONABLE_TYPES:
+                    errors.append(
+                        f"automation '{alias}': an assignment action cannot take "
+                        f"its assignees from a step; actionable_type must be "
+                        f"\"kickoff\" or \"field\" and must name an assignee-picker "
+                        f"(assignees_form) field, or a text field validated as an "
+                        f"email (api-v2: The selected form field should be "
+                        f"\"assignees list\" type or text email only.)"
+                    )
+                elif not a_id and not _has_assignees(act):
                     errors.append(
                         f"automation '{alias}': assignment action '{av}' needs a "
                         f"non-empty assignees object such as "

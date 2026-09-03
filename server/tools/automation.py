@@ -18,6 +18,12 @@ from utils.fastmcp_types import (
     GenericList,
 )
 from utils.sdk_serializer import serialize_dataclass
+from tools.template_mapping_validation import (
+    _has_assignees,
+    ACTIONABLE_ID_ALIASES,
+    ACTIONABLE_TYPE_MAP,
+    ASSIGNMENT_ACTIONABLE_TYPES,
+)
 from metrics import track_tool_execution
 import logging
 
@@ -202,6 +208,160 @@ def register_automation_tools(mcp):
     # 'conditions.*.logic' => in:and,or  (per-condition, NOT a top-level field)
     _CONDITION_LOGIC_VALUES = ["and", "or"]
 
+    # ------------------------------------------------------------------
+    # Field-referenced assignees (mcp#1056)
+    # ------------------------------------------------------------------
+    # "Assign this step to whoever was picked in that form field" is carried by
+    # `actionable_id` + `actionable_type` ON THE ACTION, never inside `assignees`.
+    # AutomatedActionRequest.php:41-42 -- each is `required_with` the other, and
+    # actionable_type is `in:Capture,Prerun,Step`. At run time
+    # BaseAction::applyAssignmentActionOnTarget() reads the field's stored value
+    # and only falls back to a static `assignees` when the field is empty.
+    #
+    # Measured against the REAL staging API on 2026-09-02, throwaway template,
+    # positive control (a static user id) 201 and negative control (an assignment
+    # with neither assignees nor actionable) HTTP 500 on the same run:
+    #   Prerun  -> kickoff assignees_form field, no `assignees` key at all   201
+    #   Capture -> step    assignees_form field                              201
+    #   Prerun  -> text field carrying field_validation ["email"]            201
+    #   Prerun  -> plain text field                     422 "should be ... type"
+    #   Step    -> any step, with action_type assignment                     422
+    #   actionable_id with no actionable_type                        422 required_with
+    # The vocabulary is SHARED with template_mapping_validation.py rather than
+    # copied here. That validator runs BEFORE this build chain, and a copy is
+    # exactly how the first cut of mcp#1056 diverged: this module folded six
+    # aliases and the validator checked the literal key, so a mapping written
+    # with `from_field` was reported as having no assignees.
+    _ACTIONABLE_TYPE_MAP = ACTIONABLE_TYPE_MAP
+    _ASSIGNMENT_ACTIONABLE_TYPES = ASSIGNMENT_ACTIONABLE_TYPES
+
+    # Keys a model reaches for when it means "assign from this field". None is an
+    # api-v2 key; all fold onto actionable_id. The TYPE is never guessed from an
+    # id -- a 32-hex id alone cannot say whether it is a kickoff field or a step
+    # field, and resolving that silently is how a rule gets built against the
+    # wrong object (rule 17: never resolve an ambiguity silently).
+    _ACTIONABLE_ID_ALIASES = ACTIONABLE_ID_ALIASES
+
+    def _is_object_id(value) -> bool:
+        """True for a Tallyfy object id: 32 hex characters, no hyphens.
+
+        A user id is an INTEGER, so a 32-hex string in a user-id position is
+        never a user. That is the whole discriminator this module needs, and it
+        is why a field id can be caught here rather than at the API.
+        """
+        return (
+            isinstance(value, str)
+            and len(value) == 32
+            and all(c in "0123456789abcdefABCDEF" for c in value)
+        )
+
+    _FIELD_REF_HINT = (
+        "To assign a step to whoever was chosen in a form field, do NOT put the "
+        "field id where a user id goes. Put it on the action itself: "
+        '"actionable_id": "<field id>" plus "actionable_type": "kickoff" for a '
+        'kickoff field or "field" for a form field on a step, and leave '
+        '"assignees" out. The field must be an assignee-picker (assignees_form) '
+        "or a text field validated as an email."
+    )
+
+    def _as_user_id(value, where: str) -> int:
+        """Coerce one entry of an assignee `users` bucket, or say why it cannot be.
+
+        api-v2 folds this bucket with int(), so anything int() refuses used to
+        escape as an uncaught ValueError and reach the caller as an opaque
+        `internal_error` (mcp#1056). Both failure shapes now name their fix.
+        """
+        if _is_object_id(value):
+            raise ToolError(
+                f"{where} carries {value!r}, which is a 32-character Tallyfy "
+                f"object id, not a user id. User ids are integers. "
+                f"{_FIELD_REF_HINT}"
+            )
+        if isinstance(value, bool):
+            raise ToolError(f"{where} must be an integer user id - got {value!r}.")
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            raise ToolError(
+                f"{where} must be an integer user id - got {value!r}. Use "
+                f'"guests" for an email address, "groups" for a group id.'
+            )
+
+    def _normalize_actionable(act: dict) -> None:
+        """Resolve the field-reference pair, and refuse a half-written one."""
+        for alias in _ACTIONABLE_ID_ALIASES:
+            value = act.pop(alias, None)
+            if value is not None and not act.get("actionable_id"):
+                act["actionable_id"] = value
+
+        raw_type = act.get("actionable_type")
+        if raw_type:
+            resolved = _ACTIONABLE_TYPE_MAP.get(str(raw_type).strip().lower())
+            if resolved:
+                act["actionable_type"] = resolved
+
+        has_id = bool(act.get("actionable_id"))
+        has_type = bool(act.get("actionable_type"))
+        if has_id != has_type:
+            missing = "actionable_type" if has_id else "actionable_id"
+            raise ToolError(
+                f"actionable_id and actionable_type must be sent together; "
+                f"{missing} is missing. actionable_type is \"kickoff\" for a "
+                f'kickoff field, "field" for a form field on a step, or "step" '
+                f"for a step (deadline actions only)."
+            )
+
+        if not has_id:
+            return
+
+        if not _is_object_id(act["actionable_id"]):
+            raise ToolError(
+                f"actionable_id must be a 32-character hex id with no hyphens - "
+                f"got {act['actionable_id']!r}."
+            )
+        if act["actionable_type"] not in ("Capture", "Prerun", "Step"):
+            raise ToolError(
+                f"actionable_type must be \"kickoff\", \"field\" or \"step\" - "
+                f"got {raw_type!r}."
+            )
+        if (
+            act.get("action_type") == "assignment"
+            and act["actionable_type"] not in _ASSIGNMENT_ACTIONABLE_TYPES
+        ):
+            raise ToolError(
+                "an assignment action cannot take its assignees from a step; "
+                'actionable_type must be "kickoff" or "field" and must name an '
+                "assignee-picker (assignees_form) field, or a text field "
+                "validated as an email."
+            )
+
+    def _validate_assignment(act: dict) -> None:
+        """An assignment must say WHO, either statically or from a field.
+
+        Neither is HTTP 500 `Undefined array key "assignees"`, not a 422:
+        DoableActionValidator::doAssigneesHaveErrorMessage() indexes the key
+        without checking it exists. Measured live on staging for both `assign`
+        and `unassign`; `clear_assignees` is exempt in that same method and
+        really does return 201 with nothing.
+        """
+        if act.get("action_type") != "assignment":
+            return
+        if act.get("action_verb") == "clear_assignees":
+            return
+        if act.get("actionable_id"):
+            return
+        # _has_assignees is the transcription of
+        # DoableActionValidator::doAssigneesHaveErrorMessage(), imported rather
+        # than copied so the build tool and the validator cannot disagree.
+        if _has_assignees(act):
+            return
+        raise ToolError(
+            "an assignment action must say who to assign. Either "
+            '"assignees": {"users": [<int>], "guests": ["<email>"], '
+            '"groups": ["<id>"]} with at least one entry, or a field reference '
+            f"- {_FIELD_REF_HINT}"
+        )
+
     def _validate_action_pair(act: dict) -> None:
         """Reject an action_type/action_verb pair the API would refuse."""
         at = act.get("action_type")
@@ -285,6 +445,11 @@ def register_automation_tools(mcp):
                 # omitted verb is unambiguous rather than an error.
                 act["action_verb"] = _INFERABLE_VERBS[act["action_type"]]
 
+            # Resolve a field reference (actionable_id + actionable_type) before
+            # the static-assignee fold, so a caller who gave one is not then
+            # asked for the other (mcp#1056).
+            _normalize_actionable(act)
+
             # Fix LLM-guessed assignee payloads → API "assignees" format.
             # LLMs often send: subject:{type:"member",id:123} or user_id:123
             # API expects: assignees:{users:[123],guests:[],groups:[]}
@@ -296,17 +461,17 @@ def register_automation_tools(mcp):
                 if isinstance(subject, dict):
                     sid = subject.get("id")
                     if sid is not None:
-                        if isinstance(sid, int) or (isinstance(sid, str) and sid.isdigit()):
-                            users.append(int(sid))
-                        elif isinstance(sid, str) and "@" in sid:
+                        if isinstance(sid, str) and "@" in sid:
                             guests.append(sid)
+                        else:
+                            users.append(_as_user_id(sid, "subject.id"))
                 # Extract from flat "user_id" / "user_ids"
                 uid = act.pop("user_id", None)
                 if uid is not None:
-                    users.append(int(uid))
+                    users.append(_as_user_id(uid, "user_id"))
                 uids = act.pop("user_ids", None)
                 if isinstance(uids, list):
-                    users.extend(int(u) for u in uids)
+                    users.extend(_as_user_id(u, "user_ids") for u in uids)
                 # Extract from flat "email" / "guest_email"
                 email = act.pop("email", None) or act.pop("guest_email", None)
                 if email:
@@ -314,9 +479,25 @@ def register_automation_tools(mcp):
                 if users or guests:
                     act["assignees"] = {"users": users, "guests": guests}
 
+            # A caller-supplied `assignees` bucket skips the fold above entirely,
+            # so it needs its own pass: a field id here is the failure mode that
+            # passed every local guard and reached the API as
+            # "Some users are not valid members of this organization", which
+            # names membership rather than the actual mistake (mcp#1056).
+            buckets = act.get("assignees")
+            if act.get("action_type") == "assignment" and isinstance(buckets, dict):
+                # `assignees` is newFromArray's own alias for the users bucket.
+                for key in ("users", "assignees"):
+                    supplied = buckets.get(key)
+                    if isinstance(supplied, list):
+                        buckets[key] = [
+                            _as_user_id(u, f"assignees.{key}") for u in supplied
+                        ]
+
             # Only after normalisation can the pair be judged.
             _validate_action_pair(act)
             _validate_deadline(act)
+            _validate_assignment(act)
 
         return actions
 
@@ -571,37 +752,39 @@ def register_automation_tools(mcp):
 
     @mcp.tool(
         name="create_automation_rule",
-        description="""Create conditional automation (if-then rules) for templates.
+        description="""Create conditional automation (if-then rules).
 
 A conditional form SECTION ("section C only if amount > 5000") is TWO rules: hide that
 step by default AND show it when the field says so. One alone leaves it always visible.
 
-REQUIRED: 'template_id' (32-char hex) + 'automation_data' (dict with `conditions`+`actions`).
+REQUIRED: 'template_id' + 'automation_data' (dict with `conditions`+`actions`).
 
-COMPATIBILITY - action_type CONSTRAINS action_verb, they are NOT independent:
+action_type CONSTRAINS action_verb:
   visibility -> show | hide    deadline -> deadline    status -> reopen
   webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
-`reopen` NEVER pairs with `visibility`. Single-verb types may omit action_verb.
 
 conditionable_type: step | field | kickoff (auto-resolved)
 Step ops: completed, reopened, approved, rejected, acknowledged, expired, not_assigned
 Field/kickoff ops: contains, not_contains, equals, not_equals, equals_any,
 greater_than, less_than, is_empty, is_not_empty
 
-EVERY condition needs a `statement` key (null for step ops). AND/OR goes on EACH
-condition as `logic`:"and"|"or", never top-level.
+EVERY condition needs a `statement` key (null for step ops). AND/OR is per-condition
+as `logic`:"and"|"or", never top-level.
 
-EXAMPLE (ids are 32-char hex, no hyphens) - SHOW a step when a kickoff
-field = "Yes" (hide: action_verb "hide"):
-{"alias":"Show legal","conditions":[{"conditionable_id":"<ko_field_id>","conditionable_type":"kickoff","operation":"equals","statement":"Yes","logic":"and"}],"actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
+EXAMPLE (ids: 32-char hex, no hyphens) - SHOW a step when a kickoff field
+= "Yes" (hide: use "hide"):
+{"conditions":[{"conditionable_id":"<ko_field_id>","conditionable_type":"kickoff","operation":"equals","statement":"Yes","logic":"and"}],"actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
 
-Same envelope, swapping the "actions" entry:
+Same envelope, other "actions":
   deadline: {..,"action_type":"deadline","deadline":{"value":3,"unit":"days","option":"from"}}
   assign:   {..,"action_type":"assignment","action_verb":"assign","assignees":{"users":[12345]}}
+  from a field: same, with "actionable_id":"<field_id>","actionable_type":"kickoff"|"field"
+  INSTEAD of assignees - assigns whoever was picked in that field. It must be an
+  assignee-picker, or text validated as an email.
 
 Every action needs `target_step_id`. deadline needs ALL of value/unit/option
 (unit minutes|hours|days|weeks|months, option before|from). webhook needs webhook_url+alias_name.
-Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name, NOT "automated_alias"); this tool fills one in if omitted.""",
+Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name); this tool fills one in if omitted.""",
         tags=["automation", "rules", "conditional", "write"],
         annotations=ToolAnnotations(
             title="Create automation rule",
@@ -669,26 +852,25 @@ REQUIRED (all three): 'template_id' (32-char hex), 'automation_id' (32-char hex)
 
 Use "actions" (NOT "then_actions"). Use "alias" (NOT "automated_alias"). Use "step"/"field"/"kickoff" for conditionable_type (auto-resolved).
 
-VALID ENUM VALUES:
   STEP operations:    completed, reopened, approved, rejected, acknowledged, expired, not_assigned
   FIELD/KICKOFF ops:  contains, not_contains, equals, not_equals, equals_any, greater_than, less_than, is_empty, is_not_empty
 
-MATRIX - action_type constrains action_verb
+action_type constrains action_verb:
   visibility -> show | hide    deadline -> deadline    status -> reopen
   webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
-e.g. `reopen` is only valid with action_type "status", never "visibility".
 
 CONDITIONS: every entry needs a `statement` key (null for step ops). AND/OR is set
 PER CONDITION as `logic`:"and"|"or"; there is no top-level condition_logic field.
 
 ACTION-SPECIFIC REQUIRED FIELDS (all actions need `target_step_id`):
-  - assignment -> `assignees: {users:[...], guests:[...], groups:[...]}`
+  - assignment -> `assignees: {users:[...], guests:[...], groups:[...]}`, OR
+    `actionable_id`+`actionable_type` ("kickoff"|"field") to assign from that field
   - deadline -> COMPLETE `deadline: {value:int, unit:minutes|hours|days|weeks|months, option:before|from}`
   - emit_webhook -> `webhook_url` AND `alias_name`
 
 INCOMPATIBLE COMBOS (produce 422 errors):
   - an action_verb outside its action_type's list (see matrix above)
-  - assignment without `assignees`; a partial `deadline`
+  - assignment with neither `assignees` nor `actionable_id`; a partial `deadline`
   - webhook without `webhook_url` + `alias_name`
   - operation="completed" with conditionable_type="field" (use "equals")
   - a condition with no `statement` key

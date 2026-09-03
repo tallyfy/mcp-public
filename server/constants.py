@@ -592,8 +592,9 @@ hunting for "the steps inside my form" wants a template with a kickoff form.
    step where that work happens. A 40-field kickoff recreates the problem they came with.
 4. THE FIELD THAT DECIDES BECOMES RULES, IN PAIRS: "section C only if over 5000" is
    hide-by-default AND show-when-over-5000; one rule alone leaves it always visible.
-   An approver-picker cannot drive assignment yet, so ask who approves and assign that
-   step. Never leave these as written instructions to follow.
+   An approver-picker DOES drive assignment: give the assignment action
+   actionable_id (that field) + actionable_type "kickoff"|"field" instead of assignees.
+   Never leave these as written instructions to follow.
 5. ASK WHAT EACH ANSWER IS FOR. What happens after it is sent, who decides, and on what
    basis is the rest of the process, never the form. Fields nobody reads later
    get dropped, not migrated.
