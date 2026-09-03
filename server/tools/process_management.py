@@ -213,8 +213,9 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
 REQUIRED: 'template_id' (32-char hex) and 'name'. Name it after the template plus
 the real-world thing it tracks: "Onboarding - Jane Doe". Generate it yourself; ask
 only if the user wants to pick. Launch ONE process per real-world thing (per hire,
-per client, per order). At volume the fix is fewer LAUNCHES, not fewer processes:
-repeat this call per item (e.g. per spreadsheet row) - that IS the bulk path.
+per client, per order). At volume the fix is less LAUNCHING WORK, not fewer
+processes: repeat this call once per row of their list, instead of them
+launching each one by hand. There is no bulk endpoint; repeating it IS the way.
 
 TWO DIFFERENT FORM SURFACES:
 
