@@ -22,13 +22,15 @@ import logging
 import os
 import time
 
+import jwt
+
 import sentry_sdk
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response, StreamingResponse
 
 import metrics
-from utils.org_id_middleware import ORG_ID_HEADERS, get_org_id
+from utils.org_id_middleware import ORG_ID_HEADERS, get_jwt_claims, get_org_id
 from constants import MCP_SESSION_TIMEOUT
 from durable_event_log import (
     EVENT_AUTH_FAILURE,
@@ -41,6 +43,8 @@ from durable_event_log import (
     ORG_SOURCE_SESSION_STORE,
     ORG_SOURCE_TOKEN_CLAIM,
     ORG_SOURCE_TOOL_ARGUMENT,
+    ORG_SOURCE_VERIFIED_TOKEN,
+    safe_org_label,
     SYNTHETIC_HEADER,
     SYNTHETIC_TRUTHY,
     TRANSPORT_DIRECT,
@@ -178,12 +182,23 @@ def resolve_transport(auth_header, jwt_claims):
     return TRANSPORT_OAUTH if "mcp_scopes" in jwt_claims else TRANSPORT_DIRECT
 
 
-def resolve_claimed_org(*, resolved_org, resolved_source, jwt_claims, has_auth):
+def resolve_claimed_org(*, resolved_org, resolved_source, jwt_claims, has_auth,
+                        header_org=None):
     """The organization the caller NAMED, and where the name came from (#996 AC1).
 
     Returns ``(claimed_org_id, org_id_source)``. Never asserts that anything was
     verified: on an auth failure nothing was, which is why the shipper blanks the
     ``org_id`` column for that event and keeps only this pair.
+
+    ``jwt_claims`` here is ``OrgIdMiddleware``'s UNVERIFIED decode, which is
+    correct for this field and would not be for ``org_id``. The question is what
+    the caller NAMED, and on a 401 there is nothing verified left to read. The
+    value is bounded by ``safe_org_label`` all the same, because "unverified" is
+    not a licence to store arbitrary bytes. A claim that fails that check is
+    therefore NOT recorded, and this returns ``none_no_org_claim``: an
+    unusable name is not a name, and the closed vocabulary has no member for
+    "named something malformed". The row still carries the user, the transport,
+    the session reference and the status, so the caller is not lost.
 
     When no organization can be named at all the source is one of the ``none_*``
     reasons, because "953 of 995 rows name nobody" is only actionable once the
@@ -194,9 +209,22 @@ def resolve_claimed_org(*, resolved_org, resolved_source, jwt_claims, has_auth):
     org = (resolved_org or "").strip()
     if org and org != "unknown":
         return org, resolved_source
-    claim = (jwt_claims or {}).get("org_id")
+    # Sanitised before it is recorded anywhere. This one is an UNVERIFIED
+    # decode, so an unauthenticated caller chooses it; it is honest in
+    # `claimed_org_id`, whose name says exactly what it is worth, and it must
+    # still not be able to carry a newline into a stored field.
+    # A header the caller sent, on a request that at least presented a bearer.
+    # It reaches THIS field and never the resolved one: `resolve_request_org`
+    # takes a header only from a request that authenticated, so on a refused or
+    # anonymous request the header is a claim and nothing more. `jwt_claims`
+    # being empty means no bearer was presented at all, and an anonymous caller
+    # must not be able to write either column - which is `develop`'s behaviour
+    # and is measured in the tests.
+    if jwt_claims and header_org:
+        return header_org, ORG_SOURCE_HEADER
+    claim = safe_org_label((jwt_claims or {}).get("org_id"))
     if claim:
-        return str(claim), ORG_SOURCE_TOKEN_CLAIM
+        return claim, ORG_SOURCE_TOKEN_CLAIM
     if not has_auth:
         return None, ORG_SOURCE_NONE_NO_BEARER
     if not jwt_claims:
@@ -218,27 +246,256 @@ def request_is_synthetic(request):
     return str(value).strip().lower() in SYNTHETIC_TRUTHY
 
 
-def _org_source_from_context(request):
-    """Whether an org in the ContextVar came from a header or the session store.
+# The longest organization id this middleware will record. Tallyfy ids are
+# 32-char hex; the bound is deliberately loose so a legitimate value is never
+# dropped, and tight enough that nothing long can be smuggled into a log line.
+def _org_header_value(request):
+    """The organization id this request's headers carry, bounded, or None.
 
-    ``OrgIdMiddleware`` writes both into one ContextVar and ``get_org_id()``
-    cannot tell them apart, which ``utils/auth_context.py`` says in as many
-    words. The request is still here though, so the header half is directly
-    observable: a header present means the header is what set it, and its
-    absence leaves the per-user store as the only remaining way the value got
-    there.
+    Last match wins, mirroring ``OrgIdMiddleware._extract_from_headers`` and
+    ``utils.auth_context._client_supplied_org_id``. Reading it is not the same
+    as trusting it: every caller of this decides for itself whether the request
+    earned the right to be believed.
+    """
+    value = None
+    try:
+        for name, raw in request.headers.items():
+            if name.lower() in _ORG_ID_HEADER_NAMES and raw:
+                value = raw
+    except Exception:
+        return None
+    return safe_org_label(value)
+
+
+def _request_has_org_header(request):
+    """True when this request carries any organization header spelling at all.
+
+    Asked separately from its VALUE because the presence alone decides whether
+    ``get_org_id()`` can be read as the session store: ``OrgIdMiddleware``
+    overwrites that ContextVar with the header when one is present, so with a
+    header in play the ContextVar is the caller's value wearing the store's
+    clothes.
     """
     try:
-        for name in request.headers.keys():
-            if name.lower() in _ORG_ID_HEADER_NAMES:
-                return ORG_SOURCE_HEADER
+        return any(
+            name.lower() in _ORG_ID_HEADER_NAMES and raw
+            for name, raw in request.headers.items()
+        )
     except Exception:
-        pass
-    return ORG_SOURCE_SESSION_STORE
+        return False
+
+
+def request_authenticated(request):
+    """Did THIS request get past authentication? Read from the same place as
+    ``verified_org_claim``, and None-safe everywhere.
+
+    ``AuthenticationMiddleware`` sets ``scope["user"]`` to an
+    ``AuthenticatedUser`` carrying the accepted token, or to an
+    ``UnauthenticatedUser`` carrying nothing. The discriminator is therefore the
+    presence of an access token, not the presence of the key.
+    """
+    user = request.scope.get("user")
+    return getattr(getattr(user, "access_token", None), "token", None) is not None
+
+
+def verified_org_claim(request):
+    """The ``org_id`` claim on the token THIS request AUTHENTICATED with, or None.
+
+    🔴 THIS IS THE ONLY ORGANIZATION ON THIS PATH THAT ANYTHING CHECKED, AND IT
+    IS DELIBERATELY NOT ``get_jwt_claims()``. That accessor returns an
+    UNVERIFIED decode: ``OrgIdMiddleware`` decodes the Authorization header with
+    ``verify_signature=False``, so its ``org_id`` needs no valid signature and
+    an unauthenticated caller chooses it outright. Routing that into the durable
+    ``org_id`` column would make the one field a reader treats as identity
+    caller-writable, in a change whose whole purpose is a trustworthy incident
+    record. ``durable_event_log`` says of that column that it "reads as though
+    the caller proved it".
+
+    Read instead from ``scope["user"]``, which Starlette's
+    ``AuthenticationMiddleware`` sets from fastmcp's ``BearerAuthBackend``
+    AFTER the RS256 signature and expiry have been checked
+    (``fastmcp/server/auth/auth.py::get_middleware``). That middleware is part
+    of the app ``mcp.http_app()`` builds, and every ``app.add_middleware`` call
+    in ``server.py`` PREPENDS, so it sits INSIDE this one and has already run by
+    the time ``call_next`` returns.
+
+    The ASGI ``scope`` is one dict shared by reference the whole way down, so a
+    key set downstream IS visible here afterwards. Measured 2026-09-04 with
+    three arms in one run: a key set by the inner app reads None before
+    ``call_next`` and its value after, a key set by the outer ASGI middleware
+    reads its value both times, and a key nobody sets reads None throughout.
+
+    Returns None whenever the request did not authenticate, which is the whole
+    point: an unauthenticated caller gets no say in this value. Callers must
+    treat None as "no verified organization" and fall back, never as an error.
+    """
+    try:
+        user = request.scope.get("user")
+        access_token = getattr(user, "access_token", None)
+        raw_token = getattr(access_token, "token", None)
+        if not raw_token:
+            return None
+        claims = jwt.decode(raw_token, options={"verify_signature": False})
+    except Exception:
+        return None
+    return safe_org_label(claims.get("org_id"))
+
+
+def best_effort_request_org(request):
+    """The organization for the ENTRY log line, printed BEFORE anything authenticates.
+
+    Returns ``(org_id_or_None, org_id_source_or_None)``.
+
+    🔴 THIS AND ``resolve_request_org`` BELOW ARE TWO DIFFERENT CONTRACTS AND THE
+    DIFFERENCE IS DELIBERATE. **The entry line is BEST EFFORT. The durable record
+    is AUTHORITATIVE.** This one runs before ``call_next``, so nothing has been
+    through the auth middleware and no verified answer exists yet; it reads the
+    ContextVar exactly as ``develop`` did, which means that when the request
+    carries an organization header the value IS that header.
+
+    ⚠️ **So this value CAN be influenced by an unauthenticated caller, and that is
+    ACCEPTED here rather than fixed.** It is a best-effort operator hint on one
+    terminal log line, structurally nothing better exists at this point in the
+    request, and the alternative measured worse: gating it printed ``org=unknown``
+    for every request carrying an organization header, which is every MCP request
+    from chat.tallyfy.com, since ``host/client/authenticated_client.py:31`` sets
+    that header on all of them and those session tokens carry no ``org_id`` claim.
+    For a successful ``tools/call`` the entry line is the ONLY terminal line
+    carrying an organization at all, so gating it removed the organization from
+    the terminal log entirely for the primary first-party client.
+
+    ``safe_org_label`` still applies, so the injection class stays closed: a
+    caller may influence WHICH organization this line names, and may not forge a
+    log line.
+
+    Nothing here reaches the durable record. ``dispatch`` replaces this value with
+    the authoritative one after ``call_next``, and clears it when the
+    authoritative pass resolves nothing.
+    """
+    org = safe_org_label(get_org_id())
+    if not org:
+        return None, None
+    if _request_has_org_header(request):
+        return org, ORG_SOURCE_HEADER
+    return org, ORG_SOURCE_SESSION_STORE
+
+
+def resolve_request_org(request, verified_org=None, authenticated=False):
+    """The organization of the request being handled, and where the name came from.
+
+    Returns ``(org_id_or_None, org_id_source_or_None)``. This feeds the RESOLVED
+    column, the one ``durable_event_log`` says "reads as though the caller proved
+    it". What the caller merely NAMED travels separately, in ``claimed_org_id``
+    via ``resolve_claimed_org`` above.
+
+    ⚠️ **THE GATE THIS BUILDS IS HEADER-SHAPED, NOT COLUMN-SHAPED, AND SAYING
+    OTHERWISE WOULD BE FALSE.** It stops an organization HEADER from an
+    unauthenticated request reaching the resolved column. It does NOT make that
+    column unreachable by every caller-supplied value: ``dispatch`` reads
+    ``params.arguments.org_id`` out of the request body and assigns it with source
+    ``tool_argument`` under no authentication gate at all. That path is
+    pre-existing and byte-identical on ``develop``, a review could not construct a
+    production shape in which an anonymous caller reaches it, and it is
+    deliberately left alone here rather than changed inside a security fix.
+    It is a known exception to the sentence above, not an oversight.
+
+    1. ``verified_org``, the claim on the token this request authenticated with.
+       It wins outright there and it wins outright here. **This is the #987
+       fix**: with no organization header, ``OrgIdMiddleware`` seeds
+       ``org_id_context`` from the per-user session store, which on the first
+       request after a token refresh that changes organization still holds the
+       PREVIOUS one, and the verified answer is resolved downstream where it
+       cannot be written back (see the class docstring below).
+    2. An explicit organization header, **only on a request that
+       authenticated**. That is the header's legitimate use, a token valid for
+       several organizations picking one, and it is exactly the case
+       ``get_authenticated_credentials`` honours when the token names none.
+    3. The ContextVar, **only when no organization header is present**, at which
+       point it can only be this user's persisted organization, written by
+       ``store_org_id_for_user`` after a verified request. With a header in play
+       the same ContextVar holds the header value instead, which is why the two
+       cannot be collapsed.
+
+    🔴 READ THIS BEFORE LOOSENING THE HEADER ARM. An earlier cut read the header
+    straight off the request with no authentication gate at all. Measured on both
+    refs with NO Authorization header on any arm: a ``GET`` of an unrouted path
+    carrying a chosen organization header recorded ``org_id: unknown``, source
+    ``none_no_bearer`` on ``develop``, and the CALLER'S CHOSEN VALUE with source
+    ``header`` on that cut. Worse, ``/.env`` shipped zero durable rows on
+    ``develop`` and one on that cut, because ``is_scanner`` below requires
+    ``org_id == 'unknown'``, so any organization header defeated scanner
+    suppression outright and turned suppressed probe noise into durable rows
+    naming a real company. ``server.py`` registers a catch-all 404 route and the
+    rate limiter allows 100 unauthenticated requests a minute per IP.
+
+    ⚠️ **This is deliberately STRICTER than ``develop``, and the difference is
+    one case.** ``develop`` honoured the header whenever ``OrgIdMiddleware`` had
+    decoded a bearer carrying a ``sub``, and an unsigned JWT with any ``sub`` is
+    free to write, so that gate stopped nobody who was trying. Here a refused
+    bearer's header does not name the organization on the row. It is still
+    recorded as what the caller CLAIMED, which is the #996 contract and is what
+    that field is for.
+
+    ``verified_org`` and ``authenticated`` are both false on the early call,
+    before ``call_next``, because nothing has authenticated at that point. That
+    is not a gap that could be closed by resolving harder: the answer does not
+    exist yet.
+    """
+    if verified_org:
+        return verified_org, ORG_SOURCE_VERIFIED_TOKEN
+
+    if authenticated:
+        header_org = _org_header_value(request)
+        if header_org:
+            return header_org, ORG_SOURCE_HEADER
+
+    if not _request_has_org_header(request):
+        context_org = safe_org_label(get_org_id())
+        if context_org:
+            return context_org, ORG_SOURCE_SESSION_STORE
+
+    return None, None
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
-    """Log HTTP requests with timing, status, and authentication info."""
+    """Log HTTP requests with timing, status, and authentication info.
+
+    WHY THE #987 FIX IS HERE AND NOT IN ``get_authenticated_credentials``
+    --------------------------------------------------------------------
+    The obvious repair for "the log names the previous organization" is to have
+    ``utils.auth_context.get_authenticated_credentials`` write its verified
+    answer back into ``org_id_context`` with the ``set_org_id()`` that already
+    exists and that nothing calls. **That write cannot reach this middleware,
+    and a dead write into a ContextVar documented as observability-only is
+    worse than none.**
+
+    ``BaseHTTPMiddleware.call_next`` runs the downstream app in a task of its
+    own, and a task copies the context at the moment it is spawned, so a
+    ``ContextVar.set`` performed downstream is invisible here afterwards.
+    Measured 2026-09-04 with both arms in one run, on starlette 1.3.1 (the
+    version ``server/requirements.txt`` pins, so the one the container runs)
+    and again on 0.46.2: a value set by the OUTER pure-ASGI middleware
+    (``OrgIdMiddleware``) IS visible in ``dispatch`` before and after
+    ``call_next``, while a value set by the inner app is visible only inside
+    the app. Both readings identical. So the two ``get_org_id()`` reads in this
+    file, and the durable record built from them, would go on naming the
+    previous organization however late the write happened.
+
+    What DOES cross that boundary is the ASGI ``scope``, one dict shared by
+    reference from the outermost middleware to the innermost. fastmcp's
+    ``AuthenticationMiddleware`` runs inside this one and puts the VERIFIED
+    access token on ``scope["user"]``, so by the time ``call_next`` returns the
+    answer is here, checked, and reachable without touching ``org_id_context``,
+    the per-user store, or any authorization decision. ``verified_org_claim``
+    above is that read.
+
+    ⚠️ **The unverified decode in ``jwt_claims_context`` is deliberately NOT the
+    source for this.** An earlier cut of this change used it, and an
+    unauthenticated caller could then choose the organization on a
+    ``mcp_upstream_rejected`` row and force a newline into the terminal log
+    line. The unverified claim keeps exactly the job it already had: it fills
+    ``claimed_org_id``, whose name says what it is worth.
+    """
 
     async def dispatch(self, request: StarletteRequest, call_next):
         start_time = time.time()
@@ -250,18 +507,24 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         # Extract auth info (without exposing full token)
         auth_header = request.headers.get("authorization", "")
         has_auth = "Bearer" in auth_header
-        # Get org_id from context
-        org_id = get_org_id() or 'unknown'
-        # Which of the three possible origins produced the value in `org_id`.
-        # Tracked at every assignment rather than reconstructed at the end,
-        # because by then the three are indistinguishable.
-        org_id_source = _org_source_from_context(request)
+        # The organization of the request being handled, and which of the three
+        # possible origins produced it. Tracked at every assignment rather than
+        # reconstructed at the end, because by then the three are
+        # indistinguishable.
+        # BEST EFFORT, and only for the entry line printed below. Nothing has
+        # authenticated at this point in the request, so this reads the
+        # ContextVar exactly as `develop` did and can name a header an
+        # unauthenticated caller chose. That is an accepted limit on one
+        # operator hint, not a hole in the record: the authoritative pass after
+        # `call_next` replaces this value, and clears it when it resolves
+        # nothing. See `best_effort_request_org`.
+        org_id, org_id_source = best_effort_request_org(request)
+        org_id = org_id or 'unknown'
 
         # Extract MCP session ID for request grouping
         mcp_session_id = request.headers.get("mcp-session-id", "")
 
         # Read pre-decoded JWT claims from OrgIdMiddleware (P2-I — single decode per request)
-        from utils.org_id_middleware import get_jwt_claims
         claims = get_jwt_claims()
         user_id = None
         if claims:
@@ -288,7 +551,11 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                             mcp_tool_name = params.get("name", "unknown")
                             # Extract org_id from tool arguments (more reliable than header for MCP)
                             arguments = params.get("arguments", {})
-                            body_org_id = arguments.get("org_id", "")
+                            # Sanitised like every other caller-supplied
+                            # source: a tool-call argument is arbitrary JSON
+                            # from the request body and reaches the log line
+                            # below, so a newline in it forges a whole line.
+                            body_org_id = safe_org_label(arguments.get("org_id"))
                             if body_org_id:
                                 org_id = body_org_id
                                 org_id_source = ORG_SOURCE_TOOL_ARGUMENT
@@ -524,11 +791,43 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 # Calculate duration AFTER body is fully read (includes tool execution time)
                 duration = time.time() - start_time
 
-                # Get org_id from context after OrgIdMiddleware has set it
-                org_id_from_context = get_org_id()
-                if org_id_from_context:
-                    org_id = org_id_from_context
-                    org_id_source = _org_source_from_context(request)
+                # Re-read the organization now the response is in hand.
+                # This is the read that matters: the request has been through
+                # the auth middleware by now, so `verified_org_claim` can
+                # answer, and this value is what the terminal log line, the
+                # Sentry tag and the durable record all carry.
+                #
+                # A verified organization DOES displace one named in the tool
+                # call's own arguments. Those two can disagree, and when they
+                # do the request acted on the verified one, because
+                # `get_authenticated_credentials` never reads a tool argument.
+                # Recording the argument would name an organization the request
+                # did not touch.
+                verified_org = verified_org_claim(request)
+                org_id_resolved, org_source_resolved = resolve_request_org(
+                    request,
+                    verified_org=verified_org,
+                    authenticated=request_authenticated(request),
+                )
+                if org_id_resolved:
+                    org_id = org_id_resolved
+                    org_id_source = org_source_resolved
+                elif org_id_source != ORG_SOURCE_TOOL_ARGUMENT:
+                    # The authoritative pass resolved nothing, so the best-effort
+                    # value from before `call_next` must NOT survive into the
+                    # durable record. Without this a refused bearer's header
+                    # would reach the column that reads as identity, through the
+                    # entry line's back door. The tool-argument case is exempt
+                    # because it never came from the best-effort read and its
+                    # precedence is deliberately unchanged here.
+                    org_id = 'unknown'
+                    org_id_source = None
+                if should_trace and transaction:
+                    # The tag set before call_next carried the best-effort value.
+                    # Overwrite it with whatever the authoritative pass settled
+                    # on, including 'unknown', rather than leaving Sentry
+                    # disagreeing with the durable record beside it.
+                    transaction.set_tag("org_id", org_id)
                 # Record transaction data
                 if should_trace and transaction:
                     transaction.set_data("duration_ms", duration * 1000)
@@ -682,6 +981,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             resolved_source=org_id_source,
             jwt_claims=claims,
             has_auth=has_auth,
+            header_org=_org_header_value(request),
         )
         self._record_failure_durably(
             mcp_error=mcp_error,

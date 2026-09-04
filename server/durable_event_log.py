@@ -288,6 +288,42 @@ def session_ref(session_id: Optional[str]) -> str:
         return ""
 
 
+#: The longest organization id this server will record. Tallyfy ids are 32-char
+#: hex; the bound is deliberately loose so a legitimate value is never dropped,
+#: and tight enough that nothing long can be smuggled into a log line.
+MAX_ORG_LABEL_LENGTH = 64
+
+
+def safe_org_label(value: Optional[Any]) -> Optional[str]:
+    """A caller-influenced organization id, or None when it is not safe to record.
+
+    FAIL CLOSED. Every organization this server can name comes, in the end, from
+    something the caller sent: a header, a tool-call argument, or a token claim.
+    Two of those are arbitrary JSON and can carry a newline, and the value is
+    interpolated straight into a log line. A newline there does not corrupt one
+    line, it MANUFACTURES one, in the same log this record exists to make
+    readable.
+
+    So anything that is not a short, printable, whitespace-free string is
+    dropped rather than recorded. Dropping falls through to the next source and
+    ultimately to ``unknown``, which is the direction that loses a label rather
+    than inventing one.
+
+    It lives here rather than in ``middleware/request_logging`` because
+    ``server/metrics.py`` needs the same bound and importing the middleware from
+    there would be circular: ``request_logging`` imports ``metrics`` at module
+    level.
+    """
+    if not isinstance(value, str):
+        return None
+    org = value.strip()
+    if not org or len(org) > MAX_ORG_LABEL_LENGTH:
+        return None
+    if any(ch.isspace() or not ch.isprintable() for ch in org):
+        return None
+    return org
+
+
 def _clean_org(value: Optional[str]) -> str:
     """Normalise an organization id, treating the display placeholder as absent.
 
@@ -673,6 +709,8 @@ __all__ = [
     "TRANSPORTS",
     "ORG_ID_SOURCES",
     "ORG_SOURCE_VERIFIED_TOKEN",
+    "MAX_ORG_LABEL_LENGTH",
+    "safe_org_label",
     "ORG_SOURCE_TOKEN_CLAIM",
     "ORG_SOURCE_HEADER",
     "ORG_SOURCE_TOOL_ARGUMENT",

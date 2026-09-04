@@ -322,9 +322,44 @@ def track_tool_execution(tool_name: str):
             all_params = dict(zip(_param_names, args))
             all_params.update(kwargs)
 
-            # Get org_id from context
-            from utils.org_id_middleware import get_org_id
-            org_id = get_org_id() or 'unknown'
+            # The organization of the request being handled (#987).
+            #
+            # `get_org_id()` alone names the PREVIOUS organization on the first
+            # request after a token refresh that changes it. `OrgIdMiddleware`
+            # seeds that ContextVar from the per-user session store whenever the
+            # request carries no organization header, and this wrapper runs
+            # BEFORE the tool body calls `get_authenticated_credentials()`,
+            # which is the only thing that resolves and re-stores the verified
+            # answer. So the stale value is what the TOOL ERROR line below and
+            # the OTel span attribute would carry.
+            #
+            # `get_verified_org_claim()` reads the `org_id` claim off THIS
+            # request's token via fastmcp's accessor, which resolves
+            # `request.scope["user"]` and is fresh by construction -- the same
+            # freshness reasoning as the `get_access_token` import below, and
+            # the accessor `utils/auth_context.py` already provides for it.
+            # It returns None when the token names no organization, which is
+            # every chat.tallyfy.com session token, so the ContextVar stays the
+            # fallback rather than being replaced.
+            #
+            # BOTH branches are bounded by `safe_org_label`, and the fallback
+            # branch is the one that needed it. `get_org_id()` returns whatever
+            # OrgIdMiddleware put in the ContextVar, which came from a header or
+            # from the per-user store, and it is interpolated straight into the
+            # TOOL ERROR line below. A newline there manufactures a whole log
+            # line. A token carrying no org claim is the ORDINARY case here, not
+            # an edge: every chat.tallyfy.com session token is one, so that is
+            # the arm most requests take.
+            from durable_event_log import safe_org_label
+            org_id = ''
+            try:
+                from utils.auth_context import get_verified_org_claim
+                org_id = safe_org_label(get_verified_org_claim()) or ''
+            except Exception:
+                org_id = ''
+            if not org_id:
+                from utils.org_id_middleware import get_org_id
+                org_id = safe_org_label(get_org_id()) or 'unknown'
 
             # Read pre-decoded JWT claims from OrgIdMiddleware (P2-I — single decode per request)
             api_key = ''
