@@ -1696,7 +1696,7 @@ DO NOT call get_template just to read its steps. Use this tool instead.""",
 
     @mcp.tool(
         name="assess_template_health",
-        description=f"""Retrieve a template's data for a comprehensive health assessment.
+        description=f"""Retrieve a template's data for a full health assessment.
 
 Use this data to evaluate template health across these dimensions:
 - Metadata quality: Does it have a clear title, summary, and guidance?
@@ -1708,7 +1708,7 @@ Use this data to evaluate template health across these dimensions:
 
 Provide an overall health rating (excellent/good/fair/poor/critical) with specific recommendations.
 
-RETURNS: the template payload, trimmed when large. Top-level keys include `id`, `title`, `summary`, `steps[]`, `automated_actions[]`, `prerun[]` (kickoff fields), and metadata. Synthesize this into a `health_rating` (one of: excellent, good, fair, poor, critical) plus a `recommendations` list (string array of specific, actionable improvements). The tool returns RAW data. The LLM is responsible for the rating + recommendations synthesis.
+RETURNS: the template payload, trimmed when large. Top-level keys include `id`, `title`, `summary`, `steps[]`, `automated_actions[]`, `prerun[]` (kickoff fields), and metadata. Synthesize this into a `health_rating` (one of: excellent, good, fair, poor, critical) plus a `recommendations` list (string array of specific improvements someone can act on). The tool returns RAW data. The LLM is responsible for the rating + recommendations synthesis.
 
 SIZE: if the response carries "_truncated", later steps were dropped and are NOT in it; if it
 carries "_withheld", a named field was removed whole. The trim reaches the step list only, so
