@@ -2028,12 +2028,17 @@ Never call this without template_id.""",
     @handle_tallyfy_errors("delete template")
     def delete_template(template_id: TemplateId) -> GenericDict:
         """
-        Archive a template (recoverable soft delete).
+        Archive a template. The template is recoverable; its embeds elsewhere are not.
 
         Hits DELETE /organizations/{org}/checklists/{id}, which api-v2 routes to
-        ChecklistsControllerNew::destroy -> ChecklistService::archiveProcess ->
-        Checklist::archive(), i.e. a soft delete that sets deleted_at. A companion
-        `PUT restore` endpoint exists, so this is NOT permanent.
+        ChecklistsControllerNew::destroy. That runs archiveProcess() AND
+        deleteReferences(). The first is a soft delete setting deleted_at, and a
+        companion `PUT restore` endpoint undoes it. The second permanently strips
+        this template's embedded blocks out of the body content of every other
+        template and step in the organization, and restore does NOT put them back
+        (ChecklistService::restoreProcess calls activate() and nothing else).
+
+        See the tool description above, which is what an agent actually reads.
 
         Args:
             template_id: Template ID to archive (REQUIRED - 32-character hex string)
