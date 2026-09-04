@@ -313,13 +313,13 @@ def register_comment_management_tools(mcp):
         name="get_task_comments",
         description="""Get all comments (threads) on a task.
 
-REQUIRED: 'task_id' (32-char hex).
+REQUIRED: 'task_id'.
 Optional: 'run_id' (32-char hex process ID), provide it if you have it to avoid an extra lookup.
 
 'run_id' identifies the PROCESS the task belongs to, so it is a DIFFERENT id from 'task_id'.
 If you only have the task id, omit 'run_id' entirely rather than repeating the task id there.
 
-If run_id is omitted, it is resolved automatically from the task. Never call this without task_id.""",
+If run_id is omitted, it is resolved automatically from the task.""",
         tags=["tasks", "comments", "threads", "read-only", "collaboration"],
         annotations=ToolAnnotations(
             title="Get task comments",
@@ -382,7 +382,7 @@ If run_id is omitted, it is resolved automatically from the task. Never call thi
         name="add_task_comment",
         description="""Add a comment to a task.
 
-REQUIRED: 'task_id' (32-char hex) and 'content' (comment text).
+REQUIRED: 'task_id' and 'content' (comment text).
 
 Optional:
 - 'run_id': process/run ID, pass it if you have it; you'll need it to call 'get_task_comments' later
@@ -568,7 +568,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="update_task_comment",
-        description="Update an existing comment on a task. REQUIRED: 'task_id' (32-char hex), 'comment_id', and 'content' (new text). Optional: 'run_id' (pass if available), 'label', 'state', 'sent_to' (list of numeric user IDs to @mention, rendered into the body as @[<user_id>] markup, which is what notifies them; you can also write @[20059] / @20059 / @alice@acme.com / @\"Alice Smith\" / @alice directly in 'content' and it is normalised for you). Never call this without all three required parameters.",
+        description="Update an existing comment on a task. REQUIRED: 'task_id', 'comment_id', and 'content' (new text). Optional: 'run_id' (pass if available), 'label', 'state', 'sent_to' (list of numeric user IDs to @mention, rendered into the body as @[<user_id>] markup, which is what notifies them; you can also write @[20059] / @20059 / @alice@acme.com / @\"Alice Smith\" / @alice directly in 'content' and it is normalised for you).",
         tags=["tasks", "comments", "threads", "write", "collaboration"],
         annotations=ToolAnnotations(
             title="Update task comment",
@@ -640,7 +640,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="delete_task_comment",
-        description="Delete a comment from a task. REQUIRED: 'task_id' (32-char hex) and 'comment_id'. Optional: 'run_id' (pass if available). This action cannot be undone. Never call this without both required parameters.",
+        description="Delete a comment from a task. REQUIRED: 'task_id' and 'comment_id'. Optional: 'run_id' (pass if available). This action cannot be undone.",
         tags=["tasks", "comments", "threads", "write", "collaboration"],
         annotations=ToolAnnotations(
             title="Delete task comment",
@@ -676,7 +676,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="report_task_issue",
-        description="Report an issue on a task. REQUIRED: 'task_id' (32-char hex) and 'content' (issue description). Optional: 'run_id' (pass if available). Creates a comment with 'problem' label. Never call this without both required parameters.",
+        description="Report an issue on a task. REQUIRED: 'task_id' and 'content' (issue description). Optional: 'run_id' (pass if available). Creates a comment with 'problem' label.",
         tags=["tasks", "comments", "issues", "write", "collaboration"],
         annotations=ToolAnnotations(
             title="Report task issue",
@@ -715,7 +715,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="resolve_task_issues",
-        description="Resolve a specific issue on a task. REQUIRED: 'task_id' (32-char hex) and 'thread_id' (the issue comment ID returned by report_task_issue). Optional: 'run_id' (pass if available). Never call this without both required parameters.",
+        description="Resolve a specific issue on a task. REQUIRED: 'task_id' and 'thread_id' (the issue comment ID returned by report_task_issue). Optional: 'run_id' (pass if available).",
         tags=["tasks", "comments", "issues", "write", "collaboration"],
         annotations=ToolAnnotations(
             title="Resolve task issues",

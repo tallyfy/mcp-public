@@ -189,7 +189,7 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="create_tag",
-        description="Create a new tag in the organization. REQUIRED: 'title' (tag name). Optional: 'color', which must be EXACTLY 7 characters as #RRGGBB (e.g. '#FF5733'). api-v2 enforces size:7, so shorthand ('#F53'), alpha ('#FF5733AA') and named colors ('red') are all rejected. Never call this without title.",
+        description="Create a new tag in the organization. REQUIRED: 'title' (tag name). Optional: 'color', which must be EXACTLY 7 characters as #RRGGBB (e.g. '#FF5733'). api-v2 enforces size:7, so shorthand ('#F53'), alpha ('#FF5733AA') and named colors ('red') are all rejected.",
         tags=["tags", "organization", "write"],
         annotations=ToolAnnotations(
             title="Create tag",
@@ -223,7 +223,7 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="update_tag",
-        description="Update a tag's title or color. REQUIRED: 'tag_id'. Plus at least one optional field. 'color' must be EXACTLY 7 characters as #RRGGBB (e.g. '#FF5733'); shorthand, alpha and named colors are rejected. Never call this without tag_id.",
+        description="Update a tag's title or color. REQUIRED: 'tag_id'. Plus at least one optional field. 'color' must be EXACTLY 7 characters as #RRGGBB (e.g. '#FF5733'); shorthand, alpha and named colors are rejected.",
         tags=["tags", "organization", "write"],
         annotations=ToolAnnotations(
             title="Update tag",
@@ -263,7 +263,7 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="delete_tag",
-        description="Delete a tag from the organization permanently. REQUIRED: 'tag_id'. This action cannot be undone. Never call this without tag_id.",
+        description="Delete a tag from the organization permanently. REQUIRED: 'tag_id'. This action cannot be undone.",
         tags=["tags", "organization", "write"],
         annotations=ToolAnnotations(
             title="Delete tag",
@@ -296,7 +296,7 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="tag_template",
-        description="Assign a tag to a template. REQUIRED: 'template_id' (32-char hex) and 'tag_id'. ACTIVE TEMPLATES ONLY: an archived template cannot be tagged. Tallyfy resolves the subject with a lookup that skips archived (soft-deleted) templates, so the call fails with the validation error 'Subject not found'. That is the identical message a wrong or unknown template_id produces, so read it as 'archived OR unknown', never as proof the template does not exist. get_template does NOT settle it: that read skips archived templates too and answers 404 in both cases. Only an archived listing tells them apart (GET organizations/<org>/checklists?archived=only), and un-archiving is PUT organizations/<org>/checklists/<template_id>/restore. Neither has a first-class tool here, so reach for tallyfy_api_read / tallyfy_api_write if they are enabled, or ask the user to restore the template in Tallyfy. Never call this without both parameters.",
+        description="Assign a tag to a template. REQUIRED: 'template_id' and 'tag_id'. ACTIVE TEMPLATES ONLY: an archived template cannot be tagged. Tallyfy resolves the subject with a lookup that skips archived (soft-deleted) templates, so the call fails with the validation error 'Subject not found'. That is the identical message a wrong or unknown template_id produces, so read it as 'archived OR unknown', never as proof the template does not exist. get_template does NOT settle it: that read skips archived templates too and answers 404 in both cases. Only an archived listing tells them apart (GET organizations/<org>/checklists?archived=only), and un-archiving is PUT organizations/<org>/checklists/<template_id>/restore. Neither has a first-class tool here, so reach for tallyfy_api_read / tallyfy_api_write if they are enabled, or ask the user to restore the template in Tallyfy.",
         tags=["tags", "templates", "write"],
         annotations=ToolAnnotations(
             title="Tag template",
@@ -357,7 +357,7 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="untag_template",
-        description="Remove a tag from a template. REQUIRED: 'tag_id' and 'template_id'. Never call this without both parameters.",
+        description="Remove a tag from a template. REQUIRED: 'tag_id' and 'template_id'.",
         tags=["tags", "templates", "write"],
         annotations=ToolAnnotations(
             title="Untag template",
@@ -391,7 +391,7 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="tag_process",
-        description="Assign a user-defined tag to a running process. REQUIRED: 'run_id' (32-char hex) and 'tag_id'. Multiple tags per process are allowed. Call this tool repeatedly with the same run_id and different tag_ids to apply more than one. Re-tagging with an already-applied tag_id does NOT create a duplicate tag, but it is not a full no-op: it re-fires the tag event and appends an audit-trail entry, so avoid redundant calls. Tags are used for filtering (search_for_processes), grouping in dashboards, and organizing processes by team/department/category. To create a new tag first, use create_tag; to remove a tag, use untag_process. ACTIVE PROCESSES ONLY: an archived process cannot be tagged. Tallyfy validates the subject with a query that excludes archived (soft-deleted) processes, so the call fails with the validation error 'Subject not found'. That is the identical message a wrong or unknown run_id produces, so read it as 'archived OR unknown', never as proof the process does not exist. Confirm with get_process, and call reactivate_process first if the process is archived. Never call this without both parameters.",
+        description="Assign a user-defined tag to a running process. REQUIRED: 'run_id' and 'tag_id'. Multiple tags per process are allowed. Call this tool repeatedly with the same run_id and different tag_ids to apply more than one. Re-tagging with an already-applied tag_id does NOT create a duplicate tag, but it is not a full no-op: it re-fires the tag event and appends an audit-trail entry, so avoid redundant calls. Tags are used for filtering (search_for_processes), grouping in dashboards, and organizing processes by team/department/category. To create a new tag first, use create_tag; to remove a tag, use untag_process. ACTIVE PROCESSES ONLY: an archived process cannot be tagged. Tallyfy validates the subject with a query that excludes archived (soft-deleted) processes, so the call fails with the validation error 'Subject not found'. That is the identical message a wrong or unknown run_id produces, so read it as 'archived OR unknown', never as proof the process does not exist. Confirm with get_process, and call reactivate_process first if the process is archived.",
         tags=["tags", "processes", "write"],
         annotations=ToolAnnotations(
             title="Tag process",
@@ -440,7 +440,7 @@ def register_tag_management_tools(mcp):
 
     @mcp.tool(
         name="untag_process",
-        description="Remove a tag from a running process. REQUIRED: 'run_id' (32-char hex) and 'tag_id'. Never call this without both parameters.",
+        description="Remove a tag from a running process. REQUIRED: 'run_id' and 'tag_id'.",
         tags=["tags", "processes", "write"],
         annotations=ToolAnnotations(
             title="Untag process",

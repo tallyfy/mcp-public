@@ -359,7 +359,7 @@ If user doesn't provide all required info, ASK them before calling this tool."""
 
     @mcp.tool(
         name="get_user",
-        description="Get a single user by their numeric ID. REQUIRED: 'user_id' (positive integer). Never call this without user_id.",
+        description="Get a single user by their numeric ID. REQUIRED: 'user_id' (positive integer).",
         tags={"users", "organization", "read-only"},
         annotations=ToolAnnotations(
             title="Get user",
@@ -561,7 +561,7 @@ Use get_guest(email=...) to read a guest's current profile.""",
 
     @mcp.tool(
         name="disable_guest",
-        description="Disable a guest account. REQUIRED: 'email' (valid email). This prevents the guest from accessing the organization. Never call this without email.",
+        description="Disable a guest account. REQUIRED: 'email' (valid email). This prevents the guest from accessing the organization.",
         tags={"users", "guests", "admin"},
         annotations=ToolAnnotations(
             title="Disable guest",
@@ -600,7 +600,7 @@ Use get_guest(email=...) to read a guest's current profile.""",
 
     @mcp.tool(
         name="enable_guest",
-        description="Re-enable a disabled guest account. REQUIRED: 'email' (valid email). Never call this without email.",
+        description="Re-enable a disabled guest account. REQUIRED: 'email' (valid email).",
         tags={"users", "guests", "admin"},
         annotations=ToolAnnotations(
             title="Enable guest",
@@ -694,7 +694,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="change_user_role",
-        description="Change a user's role in the organization. REQUIRED: 'user_id' (positive integer) and 'role' ('light', 'standard', or 'admin'). Never call this without both parameters.",
+        description="Change a user's role in the organization. REQUIRED: 'user_id' (positive integer) and 'role' ('light', 'standard', or 'admin').",
         tags={"users", "admin"},
         annotations=ToolAnnotations(
             title="Change user role",
@@ -730,7 +730,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="disable_user",
-        description="Disable a user account. REQUIRED: 'user_id' (positive integer). This prevents the user from accessing the organization. Never call this without user_id.",
+        description="Disable a user account. REQUIRED: 'user_id' (positive integer). This prevents the user from accessing the organization.",
         tags={"users", "admin"},
         annotations=ToolAnnotations(
             title="Disable user",
@@ -763,7 +763,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="enable_user",
-        description="Re-enable a disabled user account. REQUIRED: 'user_id' (positive integer). Never call this without user_id.",
+        description="Re-enable a disabled user account. REQUIRED: 'user_id' (positive integer).",
         tags={"users", "admin"},
         annotations=ToolAnnotations(
             title="Enable user",

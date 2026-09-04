@@ -162,7 +162,7 @@ CORRECT usage:
   create_folder(name="HR Templates")                        # holds templates
   create_folder(name="Payroll", folder_type="run", parent_id="7c9e6679742540de944be07fc1f90ae7")
 
-Never call this without name.""",
+""",
         tags=["folders", "organization", "write"],
         annotations=ToolAnnotations(
             title="Create folder",
@@ -215,7 +215,7 @@ Never call this without name.""",
 
     @mcp.tool(
         name="update_folder",
-        description="Update a folder's name or parent. REQUIRED: 'folder_id'. Plus at least one optional field. Never call this without folder_id.",
+        description="Update a folder's name or parent. REQUIRED: 'folder_id'. Plus at least one optional field.",
         tags=["folders", "organization", "write"],
         annotations=ToolAnnotations(
             title="Update folder",
@@ -259,7 +259,7 @@ Never call this without name.""",
 
     @mcp.tool(
         name="delete_folder",
-        description="Delete a folder permanently. REQUIRED: 'folder_id'. Contents are NOT deleted. Processes/templates are moved out first. Never call this without folder_id.",
+        description="Delete a folder permanently. REQUIRED: 'folder_id'. Contents are NOT deleted. Processes/templates are moved out first.",
         tags=["folders", "organization", "write"],
         annotations=ToolAnnotations(
             title="Delete folder",
@@ -294,7 +294,7 @@ Never call this without name.""",
         name="add_object_to_folder",
         description="""Add a process or template to a folder.
 
-REQUIRED: 'folder_id' (32-char hex), 'object_id' (32-char hex ID of the process or
+REQUIRED: 'folder_id', 'object_id' (32-char hex ID of the process or
 template), and 'object_type': 'run' for processes, 'checklist'/'template' for templates.
 
 THE FOLDER'S TYPE MUST MATCH object_type. Folder type is fixed at creation:
@@ -320,7 +320,7 @@ REPEAT CALLS ERROR rather than passing quietly: adding an object already in the
 folder returns 422 "already in this folder". Nothing is duplicated or harmed, so
 treat it as already-done, not as a failure to retry.
 
-Never call this without all three parameters.""",
+""",
         tags=["folders", "organization", "write"],
         annotations=ToolAnnotations(
             title="Add object to folder",
@@ -381,7 +381,7 @@ template's hex id hoping it works, and do not invent an integer.
 add_object_to_folder does NOT return this id. Get it by listing the folder's objects
 and reading the 'id' on each entry.
 
-Never call this without folder_object_id.""",
+""",
         tags=["folders", "organization", "write"],
         annotations=ToolAnnotations(
             title="Remove object from folder",

@@ -132,7 +132,7 @@ def register_group_management_tools(mcp):
 
     @mcp.tool(
         name="get_group",
-        description="Get a single group by its ID. REQUIRED: 'group_id'. Never call this without group_id.",
+        description="Get a single group by its ID. REQUIRED: 'group_id'.",
         tags=["groups", "organization", "read-only"],
         annotations=ToolAnnotations(
             title="Get group",
@@ -179,7 +179,7 @@ CORRECT usage:
   create_group(name="Onboarding buddies", description="Volunteers who mentor new hires",
                members=[20059, 20033])
 
-Never call this without both name and description.""",
+""",
         tags=["groups", "organization", "write"],
         annotations=ToolAnnotations(
             title="Create group",
@@ -234,7 +234,7 @@ Never call this without both name and description.""",
 
     @mcp.tool(
         name="update_group",
-        description="Update a group's name, description, or members. REQUIRED: 'group_id'. Plus at least one optional field to update. Never call this without group_id.",
+        description="Update a group's name, description, or members. REQUIRED: 'group_id'. Plus at least one optional field to update.",
         tags=["groups", "organization", "write"],
         annotations=ToolAnnotations(
             title="Update group",
@@ -285,7 +285,7 @@ Never call this without both name and description.""",
 
     @mcp.tool(
         name="delete_group",
-        description="Delete a group from the organization permanently. REQUIRED: 'group_id'. This action cannot be undone. Never call this without group_id.",
+        description="Delete a group from the organization permanently. REQUIRED: 'group_id'. This action cannot be undone.",
         tags=["groups", "organization", "write"],
         annotations=ToolAnnotations(
             title="Delete group",

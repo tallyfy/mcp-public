@@ -163,7 +163,7 @@ def register_form_fields_tools(mcp):
         name="add_form_field_to_step",
         description="""Add form fields (text, dropdown, date, etc.) to a step.
 
-REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_data' (dict).
+REQUIRED: 'template_id', 'step_id', and 'field_data' (dict).
 
 SUPPORTED `field_type` ENUM (9 values, must be one of these exactly):
   - `text`           single-line text input
@@ -194,7 +194,7 @@ CORRECT usage:
   add_form_field_to_step(template_id="abc...", step_id="def...",
     field_data={"field_type":"text","label":"Customer Name","required":True})
 
-Never call this without all three parameters.""",
+""",
         tags=["forms", "fields", "ui", "write", "management", "configuration"],
         annotations=ToolAnnotations(
             title="Add form field to step",
@@ -299,7 +299,7 @@ Never call this without all three parameters.""",
         name="update_form_field",
         description="""Update form field properties, validation, or options on an existing form field.
 
-REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), 'field_id' (32-char hex), and 'field_data' (dict).
+REQUIRED: 'template_id', 'step_id', 'field_id', and 'field_data' (dict).
 
 UPDATABLE vs IMMUTABLE PROPERTIES:
 
@@ -331,7 +331,7 @@ CORRECT usage:
   update_form_field(template_id="abc...", step_id="def...", field_id="ghi...",
     field_data={"guidance":"Use the legal entity name from the contract"})
 
-Never call this without all four parameters.""",
+""",
         tags=["forms", "fields", "ui", "write", "management", "configuration"],
         annotations=ToolAnnotations(
             title="Update form field",
@@ -516,7 +516,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="move_form_field",
-        description="Move form field between steps with position control. REQUIRED: 'template_id' (32-char hex), 'from_step' (32-char hex), 'field_id' (32-char hex), and 'to_step' (32-char hex). Optional: 'position' (1-BASED integer between 1 and 9999, where the first field is position 1, not 0; defaults to 1). Never call this without the four required parameters.",
+        description="Move form field between steps with position control. REQUIRED: 'template_id', 'from_step', 'field_id', and 'to_step'. Optional: 'position' (1-BASED integer between 1 and 9999, where the first field is position 1, not 0; defaults to 1).",
         tags=["forms", "fields", "ui", "write", "management", "positioning"],
         annotations=ToolAnnotations(
             title="Move form field",
@@ -579,7 +579,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="delete_form_field",
-        description="Delete a form field from a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). WARNING: the API does not stop this when an automation depends on the field. The delete goes through, answers 204 No Content, and every automation rule condition pointing at this field is removed along with it, silently, with nothing in the response saying so. The automation itself survives without that condition, so a rule that used to fire on this field can start behaving differently. This cannot be undone. PRE-FLIGHT: call analyze_template_automations first and look for a condition whose 'conditionable_type' is \"Capture\" and whose 'conditionable_id' equals this field_id. If one exists, name the affected automations to the user and get agreement before deleting. Never call this without all three parameters.",
+        description="Delete a form field from a step. REQUIRED: 'template_id', 'step_id', and 'field_id'. WARNING: the API does not stop this when an automation depends on the field. The delete goes through, answers 204 No Content, and every automation rule condition pointing at this field is removed along with it, silently, with nothing in the response saying so. The automation itself survives without that condition, so a rule that used to fire on this field can start behaving differently. This cannot be undone. PRE-FLIGHT: call analyze_template_automations first and look for a condition whose 'conditionable_type' is \"Capture\" and whose 'conditionable_id' equals this field_id. If one exists, name the affected automations to the user and get agreement before deleting.",
         tags=["forms", "fields", "ui", "write", "management", "deletion"],
         annotations=ToolAnnotations(
             title="Delete form field",
@@ -615,7 +615,7 @@ Never call this without all four parameters.""",
 
     @mcp.tool(
         name="get_dropdown_options",
-        description="Get the options on a dropdown/radio/multiselect field, as {\"id\", \"text\"} objects. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_id' (32-char hex). Never call this without all three parameters. The id is needed to WRITE a value: dropdown takes {\"id\",\"text\"}, multiselect a list of {\"id\",\"text\",\"selected\":true}, radio the bare text. Options the API could not have issued (missing an id or a text) are OMITTED rather than given a made-up id, so an empty list means none were usable and NOT that the field has no options - do not feed an empty result back into update_dropdown_options, which would replace the real list.",
+        description="Get the options on a dropdown/radio/multiselect field, as {\"id\", \"text\"} objects. REQUIRED: 'template_id', 'step_id', and 'field_id'. The id is needed to WRITE a value: dropdown takes {\"id\",\"text\"}, multiselect a list of {\"id\",\"text\",\"selected\":true}, radio the bare text. Options the API could not have issued (missing an id or a text) are OMITTED rather than given a made-up id, so an empty list means none were usable and NOT that the field has no options - do not feed an empty result back into update_dropdown_options, which would replace the real list.",
         tags=["forms", "fields", "ui", "read-only", "dropdown", "options"],
         annotations=ToolAnnotations(
             title="Get dropdown options",
@@ -676,7 +676,7 @@ Never call this without all four parameters.""",
         name="update_dropdown_options",
         description="""Replace the options list on a dropdown/radio/multiselect form field.
 
-REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), 'field_id' (32-char hex), and 'options' (list).
+REQUIRED: 'template_id', 'step_id', 'field_id', and 'options' (list).
 
 ACCEPTED `options` FORMATS (pass EITHER; the tool normalizes both):
 
@@ -714,7 +714,7 @@ CORRECT usage:
     options=[{"id": 100, "text": "Approved"}, {"id": 200, "text": "Rejected"}]
   )
 
-Never call this without all four parameters.""",
+""",
         tags=["forms", "fields", "ui", "write", "dropdown", "options", "configuration"],
         annotations=ToolAnnotations(
             title="Update dropdown options",
@@ -775,7 +775,7 @@ RECOMMENDATION OUTPUT: After analyzing the returned data, produce a list of reco
 
 To add suggested fields, use add_form_field_to_step with the recommended field_data.
 
-REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call this without both parameters.""",
+REQUIRED: 'template_id' and 'step_id'.""",
         tags=["forms", "fields", "ui", "read-only", "suggestions", "analysis"],
         annotations=ToolAnnotations(
             title="Suggest form fields",
@@ -832,7 +832,7 @@ REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call th
 
     @mcp.tool(
         name="reorder_form_fields",
-        description="Reorder form fields in a step. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'field_order'. Pass 'field_order' as EITHER a list of field IDs (32-char hex) in the desired order (positions assigned 1, 2, 3, ... by list order), OR a list of {capture_id, position} objects when you need explicit non-sequential positions. Never call this without all three parameters.",
+        description="Reorder form fields in a step. REQUIRED: 'template_id', 'step_id', and 'field_order'. Pass 'field_order' as EITHER a list of field IDs in the desired order (positions assigned 1, 2, 3, ... by list order), OR a list of {capture_id, position} objects when you need explicit non-sequential positions.",
         tags=["forms", "fields", "write", "reorder"],
         annotations=ToolAnnotations(
             title="Reorder form fields",
@@ -947,7 +947,7 @@ whatever names or routes the process. Everything else belongs on the step where 
 happens (add_form_field_to_step). Porting a long paper or Google form wholesale into kickoff
 recreates the problem the customer came with; split it by section instead.
 
-REQUIRED: 'template_id' (32-char hex) and 'field_data' (dict).
+REQUIRED: 'template_id' and 'field_data' (dict).
 
 SUPPORTED `field_type` ENUM (same as step fields):
   text, textarea, date, dropdown, multiselect, radio, file, table, assignees_form
@@ -971,7 +971,7 @@ CORRECT usage:
     field_data={"field_type":"dropdown","label":"Priority","required":true,
                 "options":[{"id":1,"text":"High"},{"id":2,"text":"Medium"},{"id":3,"text":"Low"}]})
 
-Never call this without both parameters.""",
+""",
         tags=["forms", "fields", "kickoff", "prerun", "write", "configuration"],
         annotations=ToolAnnotations(
             title="Add kickoff field",
@@ -1066,7 +1066,7 @@ Never call this without both parameters.""",
         name="update_kickoff_field",
         description="""Update a kickoff (prerun) field on a template.
 
-REQUIRED: 'template_id' (32-char hex), 'field_id' (32-char hex), and 'field_data' (dict).
+REQUIRED: 'template_id', 'field_id', and 'field_data' (dict).
 
 UPDATABLE PROPERTIES:
   label, guidance, required (bool), position, options (dropdown/radio/multiselect),
@@ -1085,7 +1085,7 @@ CORRECT usage:
   update_kickoff_field(template_id="abc...", field_id="def...",
     field_data={"label": "Updated Name", "guidance": "Enter the legal entity name"})
 
-Never call this without all three parameters.""",
+""",
         tags=["forms", "fields", "kickoff", "prerun", "write", "configuration"],
         annotations=ToolAnnotations(
             title="Update kickoff field",
@@ -1207,7 +1207,7 @@ Never call this without all three parameters.""",
         name="delete_kickoff_field",
         description="""Delete a kickoff (prerun) field from a template.
 
-REQUIRED: 'template_id' (32-char hex) and 'field_id' (32-char hex).
+REQUIRED: 'template_id' and 'field_id'.
 
 WARNING: Deleting a kickoff field removes it permanently and drops all collected data
 for that field across existing process runs. This cannot be undone.
@@ -1222,7 +1222,7 @@ PRE-FLIGHT: call analyze_template_automations first and look for a condition who
 'conditionable_type' is "Prerun" and whose 'conditionable_id' equals this field_id. If one
 exists, name the affected automations to the user and get agreement before deleting.
 
-Never call this without both parameters.""",
+""",
         tags=["forms", "fields", "kickoff", "prerun", "write", "deletion"],
         annotations=ToolAnnotations(
             title="Delete kickoff field",
@@ -1259,7 +1259,7 @@ Never call this without both parameters.""",
         name="reorder_kickoff_fields",
         description="""Reorder kickoff (prerun) fields on a template.
 
-REQUIRED: 'template_id' (32-char hex) and 'field_order' (list of field IDs in desired order).
+REQUIRED: 'template_id' and 'field_order' (list of field IDs in desired order).
 
 The API assigns position sequentially based on array order: first ID gets position 1,
 second gets position 2, etc. Fields not included in field_order are appended at the end
@@ -1269,7 +1269,7 @@ CORRECT usage:
   reorder_kickoff_fields(template_id="abc...",
     field_order=["field_id_3", "field_id_1", "field_id_2"])
 
-Never call this without both parameters.""",
+""",
         tags=["forms", "fields", "kickoff", "prerun", "write", "reorder"],
         annotations=ToolAnnotations(
             title="Reorder kickoff fields",
@@ -1346,7 +1346,7 @@ Never call this without both parameters.""",
         name="get_kickoff_dropdown_options",
         description="""Get dropdown/radio/multiselect options for a kickoff (prerun) field.
 
-REQUIRED: 'template_id' (32-char hex) and 'field_id' (32-char hex).
+REQUIRED: 'template_id' and 'field_id'.
 
 Returns the options array for the specified kickoff field. Only works on fields with
 field_type dropdown, radio, or multiselect; returns an error for other field types.
@@ -1354,7 +1354,7 @@ field_type dropdown, radio, or multiselect; returns an error for other field typ
 CORRECT usage:
   get_kickoff_dropdown_options(template_id="abc...", field_id="def...")
 
-Never call this without both parameters.""",
+""",
         tags=["forms", "fields", "kickoff", "prerun", "read-only", "dropdown", "options"],
         annotations=ToolAnnotations(
             title="Get kickoff dropdown options",

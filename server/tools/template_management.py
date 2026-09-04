@@ -802,7 +802,7 @@ get_template_steps(step_id=..., full_text=True).""",
 
         Args:
             page: Page number to fetch (default: 1)
-            folder: Optional folder ID (32-char hex) or folder name to filter templates by folder
+            folder: Optional folder ID or folder name to filter templates by folder
 
         Returns:
             Dict with 'data' (list of templates) and 'meta' (pagination info)
@@ -992,7 +992,7 @@ Default deadline is value=1, unit='day', option='from', step='start_run'.
 
 This tool only SUGGESTS. To apply a suggestion, pass the same four-key dict to update_step as step_data={'deadline': {...}}.
 
-REQUIRED: Both 'template_id' and 'step_id' must be provided (32-character hex strings). Never call this without both parameters.""",
+REQUIRED: Both 'template_id' and 'step_id' must be provided (32-character hex strings).""",
         tags=["templates", "workflow", "analysis", "deadlines", "read-only"],
         annotations=ToolAnnotations(
             title="Suggest step deadline",
@@ -1046,7 +1046,7 @@ REQUIRED: Both 'template_id' and 'step_id' must be provided (32-character hex st
         name="add_assignees_to_step",
         description="""Add assignees (users or guests or both) to a specific step in a template.
 
-REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'assignees'.
+REQUIRED: 'template_id', 'step_id', and 'assignees'.
 
 'assignees' accepts the following format:
 Dict with 'users' and/or 'guests' keys (to add guests by email):
@@ -1079,7 +1079,7 @@ NOT turn it off, and no MCP tool clears it; only the Assign tab in the browser
 does, as a side effect of choosing certain assignee modes. To stop a step
 offering a guest slot, send 'allow_guest_owners': False through update_step.
 
-Never call this without all three parameters.""",
+""",
         tags=["templates", "workflow", "write", "management", "assignees"],
         annotations=ToolAnnotations(
             title="Add assignees to step",
@@ -1215,7 +1215,7 @@ existing title and assignees (members, guests and groups), which the API would
 otherwise clear on an update that omits them. To change who a step is assigned to,
 use add_assignees_to_step instead.
 
-REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'description' (new text, HTML allowed). Never call this without all three parameters.""",
+REQUIRED: 'template_id', 'step_id', and 'description' (new text, HTML allowed).""",
         tags=["templates", "workflow", "write", "management", "editing"],
         annotations=ToolAnnotations(
             title="Edit step description",
@@ -1275,7 +1275,7 @@ REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'description
         name="update_step",
         description="""Edit an EXISTING step in place, keeping its id, automations, form fields and history. To RENAME a step, pass 'title'. Also use this to change its deadline, start date, type or instructions. Never delete_step then add_step_to_template to edit: that mints a NEW id and orphans every automation pointing at the old one.
 
-REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'step_data', a dict of ONLY the fields to change. A field you omit is left alone; pass an empty list to CLEAR one. An unknown key is refused with the full list of valid ones.
+REQUIRED: 'template_id', 'step_id', and 'step_data', a dict of ONLY the fields to change. A field you omit is left alone; pass an empty list to CLEAR one. An unknown key is refused with the full list of valid ones.
 
 step_data keys:
   - 'title': the step name. This is the rename.
@@ -1288,7 +1288,7 @@ step_data keys:
 
 To MOVE a step use reorder_step; for questions use add_form_field_to_step.
 
-Never call this without all three parameters.""",
+""",
         tags=["templates", "workflow", "write", "management", "editing", "deadlines"],
         annotations=ToolAnnotations(
             title="Update a step in place",
@@ -1356,7 +1356,7 @@ Never call this without all three parameters.""",
         name="add_step_to_template",
         description="""Add a new step to a template. Call this repeatedly after create_template, one call per step, in order. When building from a user description or document, break the workflow into logical steps and call this for each.
 
-REQUIRED: 'template_id' (32-char hex) and 'step_data' (dict with 'title'). An unknown key is refused with the full list of valid ones.
+REQUIRED: 'template_id' and 'step_data' (dict with 'title'). An unknown key is refused with the full list of valid ones.
 
 step_data keys:
   - 'title': step name (REQUIRED)
@@ -1373,7 +1373,7 @@ step_data keys:
       'email'          "Email Draft": a human clicks SEND
       'expiring_email' "Email Auto-Send": sends at deadline, self-completes
 
-Never call this without both parameters.""",
+""",
         tags=["templates", "workflow", "write", "management", "creation"],
         annotations=ToolAnnotations(
             title="Add step to template",
@@ -1484,7 +1484,7 @@ Use this data to suggest kickoff fields that would help initialize the workflow 
 - Field types: text, textarea, date, dropdown, multiselect, radio, file, table, assignees_form
   (there is NO `number` and NO `checkbox` field type; add_kickoff_field rejects both)
 
-REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.""",
+REQUIRED: 'template_id'.""",
         tags=["templates", "workflow", "analysis", "kickoff", "read-only"],
         annotations=ToolAnnotations(
             title="Suggest kickoff fields",
@@ -1536,7 +1536,7 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
 
     @mcp.tool(
         name="get_kickoff_fields",
-        description="Get all kickoff/prerun fields for a template. REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.",
+        description="Get all kickoff/prerun fields for a template. REQUIRED: 'template_id'.",
         tags=["templates", "kickoff", "prerun", "forms", "read-only"],
         annotations=ToolAnnotations(
             title="Get kickoff fields",
@@ -1574,7 +1574,7 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
         name="get_template_steps",
         description=f"""Get all steps for a template in order. USE THIS instead of get_template when the user asks about steps.
 
-MANDATORY: 'template_id' (32-char hex string) is required.
+MANDATORY: 'template_id' is required.
 
 USE THIS TOOL when the user asks:
 - "What are the steps in [template]?"
@@ -1717,7 +1717,7 @@ partial whenever a marker is present. If any text CONTAINS "{TRUNCATION_MARKER_P
 string is only part of the real value: never write it back, re-read that one step first with
 get_template_steps(step_id=..., full_text=True).
 
-REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.""",
+REQUIRED: 'template_id'.""",
         tags=["templates", "workflow", "analysis", "health", "read-only", "optimization"],
         annotations=ToolAnnotations(
             title="Assess template health",
@@ -1760,7 +1760,7 @@ REQUIRED: 'template_id' (32-character hex string). Never call this without the t
         name="update_template",
         description="""Update a template's metadata (title, summary, settings).
 
-REQUIRED: 'template_id' (32-char hex) plus at least one property to update.
+REQUIRED: 'template_id' plus at least one property to update.
 
 Updatable fields: title, summary, guidance, icon, alias, webhook, is_public, is_featured,
 auto_naming, folderize_process, allow_launcher_change_name, is_pinned, default_folder,
@@ -1777,7 +1777,7 @@ CORRECT usage:
   update_template(template_id="abc123...", template_data={"title": "New Template Name"})
   update_template(template_id="abc123...", template_data={"summary": "Updated", "is_public": True})
 
-Never call this without template_id.""",
+""",
         tags=["templates", "blueprints", "write", "management", "configuration"],
         annotations=ToolAnnotations(
             title="Update template",
@@ -1874,7 +1874,7 @@ Never call this without template_id.""",
         name="clone_template",
         description="""Clone (duplicate) a template with a new name.
 
-REQUIRED: 'template_id' (32-char hex) and 'new_name' (string).
+REQUIRED: 'template_id' and 'new_name' (string).
 
 The clone copies steps, form fields and automation rules. Permissions are handled
 by the API's own clone semantics and are NOT controllable from here: there is no
@@ -1883,7 +1883,7 @@ parameter to opt in or out.
 CORRECT usage:
   clone_template(template_id="a1b2c3d4e5f6789012345678901234ef", new_name="Employee Onboarding v2")
 
-Never call this without both required parameters.""",
+""",
         tags=["templates", "blueprints", "write", "management", "clone", "duplicate"],
         annotations=ToolAnnotations(
             title="Clone template",
@@ -1949,7 +1949,7 @@ NOT near-duplicate templates. Low overlap: separate templates.
 REQUIRED: 'title' (short and noun-like: "Employee Onboarding", not a sentence).
 Optional: 'type' ('procedure' for multi-step workflows, 'form' for data
 collection, 'document' for reference docs), 'summary', 'guidance', 'starred'.
-Never call this without title.""",
+""",
         tags=["templates", "blueprints", "write", "create"],
         annotations=ToolAnnotations(
             title="Create template",
@@ -1998,7 +1998,7 @@ Never call this without title.""",
 
     @mcp.tool(
         name="delete_template",
-        description="""ARCHIVE a template. REQUIRED: 'template_id' (32-char hex).
+        description="""ARCHIVE a template. REQUIRED: 'template_id'.
 
 The TEMPLATE itself is recoverable. It is archived (hidden from default template
 lists), its steps, form fields and automation rules are preserved, and Tallyfy
@@ -2013,7 +2013,7 @@ Processes already running are unaffected, so work in flight keeps its content.
 Permanently purging a template is a separate admin-only API operation that this tool
 does not perform, and it still requires the template to be archived first.
 
-Never call this without template_id.""",
+""",
         tags=["templates", "blueprints", "write", "delete"],
         annotations=ToolAnnotations(
             title="Delete template",
@@ -2057,7 +2057,7 @@ Never call this without template_id.""",
 
     @mcp.tool(
         name="delete_step",
-        description="""Delete a step from a template PERMANENTLY. REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex).
+        description="""Delete a step from a template PERMANENTLY. REQUIRED: 'template_id' and 'step_id'.
 
 Unlike archiving a template, this is a true hard delete with no restore endpoint. It cannot be undone.
 
@@ -2084,7 +2084,7 @@ template, because api-v2 checks the whole organization while this scan sees one 
 If `deadline_anchors_unavailable` is present the check did not run, which is not a clean
 result. Treat any refusal as real; act on its message rather than retrying.
 
-Never call this without both parameters.""",
+""",
         tags=["templates", "steps", "write", "delete"],
         annotations=ToolAnnotations(
             title="Delete step",
@@ -2118,7 +2118,7 @@ Never call this without both parameters.""",
 
     @mcp.tool(
         name="clone_step",
-        description="Clone (duplicate) a step within a template. REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Creates an exact copy of the step including form fields and assignees. Never call this without both parameters.",
+        description="Clone (duplicate) a step within a template. REQUIRED: 'template_id' and 'step_id'. Creates an exact copy of the step including form fields and assignees.",
         tags=["templates", "steps", "write", "clone"],
         annotations=ToolAnnotations(
             title="Clone step",
@@ -2152,7 +2152,7 @@ Never call this without both parameters.""",
 
     @mcp.tool(
         name="reorder_step",
-        description="Move a step to a new position in a template. REQUIRED: 'template_id' (32-char hex), 'step_id' (32-char hex), and 'position' (1-based integer >= 1; the first step is position 1, not 0). Never call this without all three parameters.",
+        description="Move a step to a new position in a template. REQUIRED: 'template_id', 'step_id', and 'position' (1-based integer >= 1; the first step is position 1, not 0).",
         tags=["templates", "steps", "write", "reorder"],
         annotations=ToolAnnotations(
             title="Reorder step",

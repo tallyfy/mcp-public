@@ -1271,7 +1271,7 @@ required (explicit - no default); dropdown/radio/multiselect also need options
         },
         description="""Mark a task as complete.
 
-REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex).
+REQUIRED: 'run_id' (32-char hex process ID) and 'task_id'.
 
 APPROVAL TASKS need is_approved:
   If the task's task_type is "approval", you MUST pass is_approved=True (approve)
@@ -1298,7 +1298,7 @@ CORRECT usage:
 
 Get run_id, task_id, and task_type from get_tasks_for_process() or get_my_tasks().
 
-Never call this without both required parameters.""",
+""",
         tags={"tasks", "workflow", "write", "lifecycle"},
         annotations=ToolAnnotations(
             title="Complete task",
@@ -1375,7 +1375,7 @@ Never call this without both required parameters.""",
 
     @mcp.tool(
         name="reopen_task",
-        description="""Reopen a previously completed task. REQUIRED: 'run_id' (32-char hex process ID), 'task_id' (32-char hex), and 'reason' (string explanation for reopening).
+        description="""Reopen a previously completed task. REQUIRED: 'run_id' (32-char hex process ID), 'task_id', and 'reason' (string explanation for reopening).
 
 ⚠️ MANDATORY `reason` PARAMETER:
   - The `reason` parameter is REQUIRED (not optional). Empty/whitespace-only strings raise ToolError.
@@ -1395,7 +1395,7 @@ WRONG usage (will fail or create a misleading audit):
   reopen_task(run_id="abc...", task_id="def...", reason="")                   # EMPTY reason → ToolError
   reopen_task(run_id="abc...", task_id="def...", reason="reopening")          # AI-fabricated → misleading audit
 
-Never call this without all three required parameters. Always ask the user to provide the reason.""",
+ Always ask the user to provide the reason.""",
         tags={"tasks", "workflow", "write", "lifecycle"},
         annotations=ToolAnnotations(
             title="Reopen task",
@@ -1447,7 +1447,7 @@ Never call this without all three required parameters. Always ask the user to pr
         name="update_task",
         description="""Update task properties including deadline, assignees, title, or form field values.
 
-REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex).
+REQUIRED: 'run_id' (32-char hex process ID) and 'task_id'.
 Plus at least ONE optional field to update.
 
 """ + _TASKDATA_SHAPE_HELP + """
@@ -1463,7 +1463,7 @@ is read back off the task and re-sent unchanged, so it is preserved rather than
 detached, but an empty list you DO pass means "unassign everyone here".
   update_task(run_id="abc...", task_id="def...", taskdata={"a1b2c3d4e5f6789012345678901234ef": "Acme Corp"})
 
-Never call this without run_id and task_id.""",
+""",
         tags={"tasks", "workflow", "write", "update"},
         annotations=ToolAnnotations(
             title="Update task",
@@ -1598,7 +1598,7 @@ Never call this without run_id and task_id.""",
 
     @mcp.tool(
         name="get_task",
-        description="Get a single task from a process by ID, including any form fields (questions) on it and the answers submitted so far. REQUIRED: 'run_id' (32-char hex process ID) and 'task_id' (32-char hex). Never call this without both parameters.",
+        description="Get a single task from a process by ID, including any form fields (questions) on it and the answers submitted so far. REQUIRED: 'run_id' (32-char hex process ID) and 'task_id'.",
         tags={"tasks", "workflow", "read-only"},
         annotations=ToolAnnotations(
             title="Get task",
@@ -1635,7 +1635,7 @@ Never call this without run_id and task_id.""",
 
     @mcp.tool(
         name="get_standalone_task",
-        description="Get a standalone (one-off) task by ID, including any form fields (questions) on it and the answers submitted so far. REQUIRED: 'task_id' (32-char hex). Never call this without task_id.",
+        description="Get a standalone (one-off) task by ID, including any form fields (questions) on it and the answers submitted so far. REQUIRED: 'task_id'.",
         tags={"tasks", "workflow", "read-only", "standalone"},
         annotations=ToolAnnotations(
             title="Get standalone task",
@@ -1676,7 +1676,7 @@ Never call this without run_id and task_id.""",
 Use THIS tool (not update_task) when the task has no run_id or was created as a one-off task.
 Use update_task instead when the task belongs to a workflow process run.
 
-REQUIRED: 'task_id' (32-char hex) plus at least ONE field to update.
+REQUIRED: 'task_id' plus at least ONE field to update.
 
 """ + _TASKDATA_SHAPE_HELP + """
 
@@ -1687,7 +1687,7 @@ CORRECT usage:
   update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": "new value"})
   update_standalone_task(task_id="abc...", taskdata={"a1b2c3d4e5f6789012345678901234ef": {"id": 2, "text": "Approved"}})
 
-Never call this without task_id. Do NOT pass a run_id: standalone tasks don't use one.""",
+ Do NOT pass a run_id: standalone tasks don't use one.""",
         tags={"tasks", "workflow", "write", "standalone", "update"},
         annotations=ToolAnnotations(
             title="Update standalone task",
@@ -1817,7 +1817,7 @@ Never call this without task_id. Do NOT pass a run_id: standalone tasks don't us
 
     @mcp.tool(
         name="complete_kickoff_form",
-        description="Complete a process kickoff form to mark it as submitted. REQUIRED: 'run_id' (32-char hex process ID). Never call this without run_id.",
+        description="Complete a process kickoff form to mark it as submitted. REQUIRED: 'run_id' (32-char hex process ID).",
         tags={"tasks", "kickoff", "write"},
         annotations=ToolAnnotations(
             title="Complete kickoff form",

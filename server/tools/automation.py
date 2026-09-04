@@ -848,7 +848,7 @@ analyze_template_automations first and send back EVERY condition and action you
 want to keep: a shorter list force-deletes the rest, HTTP 200, no warning.
 Omitting 'conditions' or 'actions' is a 422.
 
-REQUIRED (all three): 'template_id' (32-char hex), 'automation_id' (32-char hex), 'automation_data' (dict).
+REQUIRED (all three): 'template_id', 'automation_id', 'automation_data' (dict).
 
 Use "actions" (NOT "then_actions"). Use "alias" (NOT "automated_alias"). Use "step"/"field"/"kickoff" for conditionable_type (auto-resolved).
 
@@ -942,7 +942,7 @@ To keep a condition or action UNCHANGED, resend it verbatim including its `id`."
 
     @mcp.tool(
         name="delete_automation_rule",
-        description="Remove an automation rule from a workflow template. REQUIRED: 'template_id' (32-char hex) and 'automation_id' (32-char hex). Never call this without both parameters.",
+        description="Remove an automation rule from a workflow template. REQUIRED: 'template_id' and 'automation_id'.",
         tags=["automation", "rules", "delete", "write", "admin"],
         annotations=ToolAnnotations(
             title="Delete automation rule",
@@ -1077,7 +1077,7 @@ if they reference different steps. Always compare conditionable_id AND target_st
 To consolidate: review redundant_groups, then use update_automation_rule to merge actions and
 delete_automation_rule to remove duplicates.
 
-REQUIRED: 'template_id' (32-character hex string). Never call this without the template_id parameter.""",
+REQUIRED: 'template_id'.""",
         tags=["automation", "automations", "rules", "list", "read", "analysis",
               "optimization", "read-only"],
         annotations=ToolAnnotations(
@@ -1302,7 +1302,7 @@ RETURN: {template_id, template_title, suggestions: [{type, priority:"high"|"medi
 
 EXAMPLE: suggest_automation_consolidation(template_id="58c03f...") returns {template_title:"New hire onboarding", suggestions:[{type:"orphaned_rule",priority:"high",rule_ids:["3f8a1c0d9e2b4a6c8d0e1f2a3b4c5d6e"],orphaned_step_ids:["7a1b2c3d4e5f60718293a4b5c6d7e8f9"],recommended_action:"review"},{type:"exact_duplicate",priority:"high",rule_ids:["b1c2d3e4f5061728394a5b6c7d8e9f00","c2d3e4f5061728394a5b6c7d8e9f0011"],recommended_action:"delete_duplicates"}], summary:{total_automations:12,total_suggestions:5,high_priority:2}}. Remediation: "delete_duplicates" then `delete_automation_rule`; "merge_actions" then `update_automation_rule`; "review"/"review_and_resolve" then ask a human before deleting.
 
-REQUIRED: 'template_id' (32-character hex). Never call without it.""",
+REQUIRED: 'template_id'. Never call without it.""",
         tags=["automation", "analysis", "optimization", "suggestions", "read-only"],
         annotations=ToolAnnotations(
             title="Suggest automation consolidation",
@@ -1386,7 +1386,7 @@ REQUIRED: 'template_id' (32-character hex). Never call without it.""",
 
     @mcp.tool(
         name="get_step_visibility_conditions",
-        description="Analyze when and how a step becomes visible based on all automations. REQUIRED: 'template_id' (32-char hex) and 'step_id' (32-char hex). Never call this without both parameters.",
+        description="Analyze when and how a step becomes visible based on all automations. REQUIRED: 'template_id' and 'step_id'.",
         tags=["automation", "analysis", "conditional", "visibility", "read-only"],
         annotations=ToolAnnotations(
             title="Get step visibility conditions",

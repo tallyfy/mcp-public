@@ -210,7 +210,7 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         },
         description="""Launch a new workflow process (run) from a template.
 
-REQUIRED: 'template_id' (32-char hex) and 'name'. Name it after the template plus
+REQUIRED: 'template_id' and 'name'. Name it after the template plus
 the real-world thing it tracks: "Onboarding - Jane Doe". Generate it yourself; ask
 only if the user wants to pick. Launch ONE process per real-world thing (per hire,
 per client, per order). At volume the fix is less LAUNCHING WORK, not fewer
@@ -349,7 +349,7 @@ WRONG:
 
     @mcp.tool(
         name="get_process",
-        description="Get full details for a single process (run) by ID. REQUIRED: 'run_id' (32-char hex). Never call this without run_id.",
+        description="Get full details for a single process (run) by ID. REQUIRED: 'run_id'.",
         tags={"processes", "workflow", "runs", "read-only"},
         annotations=ToolAnnotations(
             title="Get process",
@@ -388,7 +388,7 @@ Only those properties change: this tool reads the process first and re-sends its
 existing members and groups, which the API would otherwise detach from the
 running process on an update that omits them.
 
-REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'starred'. Never call this without run_id.""",
+REQUIRED: 'run_id' plus at least one of: 'name', 'summary', or 'starred'.""",
         tags={"processes", "workflow", "runs", "write"},
         annotations=ToolAnnotations(
             title="Update process",
@@ -455,7 +455,7 @@ REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'st
 
     @mcp.tool(
         name="archive_process",
-        description="Archive a completed process (run). REQUIRED: 'run_id' (32-char hex). CAUTION: Archived processes are HIDDEN from default views but NOT deleted. All data, tasks, comments, and form-field captures are preserved. Use reactivate_process(run_id) to restore an archived process to active status. To permanently delete a process you must use the universal write fallback (tallyfy_api_write) since no first-class delete tool is exposed. Archived processes can be retrieved via get_organization_runs(archived='only'). Never call this without run_id.",
+        description="Archive a completed process (run). REQUIRED: 'run_id'. CAUTION: Archived processes are HIDDEN from default views but NOT deleted. All data, tasks, comments, and form-field captures are preserved. Use reactivate_process(run_id) to restore an archived process to active status. To permanently delete a process you must use the universal write fallback (tallyfy_api_write) since no first-class delete tool is exposed. Archived processes can be retrieved via get_organization_runs(archived='only').",
         tags={"processes", "workflow", "runs", "write", "archive"},
         annotations=ToolAnnotations(
             title="Archive process",
@@ -487,7 +487,7 @@ REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'st
 
     @mcp.tool(
         name="reactivate_process",
-        description="Reactivate an archived process (run) to make it active again. REQUIRED: 'run_id' (32-char hex). Never call this without run_id.",
+        description="Reactivate an archived process (run) to make it active again. REQUIRED: 'run_id'.",
         tags={"processes", "workflow", "runs", "write"},
         annotations=ToolAnnotations(
             title="Reactivate process",
@@ -520,7 +520,7 @@ REQUIRED: 'run_id' (32-char hex) plus at least one of: 'name', 'summary', or 'st
 
     @mcp.tool(
         name="reopen_kickoff_form",
-        description="Reopen a completed kickoff form to allow edits. REQUIRED: 'run_id' (32-char hex process ID). Never call this without run_id.",
+        description="Reopen a completed kickoff form to allow edits. REQUIRED: 'run_id' (32-char hex process ID).",
         tags={"processes", "kickoff", "write"},
         annotations=ToolAnnotations(
             title="Reopen kickoff form",
