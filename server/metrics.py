@@ -73,10 +73,48 @@ mcp_tool_errors_total = Counter(
     ['tool_name', 'error_type']
 )
 
-# Active connections
-mcp_active_connections = Gauge(
-    'mcp_server_active_connections',
-    'Number of active MCP server connections'
+# Requests in flight (#1161).
+#
+# RENAMED from mcp_server_active_connections, which was never a connection
+# count. Its only two emitters are per-HTTP-request, so it measures requests
+# being served at the scrape instant. On a fast, low-volume server that reads
+# 1 or 2 forever no matter how many clients are connected, and the Grafana
+# panel titled "Active Server Connections" led an operator to conclude almost
+# nobody was talking to the server while it served 14,349 tool calls from 35
+# organizations in 14 days.
+#
+# The rename costs 15 days of history (the Prometheus retention window) and no
+# alert coverage: alerts.yml and recording_rules.yml both reference it zero
+# times. It was preferred over redefining the gauge under its old name, which
+# would have made old and new samples indistinguishable inside that window.
+mcp_requests_in_flight = Gauge(
+    'mcp_server_requests_in_flight',
+    'HTTP requests being served at this instant (NOT connected clients)'
+)
+
+# Active MCP sessions (#1161).
+#
+# This is the question the old panel put in the operator's head and could not
+# answer: how many clients are actually talking to us. It is read from
+# _mcp_sessions in the request middleware, which already maintains last_activity
+# with a stale sweep.
+#
+# ⚠️ HONEST ONLY BECAUSE THERE IS ONE PROCESS PER SCRAPE TARGET. An in-process
+# dict is a per-process truth. Verified before adding this: server/Dockerfile
+# runs `uvicorn server:app` with no --workers, docker-compose declares a single
+# container with no replicas, and prometheus.yml scrapes exactly mcp-server:9000
+# and staging-mcp-server:9000. If the server is ever run multi-worker or scaled
+# out, THIS GAUGE BECOMES WRONG IN THE SAME WAY THE OLD NAME WAS, and it must
+# move to a shared store rather than be left to drift.
+#
+# Two limits the panel description must repeat, because a caveat only a
+# maintainer reads is how #1161 happened in the first place:
+#   - it saturates at MAX_SESSIONS (1000)
+#   - it means "seen within MCP_SESSION_TIMEOUT", not "connected right now".
+#     Over HTTP plus SSE there is no connected state to report.
+mcp_active_sessions = Gauge(
+    'mcp_server_active_sessions',
+    'MCP sessions seen within the session timeout (saturates at MAX_SESSIONS)'
 )
 
 # Durable-record shipping outcome (#890).
@@ -535,24 +573,6 @@ def track_tallyfy_api_call(operation: str):
 # Context Managers
 # ============================================================================
 
-class track_connection:
-    """
-    Context manager to track active connections.
-
-    Example:
-        with track_connection():
-            # connection handling code
-            pass
-    """
-    def __enter__(self):
-        mcp_active_connections.inc()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        mcp_active_connections.dec()
-        return False
-
-
 # ============================================================================
 # Manual Metric Functions
 # ============================================================================
@@ -570,14 +590,19 @@ def record_tool_error(tool_name: str, error_type: str, duration: float):
     mcp_request_duration_seconds.labels(tool_name=tool_name).observe(duration)
 
 
-def increment_active_connections():
-    """Increment active connection count."""
-    mcp_active_connections.inc()
+def increment_requests_in_flight():
+    """Increment the in-flight request gauge. Pair with the decrement."""
+    mcp_requests_in_flight.inc()
 
 
-def decrement_active_connections():
-    """Decrement active connection count."""
-    mcp_active_connections.dec()
+def decrement_requests_in_flight():
+    """Decrement the in-flight request gauge. Pair with the increment."""
+    mcp_requests_in_flight.dec()
+
+
+def set_active_sessions(count):
+    """Publish the current MCP session count. See the gauge for its limits."""
+    mcp_active_sessions.set(count)
 
 
 # ============================================================================

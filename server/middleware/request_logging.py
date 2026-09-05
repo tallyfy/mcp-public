@@ -622,8 +622,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             for uid in old_pending:
                 del _pending_sessions[uid]
 
-        # Track active connection
-        metrics.increment_active_connections()
+            # Publish the session count (#1161). Set here rather than on every
+            # request because this is the one place the dict is authoritative:
+            # immediately after the MAX_SESSIONS trim and the stale sweep.
+            metrics.set_active_sessions(len(_mcp_sessions))
 
         # For tools/call requests, log the entry BEFORE processing so it appears before tool execution logs
         tools_call_logged = False
@@ -653,6 +655,14 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         transaction = None
 
         try:
+            # Increment INSIDE the try (#1161). It used to sit ~28 lines above,
+            # outside this block, so an exception raised while building the log
+            # strings leaked a permanent +1 that only a restart cleared. Those
+            # lines only format strings, so nothing was observed leaking, but
+            # the pairing was one edit away from being broken. The decrement is
+            # in this try's finally; keep them in the same block.
+            metrics.increment_requests_in_flight()
+
             # Start Sentry transaction for performance monitoring (skip /metrics)
             if should_trace:
                 transaction = sentry_sdk.start_transaction(
@@ -843,8 +853,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             if should_trace and transaction:
                 transaction.__exit__(None, None, None)
 
-            # Decrement active connection
-            metrics.decrement_active_connections()
+            # Decrement the in-flight gauge. Paired with the increment at the
+            # top of this same try.
+            metrics.decrement_requests_in_flight()
 
         # Known scanner/bot paths - demote to DEBUG level when unauthenticated
         _SCANNER_PATTERNS = {

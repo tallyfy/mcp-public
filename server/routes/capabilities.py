@@ -9,7 +9,12 @@ Explicitly declares server capabilities for standards compliance with:
 
 from unittest.mock import MagicMock
 
-from mcp.types import ServerCapabilities, ToolsCapability, ResourcesCapability
+from mcp.types import (
+    LATEST_PROTOCOL_VERSION,
+    ServerCapabilities,
+    ToolsCapability,
+    ResourcesCapability,
+)
 
 from constants import MCP_RESOURCE_URL
 # Imported, not re-listed: this is the exact array the live
@@ -138,7 +143,7 @@ def register_capabilities(mcp):
 
 ## Transport
 
-- **Protocol**: MCP (Model Context Protocol) v1.0
+- **Protocol**: MCP (Model Context Protocol) {LATEST_PROTOCOL_VERSION}
 - **Transport**: Streamable HTTP, served at `/`, `/mcp` and `/mcp/`
 - **Format**: JSON (application/json)
 
@@ -150,7 +155,7 @@ def register_capabilities(mcp):
 
 ## Standards Compliance
 
-- MCP Protocol v1.0 compliant
+- MCP Protocol {LATEST_PROTOCOL_VERSION} (one revision behind the current published spec — see tallyfy/mcp#756)
 - OAuth 2.1 with PKCE (RFC 7636)
 - Tool safety annotations (readOnlyHint, destructiveHint, idempotentHint)
 - Response minimization (no diagnostic fields)
