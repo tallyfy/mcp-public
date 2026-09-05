@@ -53,7 +53,7 @@ on an automation and inert on a step. Do not merge the two sets.
 import logging
 from typing import Any, Dict
 
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from utils.fastmcp_types import GenericDict
 from utils.fastmcp_errors import handle_tallyfy_errors

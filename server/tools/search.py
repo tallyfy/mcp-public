@@ -12,7 +12,7 @@ from typing import Annotated, Any, Dict, List, Optional
 import httpx
 
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from pydantic import Field
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations

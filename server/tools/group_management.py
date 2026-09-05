@@ -3,7 +3,7 @@ Group Management Tools
 Tools for managing organization groups
 """
 
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from fastmcp.exceptions import ToolError
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
@@ -203,7 +203,7 @@ CORRECT usage:
 
         Args:
             name: Group name (REQUIRED — max 200 chars, unique per organization)
-            description: Group description (REQUIRED — api-v2's CreateGroupRequest
+            description: Group description (REQUIRED. api-v2's CreateGroupRequest
                 declares 'description' => 'required|string', so a create without
                 one is rejected with a 422)
             members: List of numeric user IDs to add as members (optional)

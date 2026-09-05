@@ -396,18 +396,11 @@ AutomationId = Annotated[str, Field(
 )]
 
 # Common optional types
-OptionalString = Annotated[Optional[str], Field(
-    description="Optional string parameter"
-)]
+OptionalString = Annotated[Optional[str], Field()]
 
-OptionalInt = Annotated[Optional[int], Field(
-    ge=0,
-    description="Optional integer parameter (non-negative)"
-)]
+OptionalInt = Annotated[Optional[int], Field(ge=0)]
 
-OptionalBool = Annotated[Optional[bool], Field(
-    description="Optional boolean parameter"
-)]
+OptionalBool = Annotated[Optional[bool], Field()]
 
 # `top_secret` was an OptionalBool, which publishes the schema entry "Optional
 # boolean parameter" and says nothing at all. #585 asked for two things: that the
@@ -587,13 +580,9 @@ StepPosition = Annotated[int, Field(
 )]
 
 # Generic container types for flexible responses
-GenericDict = Annotated[Dict[str, Any], Field(
-    description="Generic dictionary response"
-)]
+GenericDict = Annotated[Dict[str, Any], Field()]
 
-GenericList = Annotated[List[Dict[str, Any]], Field(
-    description="Generic list of dictionary responses"
-)]
+GenericList = Annotated[List[Dict[str, Any]], Field()]
 
 FieldIdList = Annotated[List[str], Field(
     description="Ordered list of field IDs (32-char hex strings)",

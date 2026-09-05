@@ -8,7 +8,7 @@ import re
 from typing import List, Optional
 
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
 from utils.fastmcp_errors import handle_tallyfy_errors
@@ -434,10 +434,10 @@ CORRECT usage:
         Args:
             task_id: Task ID to comment on (REQUIRED - 32-character hex string)
             content: Comment text (REQUIRED)
-            run_id: Process/run ID — not used by this endpoint but accepted so callers retain
+            run_id: Process/run ID, not used by this endpoint but accepted so callers retain
                 it in context for a subsequent get_task_comments call (optional)
-            label: Comment type — "comment" | "problem" | "resolve" | "improvement" | "advice" (default: "comment")
-            state: Visibility — "hide-for-guests" (default) | "open" | "collapsed".
+            label: Comment type: "comment" | "problem" | "resolve" | "improvement" | "advice" (default: "comment")
+            state: Visibility: "hide-for-guests" (default) | "open" | "collapsed".
                 This server substitutes no default of its own: when the caller omits
                 'state' it is forwarded as None and the value is chosen by api-v2,
                 which falls back to Thread::HIDE ("hide-for-guests") in
@@ -601,9 +601,9 @@ CORRECT usage:
             task_id: Task ID (REQUIRED - 32-character hex string)
             comment_id: Comment ID to update (REQUIRED)
             content: New comment text (REQUIRED)
-            run_id: Process/run ID — not used by this endpoint, accepted for context continuity (optional)
-            label: Comment type — "comment" | "problem" | "resolve" | "improvement" | "advice" (optional)
-            state: Visibility — "open" | "hide-for-guests" | "collapsed" (optional)
+            run_id: Process/run ID, not used by this endpoint. Accepted for context continuity (optional)
+            label: Comment type: "comment" | "problem" | "resolve" | "improvement" | "advice" (optional)
+            state: Visibility: "open" | "hide-for-guests" | "collapsed" (optional)
             sent_to: List of numeric user IDs to @mention (optional). Rendered into
                 the body as @[<user_id>] markup — the API has no request-side
                 sent_to parameter, body markup is what notifies.
@@ -660,7 +660,7 @@ CORRECT usage:
         Args:
             task_id: Task ID (REQUIRED - 32-character hex string)
             comment_id: Comment ID to delete (REQUIRED)
-            run_id: Process/run ID — not used by this endpoint, accepted for context continuity (optional)
+            run_id: Process/run ID, not used by this endpoint. Accepted for context continuity (optional)
 
         Returns:
             Result of the deletion operation
@@ -696,7 +696,7 @@ CORRECT usage:
         Args:
             task_id: Task ID (REQUIRED - 32-character hex string)
             content: Issue description (REQUIRED)
-            run_id: Process/run ID — not used by this endpoint, accepted for context continuity (optional)
+            run_id: Process/run ID, not used by this endpoint. Accepted for context continuity (optional)
 
         Returns:
             Created issue comment object
@@ -735,7 +735,7 @@ CORRECT usage:
         Args:
             task_id: Task ID (REQUIRED - 32-character hex string)
             thread_id: Issue comment ID to resolve (REQUIRED - returned by report_task_issue)
-            run_id: Process/run ID — not used by this endpoint, accepted for context continuity (optional)
+            run_id: Process/run ID, not used by this endpoint. Accepted for context continuity (optional)
 
         Returns:
             Result of the resolution operation

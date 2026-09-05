@@ -155,7 +155,10 @@ def register_capabilities(mcp):
 
 ## Standards Compliance
 
-- MCP Protocol {LATEST_PROTOCOL_VERSION} (one revision behind the current published spec — see tallyfy/mcp#756)
+- MCP Protocol {LATEST_PROTOCOL_VERSION}, the current published revision. The framework serves
+  both this revision and the older session-based handshake from one deployment, negotiated per
+  connection. Work still in progress against this revision (server/discover, ttlMs/cacheScope on
+  list results, the Mcp-Method and Mcp-Name headers) is tracked under tallyfy/mcp#756.
 - OAuth 2.1 with PKCE (RFC 7636)
 - Tool safety annotations (readOnlyHint, destructiveHint, idempotentHint)
 - Response minimization (no diagnostic fields)

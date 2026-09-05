@@ -9,7 +9,7 @@ from typing import Any, Dict
 
 from email_validator import validate_email, EmailNotValidError
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
 from utils.fastmcp_errors import handle_tallyfy_errors

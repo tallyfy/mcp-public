@@ -3,7 +3,7 @@ Automation Tools
 Tools for managing template automation rules and analysis
 """
 
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
 from fastmcp.exceptions import ToolError

@@ -1,8 +1,31 @@
 tallyfy==1.3.12
 dateparser==1.2.1
-fastmcp==3.4.6
+fastmcp==4.0.3
+
+# The MCP Python SDK, pinned as a RANGE rather than an exact version on purpose.
+# It arrives transitively through fastmcp, which itself asks for
+# `mcp<3.0.0,>=2.0.0`; the exact version is resolved in requirements.lock. The
+# bound is stated here because the SDK major is what decides which protocol
+# revision we can speak (2.x is the first that knows 2026-07-28), so a silent
+# slide back to 1.x would undo the whole upgrade with no diff to review.
+# See tallyfy/mcp#1236.
+mcp>=2.0.0,<3.0.0
+
 requests==2.33.0
+
+# httpx STAYS an explicit direct pin, and this line is load-bearing rather than
+# leftover. FastMCP 4 dropped httpx entirely and uses httpx2, so httpx no longer
+# arrives transitively. Eleven `except httpx.` handlers across server/ and host/
+# wrap OUR OWN httpx calls, and every one of them stops matching if this line is
+# tidied away as "transitive". See tallyfy/mcp#1242 section 4b.
 httpx==0.28.1
+
+# httpx2 is what FastMCP 4 uses for its own HTTP, including the JWKS fetch inside
+# JWTVerifier. Pinned explicitly because Dependabot only reads requirements.txt,
+# so a transitive-only TLS client would carry no scanner at all. Note it verifies
+# through the OS trust store via truststore rather than through certifi.
+httpx2==2.12.0
+
 uvicorn==0.35.0
 python-dotenv==1.2.2
 starlette==1.3.1

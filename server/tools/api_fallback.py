@@ -68,7 +68,7 @@ from typing import Annotated, Any, Dict, Literal, Optional
 
 import httpx
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
@@ -270,7 +270,7 @@ ApiCallPath = Annotated[str, Field(
         "'/organizations/abc123/users' matches the template "
         "'/organizations/{org}/users' in the live OpenAPI spec. "
         "Use curly-brace placeholders (e.g. '{org}') only if you "
-        "genuinely don't know the value — the server substitutes "
+        "genuinely don't know the value. The server substitutes "
         "the authenticated org_id for '{org}' automatically."
     ),
     examples=["/organizations/abc123/users", "/me"],

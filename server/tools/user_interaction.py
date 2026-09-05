@@ -15,7 +15,7 @@ forwarded to the agent as a synthetic user turn.
 """
 
 from typing import List, Dict, Any, Optional
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from metrics import track_tool_execution
 
@@ -75,7 +75,7 @@ def register_user_interaction_tools(mcp):
                 - key: Unique field identifier (used as key in response data)
                 - label: Display label for the field
                 - required: Whether the field is required (default: false)
-                - options: For select/radio — list of {label, value, description?}
+                - options: For select/radio, a list of {label, value, description?}
                 - placeholder: Placeholder text for text inputs
                 - validators: {required?, minLength?, maxLength?, pattern?}
                 - visible: Whether to show the field (default: true)
@@ -239,7 +239,7 @@ def register_user_interaction_tools(mcp):
                 ``cancelable`` is False, the cancel button is hidden
                 regardless of this value.
             header: Short category label, max 12 chars (e.g. "Confirm")
-            cancelable: When False, the user must confirm — no decline
+            cancelable: When False, the user must confirm. There is no decline
                 path. Default True. Use sparingly: forcing confirmation
                 without a decline option is a UX anti-pattern except when
                 the agent's earlier turn explicitly framed the prompt as

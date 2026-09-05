@@ -7,7 +7,7 @@ import logging
 from typing import List, Dict, Any, Optional, Union
 
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from tallyfy import TallyfySDK, TaskOwners
 # `tallyfy.models.Task` is deliberately NOT imported. Every task response in this
 # module is now serialized from the raw api-v2 body through
@@ -1018,7 +1018,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
 
         Args:
             process_id: Process (run) ID to get tasks for (provide this OR run_id OR process_name)
-            run_id: Alias for process_id — consistent with run_id used in other task tools
+            run_id: Alias for process_id, consistent with run_id used in other task tools
             process_name: Process (run) name to get tasks for (alternative to process_id/run_id)
             status: Filter tasks by status (optional)
             sort: Sort order for tasks (optional)
@@ -1156,7 +1156,7 @@ required (explicit - no default); dropdown/radio/multiselect also need options
             deadline: Deadline as natural language — e.g. "April 12 2026 at 3pm", "next Monday"
             description: Task description/summary (optional)
             string (task|approval|expiring|email|expiring_email)
-            task_type: Task type — string (task|approval|expiring|email|expiring_email)
+            task_type: Task type: string (task|approval|expiring|email|expiring_email)
             user_names: Member full names to assign (optional)
             user_emails: Member email addresses to assign (optional)
             guest_emails: Guest email addresses to assign (optional)
@@ -1532,7 +1532,7 @@ detached, but an empty list you DO pass means "unassign everyone here".
                 get_task / get_standalone_task, so a write is verifiable.
             prevent_guest_comment: Prevent guests from commenting
             started_at: Task start timestamp in "YYYY-MM-DD HH:MM:SS" format
-            task_type: Task type string
+            task_type: Task type (task, approval, expiring, email, expiring_email)
             webhook: Webhook URL to notify on task updates
 
         Returns:

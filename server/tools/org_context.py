@@ -32,7 +32,7 @@ import logging
 import re
 
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from typing import Annotated
 from pydantic import Field

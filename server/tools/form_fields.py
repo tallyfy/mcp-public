@@ -6,7 +6,7 @@ Tools for managing form fields in templates
 from typing import List, Union
 
 from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
 from utils.fastmcp_errors import handle_tallyfy_errors
@@ -993,7 +993,7 @@ CORRECT usage:
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
-            field_data: Field definition dict (REQUIRED) — must include field_type, label, required
+            field_data: Field definition dict (REQUIRED). Must include field_type, label, required
 
         Returns:
             Updated template object with the new kickoff field

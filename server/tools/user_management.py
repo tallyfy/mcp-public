@@ -6,7 +6,7 @@ Tools for managing organization users
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from fastmcp.exceptions import ToolError
 from tallyfy import TallyfySDK
 from tallyfy.models import Guest
@@ -530,7 +530,7 @@ Use get_guest(email=...) to read a guest's current profile.""",
         Args:
             email: Guest's email address (REQUIRED)
             associated_members: Full replacement list of numeric member user IDs
-                (REQUIRED — pass [] to clear the association)
+                (REQUIRED. Pass [] to clear the association)
 
         Returns:
             Updated guest object

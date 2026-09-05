@@ -3,7 +3,7 @@ Folder Management Tools
 Tools for discovering and managing organization folders
 """
 
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools import ToolResult
 from fastmcp.exceptions import ToolError
 from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
@@ -344,7 +344,7 @@ treat it as already-done, not as a failure to retry.
         Args:
             folder_id: Folder ID (REQUIRED)
             object_id: ID of the process or template to add (REQUIRED)
-            object_type: Type of object — 'run' for processes, 'checklist' for templates (REQUIRED)
+            object_type: Type of object: 'run' for processes, 'checklist' for templates (REQUIRED)
 
         Returns:
             Created folder-object relation
