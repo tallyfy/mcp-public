@@ -520,12 +520,17 @@ REQUIRED: 'run_id' plus at least one of: 'name', 'summary', or 'starred'.""",
 
     @mcp.tool(
         name="reopen_kickoff_form",
-        description="Reopen a completed kickoff form to allow edits. REQUIRED: 'run_id' (32-char hex process ID).",
+        description=(
+            "Reopen a completed kickoff form, which UN-COMPLETES the process: it takes an "
+            "already-finished run back out of its finished state, not just 'allow edits' on it. "
+            "That can shift SLA/deadline calculations and re-trigger completion-based automations. "
+            "REQUIRED: 'run_id' (32-char hex process ID)."
+        ),
         tags={"processes", "kickoff", "write"},
         annotations=ToolAnnotations(
             title="Reopen kickoff form",
             readOnlyHint=False,
-            destructiveHint=False,
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=True,
         ),
@@ -535,7 +540,11 @@ REQUIRED: 'run_id' plus at least one of: 'name', 'summary', or 'starred'.""",
     @handle_tallyfy_errors("reopen kickoff form")
     def reopen_kickoff_form(run_id: ProcessId) -> GenericDict:
         """
-        Reopen a completed kickoff form.
+        Reopen a completed kickoff form, un-completing the process it belongs to.
+
+        This reverts an already-completed process out of its finished state, with real
+        workflow consequences: SLA/deadline recalculation and any automations that fire on
+        completion. It is not merely "allow edits" on an otherwise-unaffected process.
 
         Args:
             run_id: Process (run) ID (REQUIRED - 32-character hex string)

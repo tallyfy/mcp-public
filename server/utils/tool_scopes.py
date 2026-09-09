@@ -312,6 +312,10 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "analyze_template_automations": _AUTO_R,
     "get_step_visibility_conditions": _AUTO_R,
     "suggest_automation_consolidation": _AUTO_R,
+    # The template path tester (tallyfy/mcp#997). Both are pure reads of one
+    # template document and change nothing.
+    "test_template": _AUTO_R,
+    "test_template_scenario": _AUTO_R,
     "create_automation_rule": _AUTO_W,
     "update_automation_rule": _AUTO_W,
     "delete_automation_rule": _AUTO_W,

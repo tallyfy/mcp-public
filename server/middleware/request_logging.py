@@ -525,10 +525,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         mcp_session_id = request.headers.get("mcp-session-id", "")
 
         # Read pre-decoded JWT claims from OrgIdMiddleware (P2-I — single decode per request)
+        # This is an UNVERIFIED decode (verify_signature=False), so an unauthenticated
+        # caller chooses the claim outright. Bounded by safe_org_label like every other
+        # caller-supplied source below: unbounded, it reaches a log line (`user={user_id}`)
+        # and the durable record's user_id/distinct_id columns, and a newline in it forges
+        # a line the same way an unbounded org_id would (#1223).
         claims = get_jwt_claims()
         user_id = None
         if claims:
-            user_id = claims.get('sub') or claims.get('user_id') or claims.get('uid')
+            user_id = safe_org_label(claims.get('sub') or claims.get('user_id') or claims.get('uid'))
 
         # Extract MCP protocol info for requests to the MCP transport paths.
         # The transport is served at '/' and aliased at '/mcp' + '/mcp/'
@@ -548,7 +553,11 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                         # Extract tool name and org_id for tools/call requests
                         if mcp_method == "tools/call":
                             params = json_body.get("params", {})
-                            mcp_tool_name = params.get("name", "unknown")
+                            # Sanitised like every other caller-supplied source: the tool
+                            # name is arbitrary JSON from the request body and reaches a
+                            # log line, a Sentry tag, and the durable record's tool_name
+                            # field below, so a newline in it forges a line (#1223).
+                            mcp_tool_name = safe_org_label(params.get("name")) or "unknown"
                             # Extract org_id from tool arguments (more reliable than header for MCP)
                             arguments = params.get("arguments", {})
                             # Sanitised like every other caller-supplied

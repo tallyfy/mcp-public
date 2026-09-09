@@ -18,6 +18,15 @@ from utils.fastmcp_types import (
     GenericList,
 )
 from utils.sdk_serializer import serialize_dataclass
+from template_testing.references import orphaned_reference_ids
+from template_testing.document import NotATemplateDocument
+from template_testing.engine import (
+    UnknownAnswerLabel,
+    run_scenario,
+    test_template_document,
+)
+from template_testing.mermaid import render_mermaid
+from template_testing.walk import DEFAULT_MAX_ASSIGNMENTS
 from tools.template_mapping_validation import (
     _has_assignees,
     ACTIONABLE_ID_ALIASES,
@@ -1178,23 +1187,14 @@ REQUIRED: 'template_id'.""",
         for rule in automations:
             conditions = rule.get("conditions") or rule.get("automated_action_conditions") or []
             actions = rule.get("then_actions") or rule.get("actions") or rule.get("automated_action_actions") or []
-            orphaned_ids = []
-            for c in conditions:
-                cid = c.get("conditionable_id", "")
-                if not cid:
-                    continue
-                # api-v2 defaults an omitted conditionable_type to Step nowhere, but
-                # every real condition carries one; fall back to Step defensively.
-                ctype = c.get("conditionable_type") or "Step"
-                valid_ids = condition_id_sets.get(ctype)
-                # valid_ids is None => this type's ids are unavailable; do not flag,
-                # so a valid form-field/kickoff rule is never reported as an orphan.
-                if valid_ids is not None and cid not in valid_ids:
-                    orphaned_ids.append(cid)
-            for a in actions:
-                tid = a.get("target_step_id", "")
-                if tid and tid not in valid_step_ids:
-                    orphaned_ids.append(tid)
+            # The comparison itself lives in template_testing/references.py, and is
+            # SHARED with the template path tester's check 6 (tallyfy/mcp#997). Two
+            # copies of this loop is how the two would come to disagree about what
+            # an id is, which is precisely the mcp#617 regression: the guard below
+            # is subtle and had to be learned once already.
+            orphaned_ids = orphaned_reference_ids(
+                conditions, actions, condition_id_sets, valid_step_ids
+            )
             if orphaned_ids:
                 suggestions.append({
                     'type': 'orphaned_rule',
@@ -1414,3 +1414,166 @@ REQUIRED: 'template_id'. Never call without it.""",
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             result = sdk.templates.get_step_visibility_conditions(org_id, template_id, step_id)
             return ToolResult(content=serialize_dataclass(result) if result else {}, structured_content=None)
+
+    # -----------------------------------------------------------------------
+    # The template path tester (tallyfy/mcp#997)
+    # -----------------------------------------------------------------------
+
+    def _fetch_template_document(sdk, org_id: str, template_id: str) -> dict:
+        """Read the RAW template payload, deliberately not through the SDK model.
+
+        🔴 ``sdk.templates.get_template`` returns a ``Template`` whose ``Step``
+        dataclass maps a FIXED key list and drops everything else, so
+        ``assign_run_starter``, ``owner_id`` and ``ai_assigned`` never survive it
+        on the pinned SDK. Feeding those to the engine reports every
+        run-starter-assigned step as unassigned, which the spec names as the
+        largest single false-positive source in check 4.
+
+        Reading raw also runs BEFORE serialization, so the walk is unaffected by
+        the 500-character string cap and the 25 KB result ceiling. That is the
+        strongest single argument for the engine being a plain function, and it
+        is thrown away by fetching through a model that trims.
+        """
+        endpoint = f"organizations/{org_id}/checklists/{template_id}"
+        response = sdk._make_request(
+            "GET", endpoint, params={"with": "steps,automated_actions,prerun"}
+        )
+        document = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(document, dict):
+            raise ToolError("Template not found")
+        return document
+
+    @mcp.tool(
+        name="test_template",
+        description=(
+            "Test a template BEFORE anyone runs it. Walks every path through the "
+            "template internally and reports PROBLEMS, not paths: a step no answer "
+            "can ever reach, a rule that can never fire, two rules fighting over one "
+            "step, a visible step with nobody assigned, a path where the process gets "
+            "stuck, a rule pointing at something deleted, a deadline counted from a "
+            "step that may not happen, a condition waiting for a dropdown answer that "
+            "no longer exists, and a start date that is set but ignored. "
+            "USE THIS when someone asks whether a template works, why a step never "
+            "appears, why nobody was assigned, or before publishing a template. "
+            "REQUIRED: 'template_id' (32-character hex). "
+            "OPTIONAL: 'max_assignments' (default 50000) bounds the walk; "
+            "'min_severity' is one of info|low|medium|high and defaults to medium. "
+            "RETURNS: 'summary' (one paragraph for a non-engineer), 'coverage', "
+            "'findings' and 'counts'. "
+            "READ 'coverage.exhaustive' FIRST. When it is false the template was too "
+            "large to walk completely, an empty findings list means 'nothing found in "
+            "what was tested' rather than 'no problems', and no finding will claim "
+            "anything can NEVER happen. Raise 'max_assignments' to walk more. "
+            "Each finding carries 'witness', the answers that produce it, in field "
+            "labels rather than ids. Read-only: it changes nothing."
+        ),
+        tags=["automation", "analysis", "template", "testing", "read-only"],
+        annotations=ToolAnnotations(
+            title="Test a template before anyone runs it",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("test_template")
+    @handle_tallyfy_errors("test template")
+    def test_template(
+        template_id: TemplateId,
+        max_assignments: int = DEFAULT_MAX_ASSIGNMENTS,
+        min_severity: str = "medium",
+    ) -> GenericDict:
+        """
+        Walk every path through a template and report problems, not paths.
+
+        Args:
+            template_id: Template ID (REQUIRED - 32-character hex string)
+            max_assignments: Cap on paths walked per independent group of rules
+            min_severity: Lowest severity to return (info|low|medium|high)
+
+        Returns:
+            Dictionary with summary, coverage, findings and counts
+        """
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            document = _fetch_template_document(sdk, org_id, template_id)
+            try:
+                report = test_template_document(
+                    document,
+                    max_assignments=max_assignments,
+                    min_severity=min_severity,
+                )
+            except NotATemplateDocument as exc:
+                raise ToolError(str(exc))
+            dead = [
+                step_id
+                for finding in report["findings"]
+                if finding["check"] == "unreachable_step"
+                for step_id in finding["step_ids"]
+            ]
+            report["mermaid"] = render_mermaid(document, dead_step_ids=dead)
+            return ToolResult(content=report, structured_content=None)
+
+    @mcp.tool(
+        name="test_template_scenario",
+        description=(
+            "Answer 'what happens if...' for one template WITHOUT running it. Give the "
+            "answers you care about and it reports which steps appear, which stay "
+            "hidden, who is assigned, which rules fire, and any problems on those "
+            "answers. "
+            "USE THIS for a specific question such as what happens when a request is "
+            "declined; use test_template for a whole-template health check. "
+            "REQUIRED: 'template_id' (32-character hex) and 'answers'. "
+            "'answers' is an OBJECT keyed by the FIELD LABEL exactly as a person sees "
+            "it, for example {\"Nominee decision\": \"Declined\"}. A field id works "
+            "too. Matching ignores case. An unknown label FAILS and lists the labels "
+            "this template has, rather than being ignored. "
+            "ANSWERS MAY BE PARTIAL, and that is the useful case: fields you leave out "
+            "are still explored, and every step is labelled 'certain' when the answer "
+            "holds however those fields are filled in, or 'depends_on' naming the "
+            "fields that decide it. "
+            "OPTIONAL: 'max_assignments' (default 50000) bounds the walk; check "
+            "'coverage.exhaustive'. Read-only: it changes nothing and launches nothing."
+        ),
+        tags=["automation", "analysis", "template", "testing", "read-only"],
+        annotations=ToolAnnotations(
+            title="Test one scenario against a template",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("test_template_scenario")
+    @handle_tallyfy_errors("test template scenario")
+    def test_template_scenario(
+        template_id: TemplateId,
+        answers: GenericDict,
+        max_assignments: int = DEFAULT_MAX_ASSIGNMENTS,
+    ) -> GenericDict:
+        """
+        Report what a template does under one set of answers.
+
+        Args:
+            template_id: Template ID (REQUIRED - 32-character hex string)
+            answers: Field label (or id) to answer. May be partial.
+            max_assignments: Cap on paths walked per independent group of rules
+
+        Returns:
+            Dictionary with the steps, their certainty, the rules that fire and findings
+        """
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            document = _fetch_template_document(sdk, org_id, template_id)
+            try:
+                report = run_scenario(document, answers or {}, max_assignments=max_assignments)
+            except UnknownAnswerLabel as exc:
+                # Fail with the available labels rather than guessing. A silently
+                # ignored answer produces a confident report about a scenario the
+                # user did not ask for.
+                raise ToolError(str(exc))
+            except NotATemplateDocument as exc:
+                raise ToolError(str(exc))
+            return ToolResult(content=report, structured_content=None)
