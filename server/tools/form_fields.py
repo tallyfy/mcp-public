@@ -21,6 +21,13 @@ from utils.fastmcp_types import (
     GenericList,
     FieldPosition,
 )
+from utils.authoring_payloads import (
+    KickoffFieldCreateData,
+    KickoffFieldUpdateData,
+    StepFormFieldCreateData,
+    StepFormFieldUpdateData,
+    documented_payload,
+)
 from utils.sdk_serializer import serialize_dataclass
 from utils.field_value_encoding import option_pairs
 from metrics import track_tool_execution
@@ -210,7 +217,7 @@ CORRECT usage:
     def add_form_field_to_step(
         template_id: TemplateId,
         step_id: StepId,
-        field_data: GenericDict,
+        field_data: documented_payload(StepFormFieldCreateData),
     ) -> GenericDict:
         """
         Add form fields (text, dropdown, date, etc.) to a step.
@@ -350,7 +357,7 @@ CORRECT usage:
         template_id: TemplateId,
         step_id: StepId,
         field_id: FieldId,
-        field_data: GenericDict,
+        field_data: documented_payload(StepFormFieldUpdateData),
     ) -> GenericDict:
         """
         Update form field properties, validation, options.
@@ -986,7 +993,7 @@ CORRECT usage:
     @handle_tallyfy_errors("add kickoff field")
     def add_kickoff_field(
         template_id: TemplateId,
-        field_data: GenericDict,
+        field_data: documented_payload(KickoffFieldCreateData),
     ) -> GenericDict:
         """
         Add a form field to a template's kickoff (prerun) form.
@@ -1103,7 +1110,7 @@ CORRECT usage:
     def update_kickoff_field(
         template_id: TemplateId,
         field_id: FieldId,
-        field_data: GenericDict,
+        field_data: documented_payload(KickoffFieldUpdateData),
     ) -> GenericDict:
         """
         Update a kickoff (prerun) field on a template.

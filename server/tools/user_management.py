@@ -39,18 +39,24 @@ logger = logging.getLogger(__name__)
 
 
 def _get_guest_raw(sdk, org_id: str, email: str) -> Dict[str, Any]:
-    """GET a guest and KEEP the field that says whether they are disabled.
+    """GET a guest and KEEP the fields `Guest`/`GuestDetails` still cannot hold.
 
-    Deliberately not routed through `sdk.users.get_guest`. That method returns
-    a `Guest`, whose `details` is a `GuestDetails`, and `GuestDetails.from_dict`
-    reads a key named `disabled_on`. The guest route has never emitted that
-    key (api-v2 does emit `disabled_on` elsewhere, on the organization-members
-    pivot in OrganizationTransformer, which is a different resource).
-    `GuestTransformer::guestDetails` emits `disabled_at`, from
-    `$orgGuest->pivot->disabled_at`. One character apart, so the single field
-    carrying a guest's live state was dropped on the floor and every read of a
-    guest came back with no way to tell an enabled one from a disabled one.
-    That is issue #590.
+    Deliberately not routed through `sdk.users.get_guest`. Issue #590 was that
+    method returning a `Guest`, whose `details` is a `GuestDetails`, and
+    `GuestDetails.from_dict` reading a key named `disabled_on` that api-v2 has
+    never emitted (it emits `disabled_on` elsewhere, on the organization-members
+    pivot in OrganizationTransformer, a different resource), while
+    `GuestTransformer::guestDetails` emits `disabled_at`. One character apart,
+    so the single field carrying a guest's live state was dropped on the floor.
+
+    ⚠️ THAT HALF IS FIXED, as of tallyfy 2.0.0 (tallyfy/sdk#33):
+    `GuestDetails.disabled_at` is now a real field, correctly populated.
+    Reading raw is NOT retired by that fix, because it recovers several other
+    things the model still cannot: `guest_id` (the SDK derives it from `link`
+    and never puts it on `GuestDetails` at all) plus `cadence_days`,
+    `associated_members`, `last_city`, `last_country` and the pivot's own
+    `last_accessed_at`, none of which `GuestDetails` declares an attribute
+    for even now.
 
     `disabled_at` IS the live state, read from api-v2's own service rather than
     inferred: `GuestService::disable` sets `disabled_at` and `disabled_by`, and

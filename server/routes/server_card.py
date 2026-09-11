@@ -107,7 +107,7 @@ _SERVER_CARD = {
         # tests/unit/server/routes/test_server_card.py asserts these values
         # against routes.capabilities.category_breakdown(), which counts the
         # tools each module actually registers. Update both or neither.
-        "toolCount": 115,
+        "toolCount": 117,
         "toolCategories": 15,
         "categories": [
             "user_management",

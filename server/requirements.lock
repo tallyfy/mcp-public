@@ -265,7 +265,7 @@ starlette==1.3.1
     #   fastmcp-slim
     #   mcp
     #   sse-starlette
-tallyfy==1.3.12
+tallyfy==3.0.2
     # via -r requirements.txt
 truststore==0.10.4
     # via

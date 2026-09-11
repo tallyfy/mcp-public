@@ -56,6 +56,7 @@ from typing import Any, Dict
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from utils.fastmcp_types import GenericDict
+from utils.authoring_payloads import TemplateMappingData, documented_payload
 from utils.fastmcp_errors import handle_tallyfy_errors
 from metrics import track_tool_execution
 
@@ -587,7 +588,9 @@ Returns: {valid: bool, errors: [str], warnings: [str], summary: {steps, kickoff_
     )
     @track_tool_execution("validate_template_mapping")
     @handle_tallyfy_errors("validate template mapping")
-    def validate_template_mapping(mapping: GenericDict) -> ToolResult:
+    def validate_template_mapping(
+        mapping: documented_payload(TemplateMappingData),
+    ) -> ToolResult:
         """
         Validate a draft Tallyfy template mapping (no AI, no network).
 

@@ -292,20 +292,71 @@ def _reopen_task_raw(sdk, org_id: str, run_id: str, task_id: str) -> Any:
     )
 
 
-# Fields a caller can WRITE through the update tools that `tallyfy.models.Task`
-# has no attribute for, so no update response can ever echo them back.
+def _resolve_forwarded_is_approved(
+    task_type: Optional[str], is_approved: Optional[bool]
+) -> Optional[bool]:
+    """Decide whether `is_approved` should actually be sent to api-v2.
+
+    Shared by `complete_task` and `complete_standalone_task` so the two can't
+    drift on this rule (repo CLAUDE.md rule 16). is_approved is only part of an
+    APPROVAL task's completion contract. api-v2's Task::complete() ALSO writes
+    it for expiring tasks: `is_approved = ($is_approved !== false)`, so
+    is_approved=False silently flips an expiring task from ACKNOWLEDGED to
+    EXPIRED (a 2xx with data loss) if forwarded. The gate api-v2 uses is the
+    task's own task_type, so resolve it and forward is_approved only for a
+    genuine approval task.
+
+    Raises:
+        ToolError: is_approved=False was requested on an expiring task.
+    """
+    if is_approved is None:
+        return None
+    if is_approved is False and task_type in ("expiring", "expiring_email"):
+        raise ToolError(
+            "is_approved=False cannot be used on an expiring task: "
+            "completing an expiring task records it as ACKNOWLEDGED, and "
+            "api-v2 would instead mark it EXPIRED (silent data loss). There "
+            "is no way to mark a task expired through this tool. Call "
+            "complete_task (or complete_standalone_task) without is_approved "
+            "to acknowledge it."
+        )
+    if task_type is not None and task_type != "approval":
+        # task / email (or expiring completed with is_approved=True):
+        # is_approved is not part of the completion contract, so drop it
+        # rather than send a value the API ignores or misinterprets.
+        return None
+    return is_approved
+
+
+# Fields a caller can WRITE through the update tools that the read-back exists
+# to recover, either because the SDK model cannot hold them at all, or because
+# it holds them in a shape this server does not want to expose.
 #
-# Measured 2026-09-01 against the pinned SDK: `Task` declares 43 fields and
-# neither of these is among them, while api-v2 emits both on a single-task GET
-# (`TaskTransformer.php:89` for `top_secret` unconditionally, and `:99` for
-# `summary` whenever `isSingleTaskDetailRequest()` is true, which it is on any
-# `.../tasks/{task}` route). So a re-read recovers them and nothing else can.
+# ⚠️ UPDATED 2026-09-09 after bumping tallyfy 1.3.12 -> 3.0.1. `Task` now
+# DECLARES `summary` and `top_secret` (tallyfy/sdk#33), so `update_task` /
+# `update_standalone_task`'s own response can echo them directly -- the
+# original reason this tuple existed is gone for those two names.
+#
+# The read-back stays anyway, because `Task.from_dict` still cannot echo
+# `original_summary` at the top level. It is not a declared field: `Task`
+# carries `@lossless()`, so an unmapped key lands in `task.extra` instead of on
+# the object, and `serialize_dataclass` would then surface it as
+# `result["extra"]["original_summary"]` rather than `result["original_summary"]`
+# -- a shape that disagrees with `get_task`, which reads raw and always puts it
+# flat (rule 16). Verified live against the installed SDK: `Task.from_dict({
+# ..., "summary": "x", "original_summary": "y"}).extra == {"original_summary":
+# "y"}`. So this tuple still names the write-time arguments that trigger the
+# read-back -- `original_summary` can never join it, because a caller writes
+# `summary`, never `original_summary` -- and the read-back it triggers still
+# earns its extra GET by flattening that one field.
 #
 # ⚠️ This is a claim about the SDK, so it is asserted rather than trusted:
-# `test_task_management.py::TestTheEchoGapIsRealAndNarrow` fails if a future SDK
-# release adds either attribute, and carries a control proving the probe can see
-# the fields the model DOES declare. When that goes red the right response is to
-# delete the member and stop the extra GET, not to weaken the test.
+# `test_task_management.py::TestTheEchoGapIsRealAndNarrow` pins that `summary`
+# and `top_secret` ARE now declared (the control that the extra GET is no
+# longer needed FOR THEM) while `original_summary` is still absent from
+# `dataclasses.fields(Task)` (the reason the read-back is still needed at all).
+# If a future SDK release ever promotes `original_summary` to a real field too,
+# that is when this whole mechanism becomes dead weight and should be deleted.
 _FIELDS_THE_SDK_TASK_MODEL_CANNOT_ECHO = ("summary", "top_secret")
 
 
@@ -330,16 +381,20 @@ def _task_after_write(sdk, endpoint: str, task_id: str) -> Dict[str, Any]:
     This adds ONE thing to `_get_task_with_form_fields` and delegates everything
     else to it: the guard below. It is not a second reader.
 
-    Why a re-read is needed at all. `sdk.tasks.update_task` and
-    `update_standalone_task` both end in `Task.from_dict(response['data'])` and
-    discard the raw body, so the object they hand back CANNOT carry `summary` -
-    `tallyfy.models.Task` declares no such attribute and `from_dict` never reads
-    one. Measured 2026-08-06 against the installed SDK: feeding a body carrying
-    `summary` and `original_summary` through `Task.from_dict` leaves both
-    `hasattr` False and `serialize_task` on the result omits them, while
-    `serialize_task` on the SAME raw dict returns both. That is rule 24 in the
-    root CLAUDE.md, and it is the whole of #633: the write lands, the app UI
-    shows it, and no update response can ever echo it back.
+    Why a re-read is still needed. `sdk.tasks.update_task` and
+    `update_standalone_task` both end in `Task.from_dict(response['data'])`.
+    Since tallyfy 2.0.0 that DOES parse `summary` and `top_secret` onto the
+    object (tallyfy/sdk#33) — the original #633 gap for those two names is
+    closed. `original_summary` is not so lucky: it is not a declared field, so
+    `Task` (which carries `@lossless()`) puts it in `task.extra` instead, and
+    `serialize_task` would then surface it as `result["extra"]
+    ["original_summary"]` rather than flat at `result["original_summary"]`.
+    Measured against the installed SDK: `Task.from_dict({..., "summary": "x",
+    "original_summary": "y"}).extra == {"original_summary": "y"}`, while
+    `serialize_task` on the SAME raw dict returns both flat. That is rule 24 in
+    the root CLAUDE.md, still true for this one field: the write lands, the app
+    UI shows it, and no update response can echo it back at the shape this
+    server wants.
 
     `?with=summary` is NOT the fix and is deliberately not sent. Verified live
     2026-08-06 against production, masquerading into a real org: a plain
@@ -810,7 +865,7 @@ def register_task_management_tools(mcp):
             "openai/toolInvocation/invoking": "Fetching your tasks...",
             "openai/toolInvocation/invoked": "Tasks loaded",
         },
-        description="""Get tasks assigned to the current user. No parameters required.
+        description="""Get tasks assigned to the current user.
 
 USE THIS TOOL when user asks:
 - "What are my tasks?"
@@ -826,12 +881,9 @@ status="overdue" or status="hasproblem"; those are query-side filter values only
 A task's status is one of: not-started, in-progress, auto-skipped, completed.
 For problem tasks read the has_issues field. For overdue, compare deadline to now.
 
-SCOPE: returns ONLY ACTIVE tasks. api-v2 forces status=active on this endpoint when
-no status is sent, and this tool cannot send one, so completed, archived and
-auto-skipped tasks are removed server-side and never reach you. Filtering the
-results cannot recover them because they are not in the response. For any other
-status, including "what did I complete", call
-get_user_tasks(user_id=..., status="all") instead.
+SCOPE: defaults to ACTIVE tasks only, matching what "what are my tasks?" usually
+means. Pass status="all" for every status including completed/archived, or
+status="completed" etc. for one specific status.
 
 PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. to retrieve subsequent pages.
 meta.total_pages shows how many pages exist. meta.total shows the real count.""",
@@ -849,35 +901,39 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
     @handle_tallyfy_errors("get my tasks")
     def get_my_tasks(
         page: PageNumber = 1,
+        status: OptionalString = "active",
     ) -> ToolResult:
         """
-        Get ACTIVE tasks assigned to the current user in the organization.
+        Get tasks assigned to the current user in the organization.
 
-        Only active tasks are returned, and that is imposed by api-v2, not by a
-        choice made here. ListUserTasksRequest's constructor runs
-        `request()->mergeIfMissing(['status' => 'active'])`, and the SDK's
-        `get_my_tasks` (tallyfy==1.3.12) takes only org_id/page/per_page, so the
-        key is always missing and the default always applies. Completed and
-        archived tasks are therefore removed before the response is built.
+        Defaults to ACTIVE tasks only, matching what "what are my tasks?" means
+        in practice. Pass status="all" to include completed/archived/auto-skipped
+        tasks, or a specific status to filter to just that one.
 
-        Measured live 2026-08-12 against production: this endpoint returned 0
-        tasks for an org where `status=all` returned 15.
-
-        Adding a status parameter has to happen in the SDK first; see
-        tallyfy/sdk#76 and mcp#618. Until then `get_user_tasks` is the tool that
-        can filter, because its SDK method does accept `status`.
+        Before tallyfy/sdk#76 (fixed in SDK 2.1.0+, tallyfy/mcp#618) the SDK's
+        `get_my_tasks` took only org_id/page/per_page and api-v2's
+        `ListUserTasksRequest` filled the always-missing `status` key with
+        'active' via `mergeIfMissing`, so this tool could not have offered a
+        status parameter even if it wanted to — the default was structural, not
+        a choice. `status` is explicit now, so callers who want everything (or
+        one specific status) no longer have to detour through
+        get_user_tasks(user_id=..., status=...).
 
         Args:
             page: Page number to fetch (1-based, default: 1).
+            status: Task status filter (default: "active"). Pass "all" for
+                every status, or one of not-started/in-progress/auto-skipped/
+                completed for a single status.
 
         Returns:
-            Dict with 'data' (list of ACTIVE tasks) and 'meta' (pagination info).
+            Dict with 'data' (list of tasks) and 'meta' (pagination info).
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             content = fetch_single_page(
                 sdk.tasks.get_my_tasks, org_id,
                 page=page,
+                status=status or "active",
                 compact_fields=["step", "run", "taskdata"],
             )
             return ToolResult(content=content, structured_content=None)
@@ -899,9 +955,8 @@ WRONG usage (will fail):
 GUEST USERS: This tool is for org members only. For guest tasks, use
 get_guest_tasks(guest_email="...") or get_guest_tasks(guest_id="...") instead.
 
-For the current user's ACTIVE tasks, get_my_tasks() is simpler (no user_id needed).
-But get_my_tasks returns active tasks ONLY, so for the current user's completed or
-archived tasks use this tool with their user_id and status="all".
+For the current user's tasks, get_my_tasks() is simpler (no user_id needed) and
+also accepts status="all"/"completed"/etc.
 
 IMPORTANT: Tallyfy has no "urgent" or "priority" field. No task ever carries
 status="overdue" or status="hasproblem"; those are query-side filter values only.
@@ -1341,28 +1396,10 @@ Get run_id, task_id, and task_type from get_tasks_for_process() or get_my_tasks(
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             forwarded_is_approved = is_approved
-            # is_approved is only part of an APPROVAL task's completion contract.
-            # api-v2 Task::complete() (Task.php) ALSO writes it for expiring tasks:
-            # `is_approved = ($is_approved !== false)`, so is_approved=False silently
-            # flips an expiring task from ACKNOWLEDGED to EXPIRED (a 2xx with data
-            # loss). The gate api-v2 uses is the task's own task_type, so resolve it
-            # and forward is_approved only for a genuine approval task.
             if is_approved is not None:
                 task = sdk.tasks.get_task(org_id, run_id, task_id)
                 task_type = getattr(task, "task_type", None) if task else None
-                if is_approved is False and task_type in ("expiring", "expiring_email"):
-                    raise ToolError(
-                        "is_approved=False cannot be used on an expiring task: "
-                        "completing an expiring task records it as ACKNOWLEDGED, and "
-                        "api-v2 would instead mark it EXPIRED (silent data loss). There "
-                        "is no way to mark a task expired through this tool. Call "
-                        "complete_task without is_approved to acknowledge it."
-                    )
-                if task_type is not None and task_type != "approval":
-                    # task / email (or expiring completed with is_approved=True):
-                    # is_approved is not part of the completion contract, so drop it
-                    # rather than send a value the API ignores or misinterprets.
-                    forwarded_is_approved = None
+                forwarded_is_approved = _resolve_forwarded_is_approved(task_type, is_approved)
             response = _complete_task_raw(
                 sdk, org_id, run_id, task_id,
                 is_approved=forwarded_is_approved,
@@ -1814,6 +1851,166 @@ CORRECT usage:
                 ))
             return ToolResult(content=content, structured_content=None)
 
+    @mcp.tool(
+        name="complete_standalone_task",
+        description="""Mark a standalone (one-off) task as complete. REQUIRED: 'task_id'.
+
+Use THIS tool (not complete_task) for a task created via create_standalone_task:
+one that has no run_id you already know. It works whether or not the task turns out
+to be linked to a process or a hidden container run (from
+separate_task_for_each_assignee fan-out creation): it looks the task up first and
+routes the request correctly either way, so you never need to resolve run_id
+yourself.
+
+APPROVAL TASKS need is_approved, same rule as complete_task:
+  task_type="approval" -> MUST pass is_approved=True or is_approved=False
+  any other task_type  -> do NOT pass is_approved (ignored)
+  is_approved=False is REFUSED on an expiring task (would record it as EXPIRED
+  instead of ACKNOWLEDGED).
+
+CORRECT usage:
+  complete_standalone_task(task_id="...")                    # regular task
+  complete_standalone_task(task_id="...", is_approved=True)  # approve an approval task
+""",
+        tags={"tasks", "standalone", "workflow", "write", "lifecycle"},
+        annotations=ToolAnnotations(
+            title="Complete a standalone task",
+            readOnlyHint=False,
+            destructiveHint=False,
+            # NOT idempotent — same reasoning as complete_task: TaskService::complete()
+            # / OneOffTaskService::markTaskComplete() re-fire webhooks/notifications on
+            # a repeat call even though status is unchanged.
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("complete_standalone_task")
+    @handle_tallyfy_errors("complete standalone task")
+    def complete_standalone_task(
+        task_id: TaskId,
+        is_approved: OptionalBool = None,
+        override_user: OptionalInt = None,
+    ) -> ToolResult:
+        """
+        Mark a standalone (one-off) task as complete.
+
+        Args:
+            task_id: Standalone task ID to complete (REQUIRED - 32-character hex string)
+            is_approved: Approval decision, honored ONLY for approval-type tasks
+                (True = approve, False = reject). Ignored for task/email tasks. For
+                an expiring task, is_approved=False is REFUSED because api-v2 would
+                record it as EXPIRED instead of ACKNOWLEDGED; complete expiring tasks
+                without is_approved.
+            override_user: Optional numeric user ID to record as the completing user
+
+        Returns:
+            Updated task object with completed status
+        """
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            task = sdk.tasks.get_standalone_task(org_id, task_id)
+            run_id = getattr(task, "run_id", None) if task is not None else None
+            task_type = getattr(task, "task_type", None) if task is not None else None
+            forwarded_is_approved = _resolve_forwarded_is_approved(task_type, is_approved)
+
+            if run_id:
+                # Linked to a real process, or a hidden shell run from fan-out
+                # creation (#747) — the org-scoped completed-tasks endpoint
+                # resolves Task::whereNull('run_id') and would 404. Dispatch to
+                # the run-scoped pair the caller would otherwise have had to
+                # know run_id to reach.
+                response = _complete_task_raw(
+                    sdk, org_id, run_id, task_id,
+                    is_approved=forwarded_is_approved,
+                    override_user=override_user,
+                )
+                return ToolResult(
+                    content=_serialize_task_response(response),
+                    structured_content=None
+                )
+
+            result = sdk.tasks.complete_standalone_task(
+                org_id, task_id,
+                is_approved=forwarded_is_approved,
+                override_user=override_user,
+            )
+            return ToolResult(
+                content=serialize_task(result) if result else {},
+                structured_content=None
+            )
+
+    @mcp.tool(
+        name="reopen_standalone_task",
+        description="""Reopen a previously completed standalone (one-off) task. REQUIRED: 'task_id' and 'reason' (string explanation for reopening).
+
+Use THIS tool (not reopen_task) for a task created via create_standalone_task:
+one that has no run_id you already know. Same dispatch behavior as
+complete_standalone_task: it looks the task up first and routes correctly whether
+or not it turns out to be linked to a process or a hidden container run.
+
+⚠️ MANDATORY `reason` PARAMETER:
+  - The `reason` parameter is REQUIRED (not optional). Empty/whitespace-only strings raise ToolError.
+  - It mirrors the native Tallyfy UI, which requires a reason before reopening.
+  - The reason is automatically posted as a comment on the task for audit trail purposes.
+  - YOU MUST ASK THE USER for the reason before calling this tool. Do NOT invent, assume, or fabricate a reason.
+
+CORRECT usage:
+  reopen_standalone_task(task_id="def...", reason="Incorrect completion, needs review")
+
+WRONG usage (will fail or create a misleading audit):
+  reopen_standalone_task(task_id="def...")            # MISSING reason -> ToolError
+  reopen_standalone_task(task_id="def...", reason="") # EMPTY reason -> ToolError
+""",
+        tags={"tasks", "standalone", "workflow", "write", "lifecycle"},
+        annotations=ToolAnnotations(
+            title="Reopen a standalone task",
+            readOnlyHint=False,
+            destructiveHint=False,
+            # NOT idempotent: every call posts `reason` as a NEW audit comment,
+            # same as reopen_task.
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("reopen_standalone_task")
+    @handle_tallyfy_errors("reopen standalone task")
+    def reopen_standalone_task(task_id: TaskId, reason: str) -> ToolResult:
+        """
+        Reopen a previously completed standalone (one-off) task.
+
+        Args:
+            task_id: Standalone task ID to reopen (REQUIRED - 32-character hex string)
+            reason: Why the task is being reopened (REQUIRED). Posted as a comment on the task for audit trail.
+
+        Returns:
+            Updated task object with reopened status
+        """
+        if not reason.strip():
+            raise ToolError(
+                "reason is required — the native Tallyfy UI requires a reason "
+                "before reopening a task. Please provide an explanation."
+            )
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            task = sdk.tasks.get_standalone_task(org_id, task_id)
+            run_id = getattr(task, "run_id", None) if task is not None else None
+
+            if run_id:
+                response = _reopen_task_raw(sdk, org_id, run_id, task_id)
+                sdk.threads.add_task_comment(org_id, task_id, reason.strip())
+                return ToolResult(
+                    content=_serialize_task_response(response),
+                    structured_content=None
+                )
+
+            result = sdk.tasks.reopen_standalone_task(org_id, task_id)
+            sdk.threads.add_task_comment(org_id, task_id, reason.strip())
+            return ToolResult(
+                content=serialize_task(result) if result else {},
+                structured_content=None
+            )
 
     @mcp.tool(
         name="complete_kickoff_form",

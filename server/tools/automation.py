@@ -17,6 +17,11 @@ from utils.fastmcp_types import (
     GenericDict,
     GenericList,
 )
+from utils.authoring_payloads import (
+    AutomationRuleCreateData,
+    AutomationRuleUpdateData,
+    documented_payload,
+)
 from utils.sdk_serializer import serialize_dataclass
 from template_testing.references import orphaned_reference_ids
 from template_testing.document import NotATemplateDocument
@@ -806,7 +811,10 @@ Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name)
     )
     @track_tool_execution("create_automation_rule")
     @handle_tallyfy_errors("create automation rule")
-    def create_automation_rule(template_id: TemplateId, automation_data: GenericDict) -> GenericDict:
+    def create_automation_rule(
+        template_id: TemplateId,
+        automation_data: documented_payload(AutomationRuleCreateData),
+    ) -> GenericDict:
         """
         Create conditional automation (if-then rules).
 
@@ -902,7 +910,7 @@ To keep a condition or action UNCHANGED, resend it verbatim including its `id`."
     def update_automation_rule(
         template_id: TemplateId,
         automation_id: AutomationId,
-        automation_data: GenericDict,
+        automation_data: documented_payload(AutomationRuleUpdateData),
         confirm_replace: bool = False
     ) -> GenericDict:
         """

@@ -27,6 +27,12 @@ from utils.fastmcp_types import (
     GenericDict,
     GenericList,
 )
+from utils.authoring_payloads import (
+    StepCreateData,
+    StepUpdateData,
+    TemplateUpdateData,
+    documented_payload,
+)
 from utils.sdk_serializer import (
     serialize_dataclass,
     unwrap_fractal,
@@ -414,27 +420,40 @@ _TEMPLATE_INCLUDES = "steps,automated_actions,prerun,tags"
 
 
 def _get_template_raw(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
-    """GET a template with its includes, and KEEP the ones the SDK model drops.
+    """GET a template with its includes, staying on the raw transport on purpose.
 
-    Deliberately not routed through `sdk.templates.get_template`. That method
-    already puts `?with=steps,automated_actions,prerun,tags` on the wire and
-    api-v2 does return the tags: `ChecklistTransformer` lists `tags` in
-    `$availableIncludes` and `includeTags` emits them through
-    `TagChecklistTransformer`. The value then disappears, because
-    `tallyfy.models.Template` declares 43 fields and none of them is `tags`, so
-    `Template.from_dict()` copies what it knows and drops the rest.
+    Deliberately not routed through `sdk.templates.get_template`, even though
+    that method now CAN carry everything this needs.
 
-    Measured 2026-09-01 against the pinned SDK: the three tag-ish attributes the
-    model DOES declare are `industry_tags`, `topic_tags` and `tag_process`, none
-    of which is the organization tag set that `tag_template` writes. So a tag
-    written by `tag_template` was unreadable by every read tool in this server,
-    which is issue #596: the write returns success and nothing can confirm it.
+    ⚠️ **HISTORY, no longer the live reason.** Until tallyfy 2.1.0
+    (tallyfy/sdk#41), `Template.from_dict()` declared no `tags` attribute and
+    mis-handled the Fractal envelope for `steps`/`prerun`/`linked_tasks`, so a
+    tag written by `tag_template` was unreadable by every read tool (#596) and
+    a value could silently vanish depending on which envelope shape arrived.
+    Both are fixed now: `Template` declares `tags`, and `_include_list()`
+    inside `from_dict` accepts either shape for all of `steps`, `prerun`,
+    `automated_actions`, `tags` and `linked_tasks`.
 
-    This is the same failure class, and the same remedy, as
+    **Why this still reads raw instead of switching to the fixed model.** Two
+    independent reasons, neither of which the SDK bump touches:
+
+    1. `serialize_dataclass` strips EMPTY containers, not just missing ones
+       (`_is_empty`). An untagged template's `tags` would still vanish from the
+       response whether it came from a plain dict or from `Template.tags == []`
+       -- that is a property of the serialiser, not of the model. Verifying
+       `untag_template` therefore still needs the explicit re-attach below,
+       reading the SDK's now-populated `.tags` would not remove that step.
+    2. `Template` carries `@lossless()`, so any key the model does not declare
+       lands in `template.extra` -- nested -- instead of flat. The raw-dict
+       path here keeps every key exactly as api-v2 sent it, flat, which is
+       friendlier to an LLM caller that has no reason to know to look inside
+       `extra`. Going through the model would bury whatever is still unmapped
+       one level deeper for no benefit.
+
+    So this is the same failure CLASS, and remedy, as
     `task_management._get_task_with_form_fields` (rule 24 in the repo
-    CLAUDE.md): the request parameter lands, the value never arrives, and
-    nothing errors. Asserting that the include was requested does NOT prove it
-    comes back, so the tests for this assert on the returned payload.
+    CLAUDE.md): asserting the include was requested does NOT prove it comes
+    back, so the tests for this assert on the returned payload.
 
     `steps` and `prerun` are unwrapped alongside `tags` because Fractal wraps
     every include the same way; `steps` in particular must stay a plain list or
@@ -1306,7 +1325,7 @@ To MOVE a step use reorder_step; for questions use add_form_field_to_step.
     def update_step(
         template_id: TemplateId,
         step_id: StepId,
-        step_data: GenericDict
+        step_data: documented_payload(StepUpdateData),
     ) -> GenericDict:
         """
         Edit an existing step in place without changing its id.
@@ -1386,7 +1405,10 @@ step_data keys:
     )
     @track_tool_execution("add_step_to_template")
     @handle_tallyfy_errors("add step to template")
-    def add_step_to_template(template_id: TemplateId, step_data: GenericDict) -> GenericDict:
+    def add_step_to_template(
+        template_id: TemplateId,
+        step_data: documented_payload(StepCreateData),
+    ) -> GenericDict:
         """
         Add a new step to a template.
 
@@ -1792,7 +1814,10 @@ CORRECT usage:
     )
     @track_tool_execution("update_template")
     @handle_tallyfy_errors("update template")
-    def update_template(template_id: TemplateId, template_data: GenericDict) -> GenericDict:
+    def update_template(
+        template_id: TemplateId,
+        template_data: documented_payload(TemplateUpdateData),
+    ) -> GenericDict:
         """
         Update a template's metadata and settings.
 

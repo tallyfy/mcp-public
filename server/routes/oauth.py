@@ -38,6 +38,7 @@ from constants import (
     TALLYFY_AUTH_SERVER,
     TALLYFY_ISSUER,
     TALLYFY_JWKS_BASE,
+    TALLYFY_PUBLIC_KEY,
     MCP_DOCS_URL,
     OAUTH_PROXY_TIMEOUT,
 )
@@ -391,6 +392,116 @@ def _proxy_identity_headers(request) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# JWKS (issue #1140)
+# ---------------------------------------------------------------------------
+#
+# `jwks_uri` in both discovery documents points at THIS server's
+# /.well-known/jwks.json, and that route proxies TALLYFY_JWKS_BASE. The proxy
+# used to forward the upstream status and body whatever they were, while
+# copying only Content-Type and Cache-Control. Measured 2026-09-09, one
+# invocation, both hosts, with a per-run fabricated .well-known path as the
+# negative control (404 on both, so the probe discriminates):
+#
+#   staging.mcp.tallyfy.com/.well-known/jwks.json  302  text/html  no keys
+#   mcp.tallyfy.com/.well-known/jwks.json          200  json       keys: 1
+#
+# The 302 had NO Location header, because the proxy never copied one, so a
+# client following staging's own discovery document got an unfollowable
+# redirect instead of a key set and could not verify a signature at all.
+#
+# ROOT CAUSE, and it is not in this repo: staging's upstream
+# https://staging.account.tallyfy.com is behind Cloudflare Access, so every
+# path on it answers 302 to tallyfy.cloudflareaccess.com. Measured the same
+# day. Note the upstream's own controls do NOT separate there: a real path and
+# a fabricated one both return 302, so from outside the gate you cannot tell
+# whether that host would serve keys at all. Production's upstream
+# https://account.tallyfy.com returns 200 with one RSA key,
+# kid "tallyfy-mcp-key".
+#
+# So the fix is ordered upstream first, pinned key second, honest failure
+# third:
+#
+#   1. Upstream 200 carrying a non-empty `keys` array wins and is forwarded
+#      verbatim. Production is therefore byte for byte unchanged.
+#   2. Otherwise, if TALLYFY_PUBLIC_KEY is pinned, publish THAT key. This is
+#      not a workaround dressed as a feature: the pinned key is the key this
+#      server actually verifies tokens against, so it is a more truthful
+#      answer to "what key verifies a token from here" than an upstream
+#      document we merely relay. Both deployments report
+#      auth:verification-key = "pinned" on /health, measured 2026-09-09, so
+#      the material is present on staging today.
+#   3. Otherwise 502 with a JSON error object. Never a bodiless redirect.
+#
+# Nothing here branches on TALLYFY_ENVIRONMENT. The trigger is "the upstream
+# did not give us keys", which is a property of the response, so this cannot
+# be satisfied by special-casing one environment.
+
+_PINNED_JWK_KID = "tallyfy-mcp-key"
+"""Key id for the pinned-key fallback.
+
+Read off production's own published JWKS on 2026-09-09, where it is the fixed
+string "tallyfy-mcp-key" rather than a thumbprint. A `kid` that disagrees with
+the one in a token header would make a strict client fail to select the key, so
+matching what the upstream publishes is the point. NOT VERIFIED: staging's
+upstream kid is unreadable from outside Cloudflare Access, so this is production
+evidence applied to staging on the strength of the value being an environment
+independent literal.
+"""
+
+
+def _upstream_key_set(response) -> Optional[Dict[str, Any]]:
+    """Return the upstream's key set, or None if it did not give us one.
+
+    "Gave us one" means HTTP 200 and a JSON object with a non-empty `keys`
+    list. A 302, an HTML error page, or a 200 carrying `{"keys": []}` all
+    answer None, because a client cannot verify a signature with any of them.
+    """
+    if getattr(response, "status_code", None) != 200:
+        return None
+    try:
+        payload = json.loads(response.content)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    keys = payload.get("keys")
+    if not isinstance(keys, list) or not keys:
+        return None
+    return payload
+
+
+def _pinned_key_set() -> Optional[Dict[str, Any]]:
+    """Build a JWKS from TALLYFY_PUBLIC_KEY, or None if that is not possible.
+
+    Returns None rather than raising when the key is unset, unparseable, or
+    the crypto libraries are missing, so a broken pin degrades to the 502 in
+    the caller rather than to a 500 from inside a discovery endpoint.
+    """
+    if not TALLYFY_PUBLIC_KEY:
+        return None
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from jwt.algorithms import RSAAlgorithm
+
+        public_key = serialization.load_pem_public_key(TALLYFY_PUBLIC_KEY.encode("utf-8"))
+        jwk = json.loads(RSAAlgorithm.to_jwk(public_key))
+    except Exception as e:  # noqa: BLE001 - any failure here means "no pinned key"
+        logger.error("Could not build a JWKS from TALLYFY_PUBLIC_KEY: %s", e)
+        return None
+
+    jwk.setdefault("use", "sig")
+    jwk.setdefault("alg", "RS256")
+    jwk.setdefault("kid", _PINNED_JWK_KID)
+    # RSAAlgorithm.to_jwk also emits "key_ops". RFC 7517 section 4.3 says `use`
+    # and `key_ops` SHOULD NOT appear together, and production's own published
+    # JWKS carries exactly {kty, use, alg, kid, n, e} and no key_ops (read
+    # 2026-09-09). Matching that shape keeps a picky client from having to
+    # reconcile two overlapping declarations of the same thing.
+    jwk.pop("key_ops", None)
+    return {"keys": [jwk]}
+
+
 def register_oauth_routes(mcp):
     """Register OAuth 2.1 discovery endpoints with the MCP server."""
 
@@ -552,16 +663,24 @@ def register_oauth_routes(mcp):
 
     @mcp.custom_route("/.well-known/jwks.json", methods=["GET"])
     async def jwks_proxy(request):
-        """
-        Proxy JWKS endpoint to Tallyfy Authorization Server.
+        """Serve the key set a client needs to verify a token from this server.
+
+        Upstream first, pinned key second, honest failure third. See
+        ``_upstream_key_set`` and ``_pinned_key_set`` for why (issue #1140).
         """
         upstream_url = f"{TALLYFY_JWKS_BASE}/.well-known/jwks.json"
         logger.info(f"Proxying JWKS request to {upstream_url}")
 
+        response = None
         try:
             async with httpx.AsyncClient(timeout=OAUTH_PROXY_TIMEOUT) as client:
                 response = await client.get(upstream_url)
+        except httpx.RequestError as e:
+            logger.error(f"JWKS proxy error: {e}")
 
+        if response is not None and _upstream_key_set(response) is not None:
+            # The upstream answered with a usable key set. Forward it verbatim,
+            # which is byte for byte what production has always served.
             return Response(
                 content=response.content,
                 status_code=response.status_code,
@@ -570,12 +689,29 @@ def register_oauth_routes(mcp):
                     "Cache-Control": response.headers.get("Cache-Control", "public, max-age=3600"),
                 },
             )
-        except httpx.RequestError as e:
-            logger.error(f"JWKS proxy error: {e}")
-            return JSONResponse(
-                {"error": "server_error", "error_description": "Failed to fetch JWKS"},
-                status_code=502,
+
+        pinned = _pinned_key_set()
+        if pinned is not None:
+            logger.warning(
+                "JWKS upstream %s did not return a usable key set (status=%s); "
+                "serving the pinned verification key instead",
+                upstream_url,
+                getattr(response, "status_code", "no response"),
             )
+            return JSONResponse(
+                pinned,
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+
+        logger.error(
+            "JWKS unavailable: upstream %s gave status=%s and no TALLYFY_PUBLIC_KEY is pinned",
+            upstream_url,
+            getattr(response, "status_code", "no response"),
+        )
+        return JSONResponse(
+            {"error": "server_error", "error_description": "Failed to fetch JWKS"},
+            status_code=502,
+        )
 
     @mcp.custom_route("/mcp/oauth/register", methods=["POST"])
     async def oauth_register_proxy(request):
