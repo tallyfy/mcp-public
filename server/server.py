@@ -124,8 +124,10 @@ for logger_name, level_name in SUPPRESSED_LOGGERS.items():
 # - Token expiration
 # - MCP resource claim - the token's `mcp_resource` must name this server, by
 #   either value in ACCEPTED_MCP_RESOURCES. Enforced only if
-#   ENFORCE_JWT_AUDIENCE=true, which as of 2026-08-09 is explicitly "false" in
-#   both production and staging, so this check does not currently run anywhere.
+#   ENFORCE_JWT_AUDIENCE=true. The built-in default is "false"
+#   (server/constants.py, ENFORCE_AUDIENCE), so a deployment that leaves it
+#   unset runs without this check. Set it once you know what your clients
+#   present.
 #
 # Passing the whole accept-set here rather than MCP_JWT_AUDIENCE alone is the
 # point of tallyfy/mcp#812: naming one value at this call site would pin the

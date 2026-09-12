@@ -64,10 +64,9 @@ TALLYFY_JWKS_URI = os.getenv('TALLYFY_JWKS_URI')
 # key, because someone sets it and believes they changed something. That is
 # exactly what config/mcp.php's rate_limits.dcr was.
 #
-# Measured 2026-08-09 from the running containers: this one is EXPLICITLY set to
-# "false" in production and staging (rc=0, so configured off rather than merely
-# defaulting), while the host's is unset and therefore enforcing. The whole
-# audience block below is dead code in every environment we run.
+# This one defaults to "false", while the host's equivalent defaults to "true"
+# and is therefore enforcing. Wherever this is left at its default, the whole
+# audience block below is dead code.
 #
 # Do not flip this by hand. Turning it on is tallyfy/mcp#743's job, gated on the
 # shadow census (mcp_server_jwt_audience_class_total, see

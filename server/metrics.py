@@ -173,8 +173,8 @@ jwt_validation_total = Counter(
 # Shadow census of WHO is presenting tokens here (tallyfy/mcp#743 AC1).
 #
 # Counted on every signature-verified token REGARDLESS of ENFORCE_JWT_AUDIENCE,
-# which is the entire point: that flag is "false" in production and staging
-# (measured 2026-08-09), so the accept/reject block it guards never runs and
+# which is the entire point: that flag defaults to "false", so wherever it is
+# left unset the accept/reject block it guards never runs and
 # `jwt_validation_total` therefore reports nothing but `status="success"`. A
 # quiet metric is equally consistent with a healthy population and with a
 # control that is switched off, so this counter answers the question the other

@@ -457,10 +457,10 @@ class TallyfyAuthProvider(JWTVerifier):
         # SHADOW CENSUS (tallyfy/mcp#743 AC1). Counts, changes nothing.
         #
         # ⚠️ This sits OUTSIDE the `if ENFORCE_AUDIENCE == "true":` block below,
-        # deliberately and load-bearingly. That flag is explicitly "false" in
-        # production AND staging (measured 2026-08-09 from the running
-        # containers), so anything inside that block executes nowhere we run and
-        # a census placed there would report a confident zero forever. Moving
+        # deliberately and load-bearingly. That flag defaults to "false"
+        # (server/constants.py, ENFORCE_AUDIENCE), so wherever it is left unset
+        # anything inside that block executes nowhere at all and a census placed
+        # there would report a confident zero forever. Moving
         # these two lines inside it silently destroys the measurement while
         # leaving the counter present in /metrics, which is worse than deleting
         # it. `test_census_runs_when_enforcement_is_off` goes red if it moves.
