@@ -60,6 +60,8 @@ from typing import Annotated, Any, Dict, List, Optional, Type, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from utils.variable_markup import summary_field_help
+
 __all__ = [
     "documented_payload",
     "AutomationRuleCreateData",
@@ -243,7 +245,12 @@ class StepStartDate(_Payload):
 
 
 class _StepCommon(_Payload):
-    summary: str = Field(default=None, description="HTML instructions for the assignee")
+    # The embed contract lives here rather than in the tool description because a
+    # PARAMETER description is published in the JSON schema and does not count
+    # against the 2000-byte tool-description cap (CLAUDE.md rule 34). This is the
+    # one place a model is actually writing the HTML, so it is where the shape
+    # belongs. See utils/variable_markup.py for where the markup is read from.
+    summary: str = Field(default=None, description=summary_field_help())
     step_type: str = Field(
         default=None,
         json_schema_extra={"enum": _STEP_TYPES},
@@ -603,8 +610,10 @@ class TemplateUpdateData(_Payload):
     """
 
     title: str = Field(default=None)
-    summary: str = Field(default=None)
-    guidance: str = Field(default=None)
+    # summary and guidance are both rich text on this object, so both carry the
+    # embed contract. See utils/variable_markup.py.
+    summary: str = Field(default=None, description=summary_field_help())
+    guidance: str = Field(default=None, description=summary_field_help())
     icon: str = Field(default=None)
     alias: str = Field(default=None)
     webhook: str = Field(default=None)

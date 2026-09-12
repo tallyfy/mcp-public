@@ -35,6 +35,24 @@ def register_landing_routes(mcp):
         host = request.headers.get("host", "")
         return HTMLResponse(_render_landing_for_host(host))
 
+    @mcp.custom_route("/tools", methods=["GET"])
+    async def tools_page(request):
+        """The public list of every tool, grouped by category (#1291).
+
+        A customer asked on a call where he could see what his AI can do. There
+        was no answer: the landing page badge said "100+ tools" and linked
+        nowhere, no page anywhere named a single tool, and the two surfaces that
+        DO produce a list are both gated (the ``tallyfy://tools`` MCP resource
+        needs a session, ``GET /api/tool-names`` needs ``X-Internal-Key``).
+
+        Built at request time from the live registry. Nothing here is a
+        committed list and no count is written down, which is the point: a
+        hand-maintained one is what put "110 tools across 15 categories" in
+        front of directory reviewers while the server served 108 across 14.
+        """
+        host = request.headers.get("host", "")
+        return HTMLResponse(_render_tools_page_for_host(host))
+
     @mcp.custom_route("/favicon.ico", methods=["GET"])
     async def favicon(request):
         # Browsers, Claude's connector UI, and Google show a generic globe for
@@ -107,6 +125,91 @@ def _render_landing_for_host(host: str) -> str:
         "{MCP_ENDPOINT}", _STAGING_ENDPOINT if staging else _PROD_ENDPOINT
     )
     html = html.replace("{ENV_BADGE}", _STAGING_BADGE if staging else _PROD_BADGE)
+    html = html.replace("{TOOL_COUNT}", str(_total_tools()))
+    return html
+
+
+def _total_tools() -> int:
+    """The live tool count, derived from what the modules register.
+
+    Imported inside the function, not at module scope: ``routes.capabilities``
+    imports ``routes.oauth``, and this module is imported by ``server.py``
+    before the routes exist. A module-scope import here is an import cycle.
+    """
+    from routes.capabilities import category_breakdown
+
+    return sum(count for _, count, _ in category_breakdown())
+
+
+def _escape(value: str) -> str:
+    """Minimal HTML escape for text taken from a tool description.
+
+    Descriptions are ours rather than a caller's, so this is not a security
+    boundary, but several of them legitimately contain ``<`` and ``&`` (the
+    variable markup from #1292 among them) and an unescaped one would break the
+    page it is being listed on.
+    """
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _render_tools_page_for_host(host: str) -> str:
+    """Render the public tool list for the host that asked for it.
+
+    Every number and every name is derived at request time. There is no
+    committed list and no hardcoded count anywhere in this function, which is
+    the whole requirement: the alternative has already gone wrong twice in this
+    repo, once advertising 110 tools across 15 categories against a server
+    serving 108 across 14, and once leaving ``server/CLAUDE.md`` claiming
+    Automation had 6 tools when it had 8.
+    """
+    from routes.capabilities import category_tools
+
+    categories = category_tools()
+    total = sum(len(tools) for _, tools, _ in categories)
+
+    sections = []
+    for label, tools, description in categories:
+        rows = "\n".join(
+            "                <tr><td><code>{name}</code></td><td>{summary}</td></tr>".format(
+                name=_escape(name), summary=_escape(summary)
+            )
+            for name, summary in tools
+        )
+        if not rows:
+            # A category whose tools have all gone is reported rather than
+            # silently omitted: an empty section is a visible defect, a missing
+            # one reads as a category that never existed.
+            rows = (
+                '                <tr><td colspan="2"><em>No tools are registered '
+                "in this category.</em></td></tr>"
+            )
+        noun = "tool" if len(tools) == 1 else "tools"
+        sections.append(
+            f"""    <h2 id="{_escape(label.lower().replace(' ', '-'))}">{_escape(label)}"""
+            f""" <span class="count">{len(tools)} {noun}</span></h2>
+    <p class="cat-desc">{_escape(description)}</p>
+    <table>
+        <thead><tr><th>Tool</th><th>What it does</th></tr></thead>
+        <tbody>
+{rows}
+        </tbody>
+    </table>
+"""
+        )
+
+    staging = _is_staging(host)
+    html = _TOOLS_HTML.replace("{SECTIONS}", "\n".join(sections))
+    html = html.replace("{TOOL_COUNT}", str(total))
+    html = html.replace("{CATEGORY_COUNT}", str(len(categories)))
+    html = html.replace(
+        "{MCP_ENDPOINT}", _STAGING_ENDPOINT if staging else _PROD_ENDPOINT
+    )
+    html = html.replace("{ENV_BADGE}", _STAGING_BADGE if staging else _PROD_BADGE)
     return html
 
 
@@ -116,7 +219,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Tallyfy MCP Server: Workflow Automation for AI Assistants</title>
-    <meta name="description" content="Run your operations from your AI assistant. The Tallyfy MCP server exposes 100+ tools for workflow automation across Claude, ChatGPT, Cursor, and more.">
+    <meta name="description" content="Run your operations from your AI assistant. The Tallyfy MCP server exposes {TOOL_COUNT} tools for workflow automation across Claude, ChatGPT, Cursor, and more.">
     <meta property="og:title" content="Tallyfy MCP Server">
     <meta property="og:description" content="Workflow automation for AI assistants. Connect Tallyfy to Claude, ChatGPT, Cursor, and any MCP-compatible client.">
     <meta property="og:image" content="https://tallyfy.com/images/press/tallyfy-logo.png">
@@ -366,7 +469,7 @@ _LANDING_HTML = """<!DOCTYPE html>
     <div class="badges">
         {ENV_BADGE}
         <a class="badge" href="https://registry.modelcontextprotocol.io/?q=tallyfy" target="_blank" rel="noopener">Listed on the Official MCP Registry</a>
-        <span class="badge">100+ tools</span>
+        <a class="badge" href="/tools">{TOOL_COUNT} tools &middot; see the list</a>
         <span class="badge">Secure OAuth sign-in</span>
     </div>
 
@@ -482,6 +585,144 @@ curl -X POST {MCP_ENDPOINT} \\
         <a href="https://tallyfy.com/products/pro/integrations/mcp-server/">Product docs</a>
         <a href="https://tallyfy.com/legal/privacy-policy/">Privacy policy</a>
         <a href="https://tallyfy.com/legal/">Terms</a>
+        <a href="mailto:support@tallyfy.com">Support</a>
+        <a href="https://tallyfy.com/">tallyfy.com</a>
+    </div>
+
+</div>
+
+</body>
+</html>
+"""
+
+
+# The tool list page. Deliberately a separate template rather than a variant of
+# the landing one: this page is a long table and needs its own styling, and
+# threading a "mode" flag through _render_landing_for_host would make one
+# template answer two questions.
+#
+# It carries the SAME visual language (tokens, header, badges, footer) copied
+# rather than shared, because the landing template is one string literal and
+# extracting a partial from it would be a large diff over a page nobody asked
+# to change.
+_TOOLS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tallyfy MCP Server: the full tool list</title>
+    <meta name="description" content="Every tool the Tallyfy MCP server exposes to an AI assistant, grouped by category. Generated from the running server.">
+    <meta property="og:title" content="Tallyfy MCP Server: the full tool list">
+    <meta property="og:description" content="Every tool the Tallyfy MCP server exposes to an AI assistant, grouped by category.">
+    <meta property="og:image" content="https://tallyfy.com/images/press/tallyfy-logo.png">
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="{MCP_ENDPOINT}tools">
+    <link rel="icon" href="https://tallyfy.com/favicon.ico">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --tallyfy-orange: #EE9A22;
+            --tallyfy-blue: #2E5C9B;
+            --tallyfy-green: #3FB65B;
+            --ink: #1a1a1a;
+            --muted: #5a5a5a;
+            --border: #e5e5e5;
+            --bg: #fff;
+            --code-bg: #f6f8fa;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Inter, sans-serif;
+            line-height: 1.6;
+            color: var(--ink);
+            background: var(--bg);
+        }
+        .container { max-width: 980px; margin: 0 auto; padding: 56px 24px 80px; }
+        header { display: flex; align-items: center; gap: 16px; margin-bottom: 40px; }
+        header img { width: 40px; height: 40px; }
+        header .brand { font-weight: 600; font-size: 18px; color: var(--ink); }
+        header .brand span { color: var(--muted); font-weight: 400; }
+        h1 { font-size: 34px; line-height: 1.2; margin-bottom: 14px; letter-spacing: -0.02em; }
+        .lead { font-size: 17px; color: var(--muted); margin-bottom: 28px; max-width: 680px; }
+        h2 {
+            font-size: 20px; margin-top: 44px; margin-bottom: 6px;
+            letter-spacing: -0.01em; scroll-margin-top: 16px;
+        }
+        h2 .count { font-size: 13px; font-weight: 400; color: var(--muted); margin-left: 6px; }
+        .cat-desc { color: var(--muted); font-size: 14px; margin-bottom: 14px; }
+        a { color: var(--tallyfy-blue); }
+        table { width: 100%; border-collapse: collapse; font-size: 14px; }
+        th, td {
+            text-align: left; padding: 9px 12px;
+            border-bottom: 1px solid var(--border); vertical-align: top;
+        }
+        th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+        td:first-child { width: 270px; }
+        code {
+            font-family: 'SF Mono', Menlo, Monaco, Consolas, monospace;
+            font-size: 13px; background: var(--code-bg);
+            border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px;
+        }
+        .badges { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 30px; }
+        .badge {
+            display: inline-flex; align-items: center; gap: 7px;
+            border: 1px solid var(--border); border-radius: 999px;
+            padding: 5px 13px; font-size: 13px; color: var(--muted); text-decoration: none;
+        }
+        .badge .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tallyfy-green); }
+        .toc { margin: 0 0 12px; padding: 0; list-style: none;
+               display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 14px; }
+        .note {
+            background: var(--code-bg); border: 1px solid var(--border);
+            border-left: 3px solid var(--tallyfy-orange);
+            border-radius: 8px; padding: 13px 16px; margin: 26px 0; font-size: 14px;
+        }
+        .footer-links {
+            margin-top: 56px; padding-top: 22px; border-top: 1px solid var(--border);
+            display: flex; flex-wrap: wrap; gap: 18px; font-size: 14px;
+        }
+        @media (max-width: 640px) {
+            .container { padding: 32px 16px 56px; }
+            h1 { font-size: 27px; }
+            td:first-child { width: auto; }
+            th, td { padding: 8px 6px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="container">
+
+    <header>
+        <img src="https://tallyfy.com/favicon.ico" alt="Tallyfy">
+        <div class="brand">Tallyfy <span>MCP Server</span></div>
+    </header>
+
+    <h1>Every tool, in full</h1>
+    <p class="lead">
+        These are the {TOOL_COUNT} tools this server gives an AI assistant, across
+        {CATEGORY_COUNT} categories. Your AI can call any of them on your behalf,
+        limited by your own Tallyfy permissions and by the scopes you approve when
+        you connect.
+    </p>
+
+    <div class="badges">
+        {ENV_BADGE}
+        <a class="badge" href="/info">About this server</a>
+        <a class="badge" href="https://registry.modelcontextprotocol.io/?q=tallyfy" target="_blank" rel="noopener">Listed on the Official MCP Registry</a>
+    </div>
+
+    <div class="note">
+        This page is generated by the server you are reading it from, so it is
+        always what that server actually exposes. Nothing here is a maintained
+        list. Connect at <code>{MCP_ENDPOINT}</code>.
+    </div>
+
+{SECTIONS}
+
+    <div class="footer-links">
+        <a href="/info">About this server</a>
+        <a href="https://tallyfy.com/products/pro/integrations/mcp-server/">Product docs</a>
+        <a href="https://tallyfy.com/legal/privacy-policy/">Privacy policy</a>
         <a href="mailto:support@tallyfy.com">Support</a>
         <a href="https://tallyfy.com/">tallyfy.com</a>
     </div>

@@ -1234,7 +1234,9 @@ existing title and assignees (members, guests and groups), which the API would
 otherwise clear on an update that omits them. To change who a step is assigned to,
 use add_assignees_to_step instead.
 
-REQUIRED: 'template_id', 'step_id', and 'description' (new text, HTML allowed).""",
+REQUIRED: 'template_id', 'step_id', and 'description' (new text, HTML allowed).
+
+Field variables in HTML: read tallyfy://variable-markup.""",
         tags=["templates", "workflow", "write", "management", "editing"],
         annotations=ToolAnnotations(
             title="Edit step description",
@@ -1799,7 +1801,9 @@ CORRECT usage:
   update_template(template_id="abc123...", template_data={"title": "New Template Name"})
   update_template(template_id="abc123...", template_data={"summary": "Updated", "is_public": True})
 
-""",
+
+
+Field variables in HTML: read tallyfy://variable-markup.""",
         tags=["templates", "blueprints", "write", "management", "configuration"],
         annotations=ToolAnnotations(
             title="Update template",

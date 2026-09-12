@@ -253,7 +253,12 @@ StepTitle = Annotated[str, Field(
 # sees, because no server-side error is ever produced. Do not reintroduce a cap here
 # without a real api-v2 rule to cite.
 StepDescription = Annotated[str, Field(
-    description="Step description or summary",
+    # Used by exactly ONE tool (edit_description_on_step), so extending it here
+    # cannot shadow another tool's docstring Args entry, which is the #1252
+    # hazard a SHARED alias carries.
+    description=(
+        "Step description or summary. " + 'HTML. To reference a form field write <span class="insert-variable-tag" contenteditable="false">{{alias}}</span> using the field\'s alias; a bare {{alias}} shows as dead text in the editor. Snippets, blueprints and mentions: read tallyfy://variable-markup'
+    ),
     examples=["Please review the attached document and provide feedback"]
 )]
 

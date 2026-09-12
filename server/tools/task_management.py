@@ -1209,7 +1209,7 @@ required (explicit - no default); dropdown/radio/multiselect also need options
         Args:
             title: Task name
             deadline: Deadline as natural language — e.g. "April 12 2026 at 3pm", "next Monday"
-            description: Task description/summary (optional)
+            description: Task description/summary (optional). HTML. To reference a form field write <span class="insert-variable-tag" contenteditable="false">{{alias}}</span> using the field's alias; a bare {{alias}} shows as dead text in the editor. Snippets, blueprints and mentions: read tallyfy://variable-markup
             string (task|approval|expiring|email|expiring_email)
             task_type: Task type: string (task|approval|expiring|email|expiring_email)
             user_names: Member full names to assign (optional)
@@ -1542,7 +1542,7 @@ detached, but an empty list you DO pass means "unassign everyone here".
             run_id: Process (run) ID the task belongs to (REQUIRED - 32-character hex string)
             task_id: Task ID to update (REQUIRED - 32-character hex string)
             title: New task title
-            summary: New task description
+            summary: New task description. HTML. To reference a form field write <span class="insert-variable-tag" contenteditable="false">{{alias}}</span> using the field's alias; a bare {{alias}} shows as dead text in the editor. Snippets, blueprints and mentions: read tallyfy://variable-markup
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}.
                 Replaces the assignee list rather than adding to it. Any of the three
@@ -1715,7 +1715,9 @@ Use update_task instead when the task belongs to a workflow process run.
 
 REQUIRED: 'task_id' plus at least ONE field to update.
 
-""" + _TASKDATA_SHAPE_HELP + """
+
+
+Field variables in HTML: read tallyfy://variable-markup.""" + _TASKDATA_SHAPE_HELP + """
 
 CORRECT usage:
   update_standalone_task(task_id="abc...", deadline="2026-06-01 17:00:00")
@@ -1761,7 +1763,7 @@ CORRECT usage:
         Args:
             task_id: Standalone task ID (REQUIRED - 32-character hex string)
             title: New task title
-            summary: New task description
+            summary: New task description. HTML. To reference a form field write <span class="insert-variable-tag" contenteditable="false">{{alias}}</span> using the field's alias; a bare {{alias}} shows as dead text in the editor. Snippets, blueprints and mentions: read tallyfy://variable-markup
             deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}.
                 Replaces the assignee list rather than adding to it. Any of the three

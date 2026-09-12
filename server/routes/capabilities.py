@@ -56,20 +56,36 @@ CATEGORY_DESCRIPTIONS = [
 _breakdown_cache: list | None = None
 
 
-def _count_tools_in_module(module_name: str) -> int:
-    """Register a tools module against a throwaway mcp and count the result.
+def _tools_in_module(module_name: str) -> list:
+    """Register a tools module against a throwaway mcp and return its tools.
 
-    Registration is pure decoration, so running it a second time against a
-    stub has no effect on the real server.
+    Returns ``[(tool_name, one-line summary)]`` sorted by name. Registration is
+    pure decoration, so running it a second time against a stub has no effect on
+    the real server.
+
+    This is the SINGLE discovery implementation. ``category_breakdown`` (the
+    counts) and ``category_tools`` (the names) both read it, so the public tools
+    page cannot list a different set from the one the capabilities resource
+    counts. Two copies of this walk is exactly how a hand-maintained list came
+    to advertise 110 tools across 15 categories while the server served 108
+    across 14 (#654), and rule 16 is about not writing the second copy.
     """
     import importlib
 
     module = importlib.import_module(f"tools.{module_name}")
-    names = set()
+    found: dict = {}
 
     def stub_tool(**kwargs):
         def decorator(func):
-            names.add(kwargs.get("name", func.__name__))
+            name = kwargs.get("name", func.__name__)
+            description = (kwargs.get("description") or "").strip()
+            # First non-empty line only. A full description runs to 2000 bytes
+            # and 115 of them would be an unreadable page.
+            summary = next(
+                (line.strip() for line in description.splitlines() if line.strip()),
+                "",
+            )
+            found[name] = summary
             return func
         return decorator
 
@@ -78,22 +94,38 @@ def _count_tools_in_module(module_name: str) -> int:
     for attr in dir(module):
         if attr.startswith("register_") and callable(getattr(module, attr)):
             getattr(module, attr)(stub)
-    return len(names)
+    return sorted(found.items())
+
+
+def _count_tools_in_module(module_name: str) -> int:
+    """Count a module's registered tools. Kept as the name other code imports."""
+    return len(_tools_in_module(module_name))
+
+
+def category_tools() -> list:
+    """Return [(label, [(tool_name, summary)], description)], read from the code.
+
+    Memoized — the tool set is static for the life of the process
+    (``ToolsCapability(listChanged=False)``). Tests that plant a tool must reset
+    ``_breakdown_cache`` first, which is what proves the page is derived rather
+    than baked in at import.
+    """
+    global _breakdown_cache
+    if _breakdown_cache is None:
+        _breakdown_cache = [
+            (label, _tools_in_module(module), desc)
+            for label, module, desc in CATEGORY_DESCRIPTIONS
+        ]
+    return _breakdown_cache
 
 
 def category_breakdown() -> list:
     """Return [(label, tool_count, description)], counted from the code.
 
-    Memoized — the tool set is static for the life of the process
-    (``ToolsCapability(listChanged=False)``).
+    A thin projection of ``category_tools()`` rather than a second walk, so the
+    count and the published list are the same measurement by construction.
     """
-    global _breakdown_cache
-    if _breakdown_cache is None:
-        _breakdown_cache = [
-            (label, _count_tools_in_module(module), desc)
-            for label, module, desc in CATEGORY_DESCRIPTIONS
-        ]
-    return _breakdown_cache
+    return [(label, len(tools), desc) for label, tools, desc in category_tools()]
 
 
 def register_capabilities(mcp):
