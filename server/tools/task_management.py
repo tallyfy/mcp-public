@@ -18,6 +18,7 @@ from mcp.types import ToolAnnotations
 from utils.date_utils import DateExtractor
 from utils.fastmcp_errors import handle_tallyfy_errors
 from utils.field_value_encoding import coerce_field_values_safely
+from utils.guest_assignment import normalize_guest_emails
 from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 from utils.fastmcp_types import (
     OptionalUserId,
@@ -724,6 +725,14 @@ def resolve_user_ids(api_key: str, org_id: str, user_names: List[str], user_emai
     (closes #153 ambiguity gap — previously silently picked the first match).
     Full-name and email matches always take precedence over first-name fallback,
     so ``user_name="Alex Smith"`` resolves uniquely even when multiple "Alex"s exist.
+
+    ALSO raises ToolError naming every input that matched NOBODY (#1290).
+    It used to append only what it found and return, so a caller handing it two
+    emails where one belonged to a guest got back one id, no warning, and no way
+    to tell a partial resolution from a complete one. On the write path
+    (``create_standalone_task``) that is an assignee silently dropped from a task
+    somebody is relying on. A guest email is the common case, because a guest is
+    never in ``get_organization_users_list``, so the message says so.
     """
     if not user_names and not user_emails:
         return []
@@ -740,9 +749,13 @@ def resolve_user_ids(api_key: str, org_id: str, user_names: List[str], user_emai
         }
         users_by_username = {user.username.lower(): user.id for user in users if user.username}
 
+        unresolved: List[str] = []
+
         for email in user_emails:
             if email.lower() in users_by_email:
                 resolved_ids.append(users_by_email[email.lower()])
+            else:
+                unresolved.append(email)
 
         # Build first-name -> list of user records (NOT first-name -> first id)
         # so we can detect ambiguity instead of silently picking one.
@@ -771,6 +784,18 @@ def resolve_user_ids(api_key: str, org_id: str, user_names: List[str], user_emai
                         f"or pass user_email or user_id directly."
                     )
                 resolved_ids.append(candidates[0].id)
+            else:
+                unresolved.append(name)
+
+        if unresolved:
+            rendered = ", ".join(repr(v) for v in unresolved)
+            raise ToolError(
+                f"No organization member matches {rendered}. Nothing was "
+                f"assigned. An EMAIL that matches no member usually belongs to a "
+                f"GUEST, who is never in the member list: pass it in "
+                f"'guest_emails' instead. Use get_organization_users() to browse "
+                f"members, or get_organization_guests() to browse guests."
+            )
 
         return resolved_ids
 
@@ -778,24 +803,50 @@ def resolve_user_ids(api_key: str, org_id: str, user_names: List[str], user_emai
 def resolve_guest_ids(api_key: str, org_id: str, guest_emails: List[str]) -> List[str]:
     """Resolve guest emails to guest IDs via direct lookup.
 
-    Per-guest 404s are swallowed so a missing guest doesn't fail the whole batch,
-    but other failures (auth, network, server) propagate to @handle_tallyfy_errors.
+    Other failures (auth, network, server) propagate to @handle_tallyfy_errors.
+
+    A per-guest 404 used to be swallowed "so a missing guest doesn't fail the
+    whole batch", which meant a batch of three emails where one was unknown came
+    back as two ids with nothing said, and the caller could not tell a partial
+    result from a complete one (#1290). It now collects them and raises naming
+    every email it could not resolve.
+
+    ⚠️ This is a READ-side resolver and must not be pushed onto a write path.
+    Assigning a guest is done by EMAIL, and api-v2 creates the guest on demand
+    (``AssignableTrait::saveAssignees`` calls ``Guest::firstOrCreateFromEmail``),
+    so requiring an id first would refuse a legitimately new guest. The write
+    paths validate the address shape with ``utils.guest_assignment`` and let
+    api-v2's ``ValidGuestEmail`` be the authority on the rest.
     """
     if not guest_emails:
         return []
 
     from tallyfy.models import TallyfyError
     resolved_ids = []
+    unresolved: List[str] = []
     with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
         for email in guest_emails:
             try:
                 guest = sdk.users.get_guest(org_id, email)
-                if guest and guest.guest_id:
-                    resolved_ids.append(guest.guest_id)
             except TallyfyError as e:
                 if e.status_code == 404:
+                    unresolved.append(email)
                     continue
                 raise
+            if guest and guest.guest_id:
+                resolved_ids.append(guest.guest_id)
+            else:
+                # A 200 carrying no guest_id is just as unresolved as a 404, and
+                # it used to fall through the `if` and disappear.
+                unresolved.append(email)
+
+    if unresolved:
+        rendered = ", ".join(repr(v) for v in unresolved)
+        raise ToolError(
+            f"No guest of this organization matches {rendered}. Use "
+            f"get_organization_guests() to browse guests, or "
+            f"get_organization_users() if the address belongs to a member."
+        )
     return resolved_ids
 
 
@@ -1010,13 +1061,11 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         if resolved_user_id is None:
             names = [user_name] if user_name else []
             emails = [user_email] if user_email else []
-            resolved_ids = resolve_user_ids(api_key, org_id, names, emails)
-            if not resolved_ids:
-                raise ToolError(
-                    f"No user found matching name='{user_name}' or email='{user_email}'. "
-                    "Use get_organization_users() to browse available members and their IDs."
-                )
-            resolved_user_id = resolved_ids[0]
+            # resolve_user_ids raises naming anything it could not resolve
+            # (#1290), so the old "if not resolved_ids" branch here could no
+            # longer fire and was removed rather than left as a guard that
+            # cannot run.
+            resolved_user_id = resolve_user_ids(api_key, org_id, names, emails)[0]
 
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             content = fetch_single_page(
@@ -1235,8 +1284,12 @@ required (explicit - no default); dropdown/radio/multiselect also need options
             user_names = [user_names]
         if isinstance(user_emails, str):
             user_emails = [user_emails]
-        if isinstance(guest_emails, str):
-            guest_emails = [guest_emails]
+        # Members went through resolve_user_ids while guests went through
+        # nothing at all, so a typo in a guest address reached api-v2 as part of
+        # an array and came back as a 422 about the whole bucket (#1290). The
+        # shape is checked here, naming the offending value; ValidGuestEmail
+        # stays the authority on everything else.
+        guest_emails = normalize_guest_emails(guest_emails, "guest_emails")
 
         api_key, org_id = get_authenticated_credentials()
 
@@ -2109,13 +2162,9 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         api_key, org_id = get_authenticated_credentials()
 
         if guest_id is None:
-            resolved_ids = resolve_guest_ids(api_key, org_id, [guest_email])
-            if not resolved_ids:
-                raise ToolError(
-                    f"No guest found matching email='{guest_email}'. "
-                    "Use get_organization_guests() to browse available guests and their IDs."
-                )
-            guest_id = resolved_ids[0]
+            # resolve_guest_ids raises naming every email it could not resolve
+            # (#1290), so the old "if not resolved_ids" branch was unreachable.
+            guest_id = resolve_guest_ids(api_key, org_id, [guest_email])[0]
 
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             content = fetch_single_page(

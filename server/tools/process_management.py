@@ -24,6 +24,11 @@ from utils.fastmcp_types import (
 )
 from utils.sdk_serializer import serialize_dataclass
 from utils.field_value_encoding import coerce_field_values_safely
+from utils.guest_assignment import (
+    build_guest_task_overrides,
+    normalize_guest_emails,
+    resolve_run_starter_user_id,
+)
 from utils.kickoff_encoding import normalize_keyed_payload
 from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
@@ -210,40 +215,42 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         },
         description="""Launch a new workflow process (run) from a template.
 
-REQUIRED: 'template_id' and 'name'. Name it after the template plus
-the real-world thing it tracks: "Onboarding - Jane Doe". Generate it yourself; ask
-only if the user wants to pick. Launch ONE process per real-world thing (per hire,
-per client, per order). At volume the fix is less LAUNCHING WORK, not fewer
-processes: repeat this call once per row of their list, instead of them
-launching each one by hand. There is no bulk endpoint; repeating it IS the way.
+REQUIRED: 'template_id' and 'name'. Name it after the template plus the
+real-world thing it tracks. Generate it; ask only if they want to pick. Launch
+ONE process per real-world thing (per hire, per order). At volume the fix is
+less LAUNCHING WORK, not fewer processes: repeat this call once per row of
+their list, instead of them launching each one by hand.
 
-TWO DIFFERENT FORM SURFACES:
+PEOPLE: 'users' takes member IDs, 'guests' takes EMAILS - never swap them, and
+pass both in ONE call. A guest cannot be a member of a process, so 'guests'
+assigns them to its TASKS instead.
+
+TWO FORM SURFACES:
 
   - `prerun` (optional): KICKOFF fields, collected BEFORE the workflow starts.
-    Defined at TEMPLATE level. Call `get_kickoff_fields(template_id)` first for
-    field IDs, types and options.
+    Call `get_kickoff_fields(template_id)` for field IDs, types and options.
 
     ONE OBJECT keyed by each field's `timeline_id` - not a list, not labels:
       prerun={"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6": "Acme Corp"}
 
     Values follow the field type. Bare scalar for text/textarea/date/email. For
     dropdown/radio/multiselect pass the option's id OR its exact text
-    (multiselect: a list of them) - this tool resolves each to the shape the API
-    needs, so never hand-build {"id","text"} or recall that multiselect entries
-    need "selected":true. table: one entry per column. file: a list of objects,
-    each with "filename" plus one of id/full_url/url. assignees_form:
-    {"users":[id],"guests":["email"],"groups":[id]}.
+    (multiselect: a list of them) - this tool resolves each, so
+    never hand-build {"id","text"} or "selected":true. table: one entry
+    per column. file: a list of objects, each with "filename" plus
+    id/full_url/url. assignees_form: {"users":[id],"guests":["email"]}.
 
   - Step-level fields (NOT here): filled DURING execution via `update_task`
     with `taskdata={field_id: value}`.
 
 CORRECT:
-  launch_process(template_id="abc123...", name="Onboarding - Jane Doe")
-  launch_process(template_id="abc123...", name="Onboarding - Acme",
-    prerun={"<customer_name_field_id>": "Acme Corp"}, owner_id=12345)
+  launch_process(template_id="abc...", name="Onboarding - Jane Doe")
+  launch_process(template_id="abc...", name="Onboarding - Acme",
+    users=[12345], guests=["jane@acme.com"])
 
 WRONG:
-  launch_process(template_id="abc123...")  <- no name, fails
+  launch_process(template_id="abc...")  <- no name, fails
+  launch_process(..., users=["jane@acme.com"])  <- an EMAIL is a guest: guests=[..]
   launch_process(..., prerun={"Customer name": "Acme"})  <- LABEL not timeline_id:
     matches no field, so it is DROPPED - a 201 with an empty kickoff form""",
         tags={"processes", "workflow", "runs", "write", "create", "launch"},
@@ -273,6 +280,13 @@ WRONG:
         tags: Optional[List[str]] = None,
         folders: Optional[List[str]] = None,
         users: Optional[List[int]] = None,
+        # Guests are identified by EMAIL, never by a member id, so this cannot
+        # be folded into `users` (List[int]) -- Pydantic rejects the email at the
+        # schema layer before any tool code runs, which is what made a mixed
+        # member-and-guest launch impossible and produced the "different member
+        # IDs" answer a customer was given. See utils/guest_assignment.py for
+        # why it is not sent as a top-level `guests` key.
+        guests: Optional[List[str]] = None,
         groups: Optional[List[str]] = None,
         is_public: OptionalBool = None,
         tasks: Optional[Dict[str, Any]] = None,
@@ -292,10 +306,23 @@ WRONG:
                     single-key objects is accepted and folded into that object.
             tags: Optional list of tag IDs to attach
             folders: Optional list of folder IDs to place the process in
-            users: Optional list of user IDs to assign to the process
+            users: Optional list of NUMERIC member IDs to assign to the process
+            guests: Optional list of guest EMAIL ADDRESSES, e.g.
+                    ["jane@acme.com"]. Guests are identified by email and never
+                    by a member id. A guest cannot be a member of a process
+                    (api-v2 has no runs-guests relation at all), so these are
+                    assigned to the process's TASKS instead, on every step whose
+                    allow_guest_owners is true, alongside whoever the template
+                    already assigns. Refused if the template has no steps or no
+                    step accepts guest owners, rather than returning a 201 for a
+                    process the guest was never put on.
             groups: Optional list of group IDs to assign to the process
             is_public: Whether the process is publicly accessible (optional)
-            tasks: Task assignment overrides dict (optional)
+            tasks: Task assignment overrides dict (optional), keyed by step
+                   timeline_id. WARNING: api-v2 creates tasks ONLY for the steps
+                   named here when this is non-empty, so a partial map launches a
+                   truncated process. When 'guests' is set this tool expands the
+                   map to cover every step for exactly that reason.
             roles: Optional role assignments as an object keyed by org role ID,
                    e.g. {"<role_id>": {"users": [12345], "guests": [], "groups": []}}
             parent_id: Parent process ID for sub-processes (optional)
@@ -306,12 +333,33 @@ WRONG:
         if not name or not name.strip():
             raise ToolError("name cannot be empty")
 
+        # Refuse a malformed address before anything is created, naming the
+        # value. api-v2's ValidGuestEmail stays the authority on whether a
+        # well-formed address is acceptable (banned host, bot, already a member,
+        # SSO domain); this only catches what is obviously not an email.
+        guest_emails = normalize_guest_emails(guests, "guests")
+
         # POST /runs keys both of these by ID; a list silently loses every value.
         prerun = normalize_keyed_payload(prerun, "prerun")
         roles = normalize_keyed_payload(roles, "roles")
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            if guest_emails:
+                # One extra GET, and only when guests were actually supplied.
+                # The steps carry both the ids every entry must name and the
+                # assignees each entry has to re-send.
+                tasks = build_guest_task_overrides(
+                    sdk.templates.get_template_steps(org_id, template_id),
+                    guest_emails,
+                    tasks,
+                    # Lazy on purpose. Most templates have no step that assigns
+                    # the launcher, and this costs a round trip, so it is only
+                    # called when a step actually needs it.
+                    run_starter_resolver=lambda: resolve_run_starter_user_id(
+                        sdk, org_id, template_id
+                    ),
+                )
             # Correct container, wrong VALUES is a separate 422 class: dropdown
             # needs {"id","text"}, radio the bare text, multiselect a list of
             # objects carrying `selected`. Resolve them against the template's
