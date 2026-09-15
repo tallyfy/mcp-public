@@ -15,6 +15,9 @@ Available middleware:
 - RemovedToolHintsMiddleware: Answers the 7 tool names removed in #492 with
   a ToolError naming the current path, instead of a bare unknown-tool error.
   Also a FastMCP tool middleware, registered above scope enforcement.
+- DiscoverWithoutAuth: Wraps the transport ENDPOINT, not the app. Lets a
+  no-token, single, exact `server/discover` reach the unwrapped transport and
+  sends every other request through RequireAuthMiddleware unchanged (#1317).
 """
 
 from middleware.request_logging import RequestLoggingMiddleware
@@ -23,6 +26,7 @@ from middleware.rate_limit import RateLimitMiddleware
 from middleware.downstream_auth_challenge import DownstreamAuthChallengeMiddleware
 from middleware.tool_scope_enforcement import ToolScopeEnforcementMiddleware
 from middleware.removed_tool_hints import RemovedToolHintsMiddleware
+from middleware.discover_without_auth import DiscoverWithoutAuth
 
 __all__ = [
     "RequestLoggingMiddleware",
@@ -31,4 +35,5 @@ __all__ = [
     "DownstreamAuthChallengeMiddleware",
     "ToolScopeEnforcementMiddleware",
     "RemovedToolHintsMiddleware",
+    "DiscoverWithoutAuth",
 ]

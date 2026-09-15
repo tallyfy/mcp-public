@@ -15,7 +15,7 @@ from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
 from sentry_config import init_sentry_server
 from utils.tallyfy_auth_provider import build_auth_provider
-from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, DownstreamAuthChallengeMiddleware, ToolScopeEnforcementMiddleware, RemovedToolHintsMiddleware
+from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, DownstreamAuthChallengeMiddleware, ToolScopeEnforcementMiddleware, RemovedToolHintsMiddleware, DiscoverWithoutAuth
 from routes import register_all_routes
 from tools.user_management import register_user_management_tools
 from tools.task_management import register_task_management_tools
@@ -236,9 +236,36 @@ app = mcp.http_app(path='/', json_response=True)
 # so it can never shadow the /mcp/oauth/* routes, and a Mount('/mcp', ...) would
 # not match bare /mcp at all. Do NOT call mcp.http_app(path='/mcp') a second time
 # (each call builds its own session manager + lifespan; only the first runs).
-_mcp_transport_route = next(
+_fastmcp_transport_route = next(
     r for r in app.routes if isinstance(r, Route) and r.path == '/'
 )
+
+# Answer `server/discover` without a token (#1317, part of #1238). FastMCP wraps
+# the WHOLE transport in RequireAuthMiddleware, so a client that asks before it
+# has a token is refused, while the spec lets it ask first. The owner decided on
+# 2026-09-15 that this one method is exempt. DiscoverWithoutAuth forwards ONLY a
+# no-token, single, exact `server/discover` to the unwrapped transport (the
+# `.app` RequireAuthMiddleware holds) and sends every other request through the
+# auth wrapper unchanged. Detail: middleware/discover_without_auth.py.
+#
+# If FastMCP ever stops exposing `.app`, leave the route unwrapped and say so.
+# That fails toward "discover still needs a token", never toward letting anything
+# else through without one.
+_protected_transport = _fastmcp_transport_route.endpoint
+_unwrapped_transport = getattr(_protected_transport, "app", None)
+if _unwrapped_transport is not None:
+    _mcp_transport_route = Route(
+        '/',
+        endpoint=DiscoverWithoutAuth(_protected_transport, _unwrapped_transport),
+        methods=_fastmcp_transport_route.methods,
+    )
+    app.routes[app.routes.index(_fastmcp_transport_route)] = _mcp_transport_route
+else:
+    logging.error(
+        "Transport endpoint exposes no .app, so server/discover still requires a token (#1317)"
+    )
+    _mcp_transport_route = _fastmcp_transport_route
+
 for _mcp_alias in ('/mcp', '/mcp/'):
     app.routes.append(Route(_mcp_alias, endpoint=_mcp_transport_route.endpoint,
                             methods=_mcp_transport_route.methods))
