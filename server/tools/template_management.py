@@ -201,6 +201,32 @@ _STEP_UPDATE_REJECTED_KEYS = {
 # buckets. See tallyfy/api-v2#10052.
 _STEP_ASSIGNEE_BUCKETS = ("assignees", "guests", "groups")
 
+# The template METADATA keys the update path actually accepts, mirroring the
+# allowed_fields whitelist inside TemplateManagement.update_template_metadata on
+# the pinned SDK (tallyfy/template_management/basic_operations.py:130-136).
+#
+# This exists so the published schema can be pinned against it in BOTH
+# directions, the way _STEP_UPDATE_KEYS already is. Until tallyfy/mcp#1322 there
+# was no constant here at all, update_template passed **template_data straight
+# through, and test_no_key_the_tool_accepts_goes_undocumented therefore had
+# nothing to compare TemplateUpdateData to. So the one guard built to catch an
+# accepted-but-undocumented key could not see the template path, and two keys sat
+# undocumented long enough for a customer to hit it: a template built through the
+# connector came out with auto_naming false and default_process_name_format NULL
+# (the DB defaults), and no advertised key existed to set the format string.
+#
+# Keep this in step with the SDK list. A key here that the SDK drops is worse
+# than silence, because the model sends it and believes the write landed.
+_TEMPLATE_UPDATE_KEYS = frozenset({
+    "title", "summary", "guidance", "icon", "alias", "webhook",
+    "explanation_video", "kickoff_title", "kickoff_description",
+    "is_public", "is_featured", "auto_naming", "folderize_process",
+    "tag_process", "allow_launcher_change_name", "is_pinned",
+    "default_folder", "folder_changeable_by_launcher",
+    "type", "starred", "default_process_name_format",
+    "can_add_oot", "owner_id", "users", "groups", "prerun",
+})
+
 # STEP deadline direction codes, from api-v2 app/Step/Deadline.php:20 and :22
 # (OPTION_FROM = 'from', OPTION_BEFORE = 'prior_to'). These are the only two
 # values any consumer understands.
@@ -1787,8 +1813,17 @@ REQUIRED: 'template_id'.""",
 REQUIRED: 'template_id' plus at least one property to update.
 
 Updatable fields: title, summary, guidance, icon, alias, webhook, is_public, is_featured,
-auto_naming, folderize_process, allow_launcher_change_name, is_pinned, default_folder,
-kickoff_title, kickoff_description.
+auto_naming, default_process_name_format, folderize_process, tag_process,
+allow_launcher_change_name, is_pinned, default_folder, kickoff_title, kickoff_description.
+
+LAUNCH NAMING. A template created through this connector starts with auto_naming OFF and
+default_process_name_format EMPTY, because those are the column defaults and create_template
+sends neither. So a template you BUILT here, or assembled from others, will ask the launcher
+to type a process name unless you set both. Set them together: auto_naming on its own leaves
+naming switched on with no pattern to apply. The pattern takes field ALIASES in double
+braces, e.g. {"auto_naming": true, "default_process_name_format": "Onboarding, {{nominee-8394640}}"}.
+If you are copying or merging existing templates, read auto_naming, default_process_name_format
+and tag_process off the SOURCE templates and carry them across; nothing does that for you.
 
 Safe to call with only the fields you want to change. This tool reads the template
 first and re-sends its existing permissions ('users' and 'groups'), which the API

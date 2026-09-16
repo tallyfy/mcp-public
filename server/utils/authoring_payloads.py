@@ -620,10 +620,50 @@ class TemplateUpdateData(_Payload):
     is_public: bool = Field(default=None)
     is_featured: bool = Field(default=None)
     is_pinned: bool = Field(default=None)
-    auto_naming: bool = Field(default=None)
+    auto_naming: bool = Field(
+        default=None,
+        description=(
+            "Name each launched process from 'default_process_name_format' instead of "
+            "asking the launcher. Off by default on a NEW template, because the column "
+            "default is false, so a template built through this connector never has it"
+        ),
+    )
+    default_process_name_format: str = Field(
+        default=None,
+        description=(
+            "The name pattern for every process launched from this template, e.g. "
+            "'Onboarding, {{nominee-8394640}}'. Variable references are the field "
+            "ALIAS in double braces. Does nothing unless 'auto_naming' is on, so set "
+            "both together. NULL on a new template, and the field that actually holds "
+            "the pattern, so setting auto_naming alone leaves naming switched on with "
+            "nothing to apply"
+        ),
+    )
     folderize_process: bool = Field(default=None)
+    tag_process: bool = Field(
+        default=None,
+        description="Apply the template's tags to every process launched from it",
+    )
     allow_launcher_change_name: bool = Field(default=None)
     default_folder: str = Field(default=None, description="Folder id")
+    folder_changeable_by_launcher: bool = Field(
+        default=None,
+        description="Let the launcher move the process out of 'default_folder'",
+    )
+    can_add_oot: bool = Field(
+        default=None,
+        description=(
+            "Allow one-off tasks to be added to processes launched from this template. "
+            "SNAPSHOTTED AT LAUNCH: a process copies this value when it starts and never "
+            "re-reads it, so changing it here affects only FUTURE launches. Processes "
+            "already running keep whatever they started with and have to be changed one "
+            "by one on the process itself. Setting it to false locks the template owner "
+            "out too, not just other people"
+        ),
+    )
+    explanation_video: str = Field(
+        default=None, description="URL of a video explaining the template"
+    )
     kickoff_title: str = Field(default=None, description="Heading on the kickoff form")
     kickoff_description: str = Field(default=None)
     users: List[int] = Field(

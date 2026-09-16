@@ -923,9 +923,67 @@ def check_never_evaluated_automation(doc: TemplateDoc) -> List[Finding]:
     return findings
 
 
+# The plan sentence, in three versions, one per thing we know (tallyfy/mcp#1321).
+#
+# WHY THERE ARE THREE. Until #1321 there was one, and it was appended to every
+# summary unconditionally. That is wrong in both directions at once. A paying Pro
+# customer is told on every run that all their automations may be dead, which is
+# false and alarming; H2O Inc read it and asked whether every rule in all three of
+# their templates was inactive, while their own run had just fired eight
+# automations. And a free or expired organization gets the same sentence hedged as
+# a caveat, when for them it is the single most important thing on the page.
+#
+# The engine cannot fix this itself and should not try: it is a pure function over
+# one template document, which is what lets it run offline and is why the walk is
+# unaffected by serialization. The TOOL knows the organization, so the tool decides
+# which of these three applies and passes it in.
+
+# Known Pro, enterprise, appsumo or in trial: automations run, so say nothing.
+# A sentence with no reader it helps is noise, and noise is what made the original
+# read as boilerplate to the people it was written for.
+PLAN_ACTIVE_NOTE = ""
+
+# Known NOT Pro and not in trial. This is a finding, not a caveat, so it is worded
+# as one. It also names the consequence that surprises people: the template does
+# not degrade to "no automation", it degrades to every step visible at once,
+# because the launch-time hide pass lives inside the same plan gate
+# (api-v2 ApplyRulesWithPrerunConditions.php:35-45).
+PLAN_INACTIVE_WARNING = (
+    "IMPORTANT, and it applies to every template in this organization rather than "
+    "just this one: this organization is not on a Pro plan and is not in a trial, "
+    "so no automation in it runs at all. Every step that a rule would normally "
+    "hide is visible from the moment a process starts, and nothing is revealed or "
+    "hidden as answers come in. The findings above about rules describe what WOULD "
+    "happen on a Pro plan. Until the plan changes, the template runs as a flat list "
+    "of every step."
+)
+
+# The plan could not be read. Keep the original wording, because the honest answer
+# when we do not know is the one we shipped before we could check. Note the
+# direction this fallback has to fail in: silence here would hide a real problem
+# from a free organization, so an unreadable plan must produce the caveat rather
+# than nothing.
 PLAN_CAVEAT = (
     "Automations only run on a Pro plan or during a trial. On any other plan every "
     "automation in this template is inactive and no step is hidden when a process "
     "starts, so none of the findings above about rules would apply. This tool reads "
     "the template and cannot see which plan the organization is on."
 )
+
+# What the tool passes in. Anything else, including None, means "not known".
+PLAN_STATE_ACTIVE = "pro"
+PLAN_STATE_INACTIVE = "not_pro"
+
+
+def plan_sentence(plan_state):
+    """The sentence for a plan state, or "" when automations are known to run.
+
+    Deliberately total: any value that is not one of the two known states,
+    including None and anything unexpected, returns the unknown-plan caveat.
+    A plan we failed to read must never silently become a plan we approved.
+    """
+    if plan_state == PLAN_STATE_ACTIVE:
+        return PLAN_ACTIVE_NOTE
+    if plan_state == PLAN_STATE_INACTIVE:
+        return PLAN_INACTIVE_WARNING
+    return PLAN_CAVEAT

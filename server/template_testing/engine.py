@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from template_testing.checks import (
     PLAN_CAVEAT,
+    plan_sentence,
     ComponentEvidence,
     ConflictObservation,
     check_always_true_condition,
@@ -273,11 +274,25 @@ def _enforce_honesty(findings: List[Finding]) -> List[Finding]:
     return findings
 
 
+def _with_plan(body: str, plan_state: Optional[str]) -> str:
+    """Append the plan sentence, and leave no trailing space when there is none.
+
+    On a Pro or trial organization ``plan_sentence`` returns "", and the callers
+    above hand this a body that already ends in the separating space they used to
+    need. Stripping here keeps the Pro summary from ending in whitespace, which is
+    the sort of thing that shows up in a customer-facing string and in a snapshot
+    test and in nothing else.
+    """
+    sentence = plan_sentence(plan_state)
+    return (body + sentence) if sentence else body.rstrip()
+
+
 def _summary(
     doc: TemplateDoc,
     findings: List[Finding],
     coverage: Dict[str, Any],
     always_mention: Optional[List[Finding]] = None,
+    plan_state: Optional[str] = None,
 ) -> str:
     """One paragraph a non-engineer reads first.
 
@@ -295,6 +310,12 @@ def _summary(
     A sentence in the summary costs nothing, is always present, and is the
     honest answer to the question the customer actually asked: the two-hour timer
     they can see is doing nothing.
+
+    ``plan_state`` is what the CALLER knows about the organization's plan, and it
+    is the whole of what this function knows: the engine still reads nothing but
+    the template document. ``None`` is the correct default and means "not known",
+    which produces the same caveat this function emitted unconditionally before
+    tallyfy/mcp#1321. See ``checks.plan_sentence``.
     """
     high = [f for f in findings if f.severity == "high"]
     counts = {s: sum(1 for f in findings if f.severity == s) for s in SEVERITY_ORDER}
@@ -312,7 +333,7 @@ def _summary(
                 f"{coverage['assignments_walked']} paths were tested rather than all "
                 f"of them. "
             )
-        return base + PLAN_CAVEAT
+        return _with_plan(base, plan_state)
 
     if not findings:
         if coverage["exhaustive"]:
@@ -327,7 +348,7 @@ def _summary(
                 f"{coverage['assignments_walked']} paths that were tested. That is not "
                 f"the same as saying there is nothing to find."
             )
-        return body + " " + PLAN_CAVEAT
+        return _with_plan(body + " ", plan_state)
 
     lead = f"{title} has {len(findings)} thing(s) worth looking at"
     if high:
@@ -348,13 +369,14 @@ def _summary(
             f"{coverage['assignments_walked']} paths were tested rather than all of "
             f"them. Anything not listed here was not proved absent, only not found. "
         )
-    return lead + PLAN_CAVEAT
+    return _with_plan(lead, plan_state)
 
 
 def test_template_document(
     raw: Dict[str, Any],
     max_assignments: int = DEFAULT_MAX_ASSIGNMENTS,
     min_severity: str = "medium",
+    plan_state: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Walk every path through one template document and report problems.
 
@@ -415,7 +437,9 @@ def test_template_document(
         "engine_version": ENGINE_VERSION,
         "template_id": doc.id,
         "template_title": doc.title,
-        "summary": _summary(doc, visible, coverage, hidden_but_worth_saying),
+        "summary": _summary(
+            doc, visible, coverage, hidden_but_worth_saying, plan_state
+        ),
         "coverage": coverage,
         "findings": [f.to_dict() for f in visible],
         "counts": {s: sum(1 for f in findings if f.severity == s) for s in SEVERITY_ORDER},

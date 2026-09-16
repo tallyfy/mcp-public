@@ -24,6 +24,7 @@ from utils.authoring_payloads import (
 )
 from utils.sdk_serializer import serialize_dataclass
 from template_testing.references import orphaned_reference_ids
+from template_testing.checks import PLAN_STATE_ACTIVE, PLAN_STATE_INACTIVE
 from template_testing.document import NotATemplateDocument
 from template_testing.engine import (
     UnknownAnswerLabel,
@@ -1451,6 +1452,61 @@ REQUIRED: 'template_id'. Never call without it.""",
             raise ToolError("Template not found")
         return document
 
+    # Plan codes on which api-v2 actually evaluates automations. Read from
+    # api-v2 app/Models/Organization.php::hasProPlan() (lines 422-425) and the
+    # constants it names in app/Helpers/constants.php lines 57 and 61-64. The
+    # same three observers that evaluate rules all gate on
+    # `hasProPlan() || in_trial` and return before loading anything, so this set
+    # plus the trial flag is the whole condition.
+    _AUTOMATION_ACTIVE_PLAN_CODES = frozenset({
+        "appsumo",
+        "pro-monthly",
+        "pro-annual",
+        "enterprise-monthly",
+        "enterprise-annual",
+    })
+
+    def _read_plan_state(sdk, org_id: str):
+        """Is this organization one where automations actually run?
+
+        Returns PLAN_STATE_ACTIVE, PLAN_STATE_INACTIVE, or None for "could not
+        tell". Added with tallyfy/mcp#1321.
+
+        🔴 EVERY FAILURE PATH MUST RETURN None, NOT A GUESS. The caller turns
+        None into the original unknown-plan caveat and a definite answer into
+        either silence or a warning. So a swallowed error that returned
+        PLAN_STATE_ACTIVE would silently delete a real warning from a free
+        organization's report, which is the one direction this must not fail in.
+        `None` costs a sentence nobody needed; a wrong `active` costs the
+        finding.
+
+        Read RAW rather than through the SDK model on purpose, the same reason
+        `_fetch_template_document` above does: `Organization.in_trial` is
+        declared with a default on the dataclass, so a field the API omitted
+        comes back as a confident value that was never sent.
+        """
+        try:
+            response = sdk._make_request("GET", f"organizations/{org_id}")
+        except Exception:  # noqa: BLE001 - any failure means "not known"
+            return None
+        data = response.get("data") if isinstance(response, dict) else None
+        if not isinstance(data, dict):
+            return None
+        plan_code = data.get("plan_code")
+        in_trial = data.get("in_trial")
+        # in_trial alone is enough, and it is checked first because a trial org
+        # carries the free plan code while its automations do run.
+        if in_trial is True:
+            return PLAN_STATE_ACTIVE
+        if isinstance(plan_code, str) and plan_code:
+            if plan_code in _AUTOMATION_ACTIVE_PLAN_CODES:
+                return PLAN_STATE_ACTIVE
+            # A known code that is not on the list, with in_trial present and
+            # false. Anything less certain than that stays unknown.
+            if in_trial is False:
+                return PLAN_STATE_INACTIVE
+        return None
+
     @mcp.tool(
         name="test_template",
         description=(
@@ -1506,11 +1562,13 @@ REQUIRED: 'template_id'. Never call without it.""",
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             document = _fetch_template_document(sdk, org_id, template_id)
+            plan_state = _read_plan_state(sdk, org_id)
             try:
                 report = test_template_document(
                     document,
                     max_assignments=max_assignments,
                     min_severity=min_severity,
+                    plan_state=plan_state,
                 )
             except NotATemplateDocument as exc:
                 raise ToolError(str(exc))
