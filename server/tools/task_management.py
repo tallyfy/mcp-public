@@ -833,6 +833,22 @@ def resolve_guest_ids(api_key: str, org_id: str, guest_emails: List[str]) -> Lis
                     unresolved.append(email)
                     continue
                 raise
+            except ValueError:
+                # The SDK validates the address before it sends anything:
+                # ``get_guest`` calls ``_validate_email``, which re-raises
+                # email_validator's ``EmailNotValidError`` as a plain
+                # ``ValueError`` (tallyfy/user_management/base.py:45). A
+                # ``ValueError`` is not a ``TallyfyError``, so it used to escape
+                # this handler entirely, reach ``@handle_tallyfy_errors`` as an
+                # unhandled exception, and be reported to Sentry tagged
+                # ``error_type=unexpected``: a server fault, for what is
+                # correctable caller input (MCP-SERVER-5Z).
+                #
+                # An address the validator refuses can never match a guest, so it
+                # belongs in the same bucket as a 404 and is named in the same
+                # refusal. It is NOT swallowed; #1290 banned the silent drop.
+                unresolved.append(email)
+                continue
             if guest and guest.guest_id:
                 resolved_ids.append(guest.guest_id)
             else:
