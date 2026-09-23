@@ -321,6 +321,14 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "create_automation_rule": _AUTO_W,
     "update_automation_rule": _AUTO_W,
     "delete_automation_rule": _AUTO_W,
+    # -- files on form fields (assets) --------------------------------------
+    # An asset IS the value of a File Upload capture, so it belongs with its
+    # field rather than with whatever the field hangs off. api-v2's
+    # RESOURCE_MAP has no assets entry, exactly as it has none for tags or
+    # folders, so this is the same judgement call the docstring records for
+    # kickoff fields: map to the family a client doing this work holds.
+    "get_asset_content": _FORM_R,
+    "upload_asset": _FORM_W,
     # -- processes read (folders over runs) ---------------------------------
     "get_process_folders": _PROC_R,
     # -- genuinely cross-family ---------------------------------------------

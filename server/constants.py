@@ -530,8 +530,8 @@ the signed-in user, who sees only their own organization.
 Tool search returns few matches, so search by category name, not a bare noun like
 "template": Template Management, Process Management, Task Management, Form Fields,
 Automation, Search, User Management, Group Management, Comment Management, Tag
-Management, Folder Management, User Interaction, Template Mapping Validation, Org
-Memory, Universal API Fallback.
+Management, Folder Management, File Management, User Interaction, Template Mapping
+Validation, Org Memory, Universal API Fallback.
 
 ## The mental model (get the object right first)
 

@@ -32,6 +32,7 @@ from tools.user_interaction import register_user_interaction_tools
 from tools.api_fallback import register_api_fallback_tool, report_fallback_flag_state
 from tools.template_mapping_validation import register_template_mapping_validation_tools
 from tools.org_context import register_org_context_tools
+from tools.file_management import register_file_management_tools
 from utils.org_id_middleware import OrgIdMiddleware
 from utils.tallyfy_spec_cache import SPEC_CACHE
 from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ACCEPTED_MCP_RESOURCES, ENFORCE_AUDIENCE, SERVER_VERSION, INSTRUCTIONS_TEMPLATE
@@ -52,6 +53,16 @@ _init_otel(service_name="mcp-server")
 # by the tallyfy_api_* Prometheus metrics (Phase 5b — closes dead-metric gap).
 from utils.sdk_metrics_patch import patch_tallyfy_sdk  # noqa: E402
 patch_tallyfy_sdk()
+
+# Stop exporting the `*_created` series (#1353). prometheus_client adds one per
+# labelled child of every Counter and Histogram: a Unix timestamp that never
+# changes after the child is made. Nothing in monitoring/ reads one, and on a
+# labelled counter they double the series count. Done here, in the process
+# entry point, and not by an env var in a compose file, so the staging and
+# production servers cannot drift apart on it. It is process-wide by design,
+# which is why tests/conftest.py restores the library default around every test.
+from prometheus_client import disable_created_metrics  # noqa: E402
+disable_created_metrics()
 
 # Configure FastMCP production settings via environment variables
 # These settings enhance security and reliability in production
@@ -191,6 +202,7 @@ register_user_interaction_tools(mcp)
 register_api_fallback_tool(mcp)
 register_template_mapping_validation_tools(mcp)
 register_org_context_tools(mcp)
+register_file_management_tools(mcp)
 
 # Enforce the token's mcp_scopes per tool (#559). This is a FastMCP TOOL
 # middleware, so it is added here with mcp.add_middleware() rather than to the

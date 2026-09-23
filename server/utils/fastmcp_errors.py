@@ -327,7 +327,15 @@ def read_error_class(error: BaseException) -> Optional[str]:
 # than a superset, because here an ADDITION is the dangerous direction: each
 # new member silences a class of error permanently, so it must be a reviewed
 # decision rather than a free one.
-EXPECTED_UPSTREAM_STATUSES = (400, 401, 402, 403, 404, 409, 422)
+#
+# 423 was added for tallyfy/mcp#577, ahead of the api-v2 change that starts
+# emitting it. api-v2 PR #9466 adds RUN_STATUS_ISSUE and refuses writes to a run
+# blocked by an open issue with a 423 whose own message names the remedy. That is
+# an ordinary business refusal, the same class as the 403 of #592 and the 402 of
+# #1080, so it belongs here. It is added BEFORE the gate opens on purpose: the
+# whole value is that the first 423 in production does not page, and landed
+# afterwards the noise has already happened.
+EXPECTED_UPSTREAM_STATUSES = (400, 401, 402, 403, 404, 409, 422, 423)
 
 
 _MAX_FIELD_ERRORS = 12

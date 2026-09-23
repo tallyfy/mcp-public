@@ -51,6 +51,7 @@ CATEGORY_DESCRIPTIONS = [
     ("Template Mapping Validation", "template_mapping_validation", "Deterministic validation of a drafted template mapping before it is built"),
     ("Universal API Fallback", "api_fallback", "Catch-all read and write access to any Tallyfy REST API endpoint"),
     ("Org Memory", "org_context", "Per-organization curated memory document: read and full-rewrite update, stored server-side"),
+    ("File Management", "file_management", "Read and upload files attached to form fields, kickoff fields and task comments"),
 ]
 
 _breakdown_cache: list | None = None
