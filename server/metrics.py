@@ -525,48 +525,15 @@ def track_tool_execution(tool_name: str):
     return decorator
 
 
-def track_tallyfy_api_call(operation: str):
-    """
-    Decorator to track Tallyfy SDK API calls.
-
-    Args:
-        operation: Name of the API operation (e.g., 'get_tasks', 'create_process')
-
-    Returns:
-        Decorated function with API metrics tracking
-
-    Example:
-        @track_tallyfy_api_call("get_tasks")
-        def fetch_tasks(sdk, org_id):
-            return sdk.tasks.list(org_id)
-    """
-    def decorator(func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args, **kwargs) -> Any:
-            start_time = time.time()
-            status = 'success'
-
-            try:
-                result = func(*args, **kwargs)
-                return result
-
-            except Exception as e:
-                status = 'error'
-                logger.error(f"Tallyfy API call '{operation}' failed: {e}")
-                raise
-
-            finally:
-                duration = time.time() - start_time
-                tallyfy_api_calls_total.labels(
-                    operation=operation,
-                    status=status
-                ).inc()
-                tallyfy_api_duration_seconds.labels(
-                    operation=operation
-                ).observe(duration)
-
-        return wrapper
-    return decorator
+# The tallyfy_api_* series above are written in exactly ONE place:
+# utils/sdk_metrics_patch.py, which wraps BaseSDK._make_request and labels
+# every call through operation_label(), the normaliser that keeps ids out of
+# the `operation` label (#1353). A decorator named track_tallyfy_api_call used
+# to sit here. It had no caller, and it took `operation` as a free string, so
+# the first person to use it would have brought back an id-bearing label the
+# normaliser never sees. It was removed rather than rerouted (#1357).
+# tests/unit/server/utils/test_sdk_metrics_patch.py fails if any other module
+# under server/ or host/ starts writing these two series.
 
 
 # ============================================================================

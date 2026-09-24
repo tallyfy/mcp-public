@@ -89,13 +89,20 @@ def patch_tallyfy_sdk():
 
     original = BaseSDK._make_request
 
+    # *args as well as **kwargs, passed through unchanged (#1357). The SDK's
+    # own signature is (self, method, endpoint, params=None, data=None,
+    # form_data=None), so a caller may pass params positionally. A
+    # keyword-only wrapper refused that with a TypeError of its OWN, and
+    # because @wraps copies __qualname__ the message read
+    # "BaseSDK._make_request() takes 3 positional arguments", blaming the SDK
+    # for a call the SDK accepts. A metric must never be why a call fails.
     @wraps(original)
-    def _instrumented(self, method, endpoint, **kwargs):
+    def _instrumented(self, method, endpoint, *args, **kwargs):
         operation = operation_label(method, endpoint)
         start = time.time()
         status = "success"
         try:
-            return original(self, method, endpoint, **kwargs)
+            return original(self, method, endpoint, *args, **kwargs)
         except Exception:
             status = "error"
             raise

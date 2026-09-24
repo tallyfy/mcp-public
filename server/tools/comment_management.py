@@ -306,6 +306,29 @@ def _ensure_mention_markup(content: str, user_ids: List[int]) -> str:
     return f"{prefix} {content}".strip()
 
 
+def _fetch_task_comments(sdk, org_id: str, task_id: str, run_id: Optional[str] = None):
+    """Read a task's comments, whether or not the task belongs to a process.
+
+    A process task is read on the run-scoped route, which needs its run_id; when the
+    caller did not supply one it is looked up from the task. A standalone (one-off)
+    task has no run at all, so it is read on the org-scoped route instead (#1316).
+    Before that, a missing run_id raised "Could not resolve run_id", which is every
+    standalone task, and fell back to ``checklist_id``, which is a TEMPLATE id and
+    therefore built a runs/ URL that could only 404.
+
+    Shared by ``get_task_comments`` and ``add_task_comment``'s resolve path, so the
+    two cannot come to disagree about which task kinds have readable comments.
+    """
+    if run_id:
+        return sdk.threads.get_task_comments(org_id, run_id, task_id)
+
+    task = sdk.get_standalone_task(org_id, task_id)
+    task_run_id = getattr(task, "run_id", None)
+    if task_run_id:
+        return sdk.threads.get_task_comments(org_id, task_run_id, task_id)
+    return sdk.threads.get_standalone_task_comments(org_id, task_id)
+
+
 def register_comment_management_tools(mcp):
     """Register all comment/thread management tools with the MCP server"""
 
@@ -319,7 +342,8 @@ Optional: 'run_id' (32-char hex process ID), provide it if you have it to avoid 
 'run_id' identifies the PROCESS the task belongs to, so it is a DIFFERENT id from 'task_id'.
 If you only have the task id, omit 'run_id' entirely rather than repeating the task id there.
 
-If run_id is omitted, it is resolved automatically from the task.""",
+If run_id is omitted, it is resolved automatically from the task.
+Standalone (one-off) tasks have no run_id: omit it and their comments are read directly.""",
         tags=["tasks", "comments", "threads", "read-only", "collaboration"],
         annotations=ToolAnnotations(
             title="Get task comments",
@@ -339,8 +363,10 @@ If run_id is omitted, it is resolved automatically from the task.""",
         Args:
             task_id: Task ID to retrieve comments for (REQUIRED - 32-character hex string)
             run_id: Process (run) ID the task belongs to. Optional. If omitted, resolved
-                automatically via a task lookup (costs one extra API call). Passing the
-                task id here is treated as if run_id had been omitted (see #696).
+                automatically via a task lookup (costs one extra API call); a standalone
+                task has no run, so its comments are read on the org-scoped route
+                instead (#1316). Passing the task id here is treated as if run_id had
+                been omitted (see #696).
 
         Returns:
             List of comment objects with content, author, and timestamps
@@ -363,16 +389,7 @@ If run_id is omitted, it is resolved automatically from the task.""",
             run_id = None
 
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            resolved_run_id = run_id
-            if not resolved_run_id:
-                task = sdk.get_standalone_task(org_id, task_id)
-                resolved_run_id = getattr(task, 'run_id', None) or getattr(task, 'checklist_id', None)
-                if not resolved_run_id:
-                    raise ToolError(
-                        "Could not resolve run_id for this task automatically. "
-                        "Please provide run_id explicitly."
-                    )
-            comments = sdk.threads.get_task_comments(org_id, resolved_run_id, task_id)
+            comments = _fetch_task_comments(sdk, org_id, task_id, run_id)
             return ToolResult(
                 content=compact_result([serialize_dataclass(c) for c in comments]) if comments else [],
                 structured_content=None
@@ -485,45 +502,38 @@ CORRECT usage:
             resolved_count = 0
             if label == "resolve":
                 try:
-                    resolved_run_id = run_id
-                    if not resolved_run_id:
-                        task = sdk.get_standalone_task(org_id, task_id)
-                        resolved_run_id = (
-                            getattr(task, "run_id", None)
-                            or getattr(task, "checklist_id", None)
+                    # #1316: a standalone task has no run, and this used to skip the
+                    # lookup for it entirely, so its open problem flags were never
+                    # cleared and the resolve comment was cosmetic.
+                    comments = _fetch_task_comments(sdk, org_id, task_id, run_id)
+                    problem_threads = [
+                        c for c in (comments or [])
+                        if (
+                            getattr(c, "label", None) == "problem"
+                            and not getattr(c, "resolve_id", None)
                         )
-                    if resolved_run_id:
-                        comments = sdk.threads.get_task_comments(
-                            org_id, resolved_run_id, task_id
-                        )
-                        problem_threads = [
-                            c for c in (comments or [])
-                            if (
-                                getattr(c, "label", None) == "problem"
-                                and not getattr(c, "resolve_id", None)
+                    ]
+                    for i, c in enumerate(problem_threads):
+                        resolve_content = effective_content if i == 0 else "Resolved"
+                        try:
+                            sdk.threads.resolve_task_issues(
+                                org_id, task_id, c.id,
+                                content=resolve_content,
+                                state=state,
                             )
-                        ]
-                        for i, c in enumerate(problem_threads):
-                            resolve_content = effective_content if i == 0 else "Resolved"
-                            try:
-                                sdk.threads.resolve_task_issues(
-                                    org_id, task_id, c.id,
-                                    content=resolve_content,
-                                    state=state,
-                                )
-                                resolved_count += 1
-                            except Exception:
-                                logger.warning(
-                                    "Failed to auto-resolve problem thread %s on task %s",
-                                    c.id,
-                                    task_id,
-                                )
-                        if resolved_count:
-                            logger.info(
-                                "Auto-resolved %d problem thread(s) on task %s",
-                                resolved_count,
+                            resolved_count += 1
+                        except Exception:
+                            logger.warning(
+                                "Failed to auto-resolve problem thread %s on task %s",
+                                c.id,
                                 task_id,
                             )
+                    if resolved_count:
+                        logger.info(
+                            "Auto-resolved %d problem thread(s) on task %s",
+                            resolved_count,
+                            task_id,
+                        )
                 except Exception:
                     logger.warning(
                         "Failed to auto-resolve problems on task %s after resolve comment",

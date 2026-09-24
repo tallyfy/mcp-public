@@ -75,6 +75,7 @@ import base64
 import binascii
 import logging
 import mimetypes
+import re
 from typing import Annotated, Any, Dict, Optional
 
 import httpx
@@ -123,22 +124,48 @@ TRANSFER_TIMEOUT_SECONDS = 60.0
 #   literal "Template" throws `Undefined array key`, answered as HTTP 500, with
 #   the file already stored. That is why upload_asset's error path says a
 #   server error may have left a copy behind.
-# * Both Tallyfy web clients send this pair from render-field.component.ts:
+# * Both Tallyfy web clients send the subject from render-field.component.ts:
 #   isPrerun ? 'Checklist' : task.is_oneoff_task ? 'Task' : 'Run'.
 #
-# 'Task' is the third value that file sends, for a form field on a STANDALONE
-# task. It is deliberately not offered here: it takes a different shape (no
-# step_id, no checklist_id, subject_id is the task), which this tool does not
-# implement.
+# 'Task' is the third value, for a form field on a STANDALONE (one-off) task,
+# and it is a different SHAPE, not just a different word (#1352). Read off
+# api-v2 master and both web clients:
+#
+# * The web clients send uploaded_from=<field id>, subject_type='Task',
+#   subject_id=<the task's own id>, and NEITHER step_id NOR checklist_id. Both
+#   add those two keys only when the task is not one-off (client-v2
+#   render-field.component.ts saveFile, legacy render.field.component.js).
+# * MorphSubject resolves 'Task' to the real Task model class, so it is stored
+#   as a model, unlike the literal 'Template' of #1348. UploadAssetRequest says
+#   only `required`, so the Asset::$validation_rules list, which omits Task, is
+#   not applied on this route (nothing calls validateInput there).
+# * saveFile keys the object as checklists/{subject_id}/ when no checklist_id
+#   is sent, and records that key in file_path, which /file/{id}/dl reads
+#   first. A checklist_id would move it to checklists/{checklist_id}/runs/
+#   {task id}/, a path nothing else writes, which is why this tool refuses one.
+# * The activity-feed step that runs after the store looks the subject up in
+#   ActivityFeed::TARGETED_ENTITY_RELATED_COLUMN, and Task::class is in it. It
+#   has to be: AssetsService::wrapFileUpload rewrites every process-task upload
+#   to Task::class before that same step.
+#
+# That last point is also why a bare 'Task' is REFUSED rather than mapped. The
+# API answers subject.type 'Task' for a process-task upload too, so a model
+# that has just read one will reach for 'Task' with a run id, and api-v2 would
+# store the file against a task that does not exist. The standalone shape is
+# named StandaloneTask, the word this server uses for these tasks everywhere
+# else (create_standalone_task, update_standalone_task).
 _WIRE_KICKOFF = "Checklist"
 _WIRE_PROCESS = "Run"
+_WIRE_STANDALONE_TASK = "Task"
 
 # What `subject_type` a caller may say, mapped to the wire value above. The
-# caller vocabulary stays Template and Process, which is what the rest of this
-# server calls these things. Checklist and Run are accepted too, for the reason
-# _FOLDER_TYPE_ALIASES in tools/folder_management.py gives: api-v2 answers with
-# them in the `subject.type` it returns, so a model that has just read one asset
-# will reach for that word when writing the next.
+# caller vocabulary is Template, Process and StandaloneTask, which is what the
+# rest of this server calls these things. Checklist and Run are accepted too,
+# for the reason _FOLDER_TYPE_ALIASES in tools/folder_management.py gives:
+# api-v2 answers with them in the `subject.type` it returns, so a model that
+# has just read one asset will reach for that word when writing the next.
+# Keys carry no spaces, hyphens or underscores, because _subject_type_key
+# strips those before the lookup ("standalone task", "one-off task").
 _SUBJECT_TYPE_ALIASES = {
     "template": _WIRE_KICKOFF,
     "templates": _WIRE_KICKOFF,
@@ -147,7 +174,15 @@ _SUBJECT_TYPE_ALIASES = {
     "process": _WIRE_PROCESS,
     "processes": _WIRE_PROCESS,
     "run": _WIRE_PROCESS,
+    "standalonetask": _WIRE_STANDALONE_TASK,
+    "standalonetasks": _WIRE_STANDALONE_TASK,
+    "oneofftask": _WIRE_STANDALONE_TASK,
+    "oneofftasks": _WIRE_STANDALONE_TASK,
 }
+
+# Words that name a task without saying which kind. Refused with a message
+# naming both task shapes, never guessed. See the comment above.
+_AMBIGUOUS_TASK_WORDS = frozenset({"task", "tasks"})
 
 _KICKOFF_FIELD_MARKER = "ko_field"
 
@@ -228,7 +263,8 @@ UploadedFrom = Annotated[str, Field(
     description=(
         "Which field the file belongs to. Pass the literal ko_field for a "
         "kickoff form field on a template, or the 32-character hex field ID for "
-        "a form field on a task in a running process."
+        "a form field on a task, either a task in a running process or a "
+        "standalone task."
     ),
     examples=["ko_field", "a1b2c3d4e5f6789012345678901234ef"],
 )]
@@ -238,11 +274,14 @@ SubjectType = Annotated[str, Field(
     max_length=32,
     description=(
         "What the file is being attached to: Template for a kickoff form "
-        "upload, or Process for an upload to a task inside a running process. "
-        "Checklist is accepted as a synonym of Template and Run as a synonym of "
-        "Process, because that is the vocabulary the API answers with."
+        "upload, Process for an upload to a task inside a running process, or "
+        "StandaloneTask for an upload to a form field on a standalone "
+        "(one-off) task. Checklist is accepted as a synonym of Template and Run "
+        "as a synonym of Process, because that is the vocabulary the API "
+        "answers with. A bare Task is refused, because it could mean either "
+        "kind of task."
     ),
-    examples=["Template", "Process"],
+    examples=["Template", "Process", "StandaloneTask"],
 )]
 
 SubjectId = Annotated[str, Field(
@@ -251,8 +290,9 @@ SubjectId = Annotated[str, Field(
     pattern="^[a-f0-9]{32}$",
     description=(
         "ID of the thing the file is attached to, as a 32-character hex string: "
-        "the template ID when subject_type is Template, or the process (run) ID "
-        "when subject_type is Process."
+        "the template ID when subject_type is Template, the process (run) ID "
+        "when subject_type is Process, or the task's own ID when subject_type "
+        "is StandaloneTask."
     ),
     examples=["c7d8e9f0a1b2c3d4e5f60718293a4b5c"],
 )]
@@ -268,7 +308,8 @@ OptionalStepIdForUpload = Annotated[Optional[str], Field(
     description=(
         "Step ID that owns the form field, as a 32-character hex string. "
         "Required when subject_type is Process. Leave it out for a kickoff "
-        "upload, which belongs to the template rather than to any step."
+        "upload, which belongs to the template rather than to any step, and "
+        "for StandaloneTask, because a standalone task has no step."
     ),
     examples=["b2c3d4e5f6a7890123456789012345ab"],
 )]
@@ -280,7 +321,8 @@ OptionalChecklistIdForUpload = Annotated[Optional[str], Field(
     description=(
         "Template ID the process was launched from, as a 32-character hex "
         "string. Required when subject_type is Process. This is the TEMPLATE, "
-        "not the process: never repeat subject_id here."
+        "not the process: never repeat subject_id here. Leave it out for "
+        "StandaloneTask."
     ),
     examples=["a1b2c3d4e5f6789012345678901234ef"],
 )]
@@ -448,13 +490,28 @@ def _decode_base64(content_base64: str) -> bytes:
         ) from exc
 
 
+def _subject_type_key(subject_type: str) -> str:
+    """Lowercase, with spaces, hyphens and underscores removed."""
+    return re.sub(r"[\s_-]+", "", str(subject_type)).lower()
+
+
 def _normalize_subject_type(subject_type: str) -> str:
-    resolved = _SUBJECT_TYPE_ALIASES.get(str(subject_type).strip().lower())
+    key = _subject_type_key(subject_type)
+    if key in _AMBIGUOUS_TASK_WORDS:
+        raise ToolError(
+            f"subject_type {subject_type!r} could mean either kind of task. Use "
+            "'StandaloneTask' for a form field on a standalone (one-off) task, "
+            "with subject_id set to that task's id. Use 'Process' for a task "
+            "inside a running process, with subject_id set to the process id "
+            "plus step_id and checklist_id."
+        )
+    resolved = _SUBJECT_TYPE_ALIASES.get(key)
     if resolved is None:
         raise ToolError(
-            f"subject_type must be 'Template' (a kickoff form upload) or "
-            f"'Process' (an upload to a task in a running process) -- got "
-            f"{subject_type!r}"
+            f"subject_type must be 'Template' (a kickoff form upload), "
+            f"'Process' (an upload to a task in a running process) or "
+            f"'StandaloneTask' (an upload to a form field on a standalone "
+            f"task) -- got {subject_type!r}"
         )
     return resolved
 
@@ -655,17 +712,24 @@ def register_file_management_tools(mcp):
         name="upload_asset",
         description=(
             "Upload a file to a Tallyfy form field. Give it the file as base64 "
-            "in content_base64 plus a filename, and say where it goes. For a "
-            "KICKOFF field: uploaded_from='ko_field', subject_type='Template', "
-            "subject_id=<template id>. For a form field on a task in a running "
+            "in content_base64 plus a filename, and say where it goes. There "
+            "are three shapes. (1) A KICKOFF field on a template: "
+            "uploaded_from='ko_field', subject_type='Template', "
+            "subject_id=<template id>. (2) A form field on a task in a running "
             "process: uploaded_from=<field id>, subject_type='Process', "
             "subject_id=<process id>, and BOTH step_id (the step that owns the "
             "field) and checklist_id (the template the process was launched "
-            "from) are required. Returns the new asset's metadata including its "
-            "id, which you then pass in the taskdata of update_task to record "
-            "the file against the field. Creates a new asset every call and "
-            "replaces nothing, so calling it twice uploads the file twice. "
-            "Decoded content must be at or under 10MB."
+            "from) are required. (3) A form field on a STANDALONE task, the "
+            "one-off kind made by create_standalone_task: "
+            "uploaded_from=<field id>, subject_type='StandaloneTask', "
+            "subject_id=<that task's id>, and no step_id or checklist_id. A "
+            "bare 'Task' is refused, because it could mean shape 2 or shape 3. "
+            "Returns the new asset's metadata including its id, which you then "
+            "pass in the taskdata of update_task (shape 2) or "
+            "update_standalone_task (shape 3) to record the file against the "
+            "field. Creates a new asset every call and replaces nothing, so "
+            "calling it twice uploads the file twice. Decoded content must be "
+            "at or under 10MB."
         ),
         tags=["file", "asset", "write", "attachment"],
         annotations=ToolAnnotations(
@@ -697,30 +761,57 @@ def register_file_management_tools(mcp):
             filename: Original filename including its extension, for example
                 report.pdf.
             uploaded_from: The literal ko_field for a kickoff form field, or the
-                32-character hex field ID for a form field on a task.
-            subject_type: Template for a kickoff upload, or Process for an
-                upload to a task in a running process. Checklist and Run are
-                accepted as synonyms.
-            subject_id: The template ID when subject_type is Template, or the
-                process (run) ID when subject_type is Process.
+                32-character hex field ID for a form field on a task, whether
+                the task is in a running process or is a standalone task.
+            subject_type: Template for a kickoff upload, Process for an upload
+                to a task in a running process, or StandaloneTask for an upload
+                to a form field on a standalone (one-off) task. Checklist and
+                Run are accepted as synonyms of the first two. A bare Task is
+                refused, because it could mean either kind of task.
+            subject_id: The template ID when subject_type is Template, the
+                process (run) ID when subject_type is Process, or the task's
+                own ID when subject_type is StandaloneTask.
             step_id: The step that owns the form field. Required when
-                subject_type is Process.
+                subject_type is Process. Leave it out for StandaloneTask.
             checklist_id: The template the process was launched from. Required
-                when subject_type is Process, and never the same value as
-                subject_id.
+                when subject_type is Process, never the same value as
+                subject_id, and left out for StandaloneTask.
 
         Returns:
             ToolResult with the created asset's id, filename, version,
             uploaded_from, uploaded_at, step_id, source and subject {id, type}.
-            For a task upload api-v2 reports the subject as the Task and its id,
-            while the stored asset belongs to the process: get_asset_content
-            then shows type Run and the process id. Measured on staging for
-            #1348; it is api-v2's AssetsService::wrapFileUpload rewriting the
-            subject in memory before the response is rendered.
+            For a process-task upload api-v2 reports the subject as the Task and
+            its id, while the stored asset belongs to the process:
+            get_asset_content then shows type Run and the process id. Measured
+            on staging for #1348; it is api-v2's AssetsService::wrapFileUpload
+            rewriting the subject in memory before the response is rendered.
+            For a standalone-task upload the stored subject IS the task, so
+            both the response and get_asset_content show type Task and the
+            task id (read from api-v2 source for #1352: wrapFileUpload rewrites
+            only a Run subject).
         """
         resolved_subject_type = _normalize_subject_type(subject_type)
         step_id = _blank_to_none(step_id)
         checklist_id = _blank_to_none(checklist_id)
+
+        # The web clients send neither key for a standalone task, and api-v2
+        # would take a checklist_id as an instruction to file the object under
+        # checklists/{checklist_id}/runs/{task id}/, a path no other writer
+        # uses. Refused before anything is sent, so the caller learns which
+        # shape it meant rather than getting a 201 on the wrong one.
+        if resolved_subject_type == _WIRE_STANDALONE_TASK:
+            extra = [
+                name for name, value in
+                (("step_id", step_id), ("checklist_id", checklist_id))
+                if value
+            ]
+            if extra:
+                raise ToolError(
+                    f"A standalone task has no step or template, so leave "
+                    f"{' and '.join(extra)} out when subject_type is "
+                    "StandaloneTask. If the task is inside a running process, "
+                    "use subject_type 'Process' with the process id instead."
+                )
 
         # Refused here rather than at the API, because api-v2 accepts the upload
         # and stores an asset that is attached to nothing reachable. A caller
