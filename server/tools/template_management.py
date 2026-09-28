@@ -5,7 +5,9 @@ Tools for managing templates, steps, and template health
 
 import logging
 import re
-from typing import Any, Dict
+from typing import Annotated, Any, Dict
+
+from pydantic import Field
 
 from email_validator import validate_email, EmailNotValidError
 from fastmcp.exceptions import ToolError
@@ -39,6 +41,7 @@ from utils.sdk_serializer import (
     compact_result,
     compact_dict_list_field,
     window_longest_text,
+    page_list_by_bytes,
     MAX_RESULT_BYTES,
     TRUNCATION_MARKER_PREFIX,
 )
@@ -1140,7 +1143,29 @@ offering a guest slot, send 'allow_guest_owners': False through update_step.
     def add_assignees_to_step(
         template_id: TemplateId,
         step_id: StepId,
-        assignees: Any,
+        # The runtime type stays Any because some clients send this object as a
+        # JSON string, which the body parses below. The published schema says
+        # object, because Claude's directory portal flags a parameter with no
+        # type (tallyfy/mcp#1416) and an object is what every client should send.
+        assignees: Annotated[Any, Field(json_schema_extra={
+            "type": "object",
+            "properties": {
+                "users": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Numeric Tallyfy user IDs",
+                },
+                "guests": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Guest email addresses",
+                },
+            },
+            "description": (
+                'Who to add, e.g. {"users": [10026], "guests": '
+                '["alice@example.com"]}. Existing assignees are kept.'
+            ),
+        })],
     ) -> GenericDict:
         """
         Add assignees to a specific step in a template.
@@ -1638,12 +1663,12 @@ WORKFLOW: If you don't have the template_id yet:
 2. Then call get_template_steps(template_id="<id>")
 
 CORRECT usage:
-- get_template_steps(template_id="abc123...") - every step, long text shortened
+- get_template_steps(template_id="abc123...") - steps in position order, long text shortened
 - get_template_steps(template_id="abc123...", step_id="def456...") - one step
 - get_template_steps(template_id="abc123...", step_id="def456...", full_text=True) - that
   step's text in full, across as many calls as it takes
 
-READING LONG TEXT: to keep all steps in one response, long text is shortened and marked
+READING LONG TEXT: to fit more steps in one response, long text is shortened and marked
 "{TRUNCATION_MARKER_PREFIX} ...]". A marked value is NOT the full text. Never write one back;
 you would overwrite whatever was cut. Re-read that one step with full_text=True first.
 'full_text' needs a 'step_id' (it is refused without one) because one step's text can be
@@ -1653,6 +1678,9 @@ Text longer than one response is delivered IN PARTS. Each part says which charac
 covers and names the next offset, e.g. "characters 0 to 24461 of 60000 ... call again with
 text_offset=24461". Keep calling with the offset you were given and join the parts in
 order; the final part says "This is the LAST part." Do not write a part back on its own.
+
+LONG TEMPLATES: if the result carries "_truncated", the remaining steps are NOT in it. Call
+again with the step_offset it names until a part says "This is the LAST part."
 
 DO NOT call get_template just to read its steps. Use this tool instead.""",
         tags=["templates", "steps", "workflow", "read-only"],
@@ -1672,6 +1700,7 @@ DO NOT call get_template just to read its steps. Use this tool instead.""",
         step_id: OptionalString = "",
         full_text: bool = False,
         text_offset: int = 0,
+        step_offset: int = 0,
     ) -> GenericList:
         """
         Get all steps for a template in order, or one step in full.
@@ -1686,6 +1715,10 @@ DO NOT call get_template just to read its steps. Use this tool instead.""",
                 escape.
             text_offset: Character offset to resume from, taken from the marker
                 on the previous part. Only meaningful with full_text.
+            step_offset: Number of steps already received, taken from the
+                "_truncated" marker on the previous part. Pages the step list
+                when a template's steps do not fit one response (#626). Refused
+                with step_id, which already selects a single step.
 
         Returns:
             List of step objects with id, title, position, and other step properties
@@ -1698,6 +1731,13 @@ DO NOT call get_template just to read its steps. Use this tool instead.""",
             )
         if text_offset < 0:
             raise ToolError(f"text_offset must be 0 or more, got {text_offset}.")
+        if step_offset < 0:
+            raise ToolError(f"step_offset must be 0 or more, got {step_offset}.")
+        if step_offset and wanted:
+            raise ToolError(
+                "step_offset pages the list of steps, and step_id already selects "
+                "one step. Pass one or the other."
+            )
         if full_text and not wanted:
             raise ToolError(
                 "full_text=True requires a step_id. Call "
@@ -1707,7 +1747,18 @@ DO NOT call get_template just to read its steps. Use this tool instead.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            steps = sdk.templates.get_template_steps(org_id, template_id)
+            # api-v2 does not return steps in position order (#626: page 1 of a
+            # 22-step template held positions 1, 8, 9, 12...), so a page cut off
+            # the raw order drops steps from the MIDDLE of the process and the
+            # next page is just as scattered. Sort first; a step with no
+            # position sorts last, keeping its original relative order.
+            steps = sorted(
+                sdk.templates.get_template_steps(org_id, template_id),
+                key=lambda st: (
+                    getattr(st, "position", None) is None,
+                    getattr(st, "position", None) or 0,
+                ),
+            )
             if wanted:
                 steps = [st for st in steps if str(getattr(st, "id", "")) == wanted]
                 if not steps:
@@ -1739,8 +1790,25 @@ DO NOT call get_template just to read its steps. Use this tool instead.""",
                 except ValueError as exc:
                     raise ToolError(str(exc)) from exc
 
+            if wanted:
+                return ToolResult(
+                    content=compact_result([serialize_dataclass(st) for st in steps]),
+                    structured_content=None
+                )
+
+            if step_offset and step_offset >= len(steps):
+                raise ToolError(
+                    f"step_offset={step_offset} is past the end: template "
+                    f"'{template_id}' has {len(steps)} steps, so the largest valid "
+                    f"step_offset is {max(len(steps) - 1, 0)}."
+                )
             return ToolResult(
-                content=compact_result([serialize_dataclass(st) for st in steps]),
+                content=page_list_by_bytes(
+                    [serialize_dataclass(st) for st in steps],
+                    step_offset,
+                    item_label="steps",
+                    offset_param="step_offset",
+                ),
                 structured_content=None
             )
 

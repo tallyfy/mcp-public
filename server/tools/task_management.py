@@ -67,6 +67,120 @@ _CHOICE_FIELD_TYPES = ("dropdown", "radio", "multiselect")
 _FANOUT_PAGE_SIZE = 100
 _FANOUT_MAX_PAGES = 20
 
+# The `status` filter on every task LISTING route (me/tasks, users/{id}/tasks,
+# runs/{id}/tasks, guests/{code}/tasks) reaches api-v2's Task::scopeStatus through
+# TallyfyQueryBuilder::filter. That scope splits the value on commas, ORs the
+# parts, and runs `scope{Studly(part)}` for each one. A part with no matching
+# scope adds NO condition, so an unknown value returns every task with a 200 and
+# nothing said (#1287, api-v2#10361). Pass-through is therefore unsafe here
+# (root CLAUDE.md rule 29): only values proven to filter are sent.
+#
+# Each entry below was read off Task.php on api-v2 master AND production and
+# then driven against a live process on 2026-09-28, except `stalled` (below).
+# Deliberately absent:
+#   delayed   - scopeDelayed is an ORDER BY, not a filter.
+#   due-date-passed - same rows as `overdue` on production, different on master.
+_TASK_STATUS_FILTERS = {
+    "all": "every task",
+    "active": "every task not completed (includes auto-skipped)",
+    "active-visible": "not-started or in-progress only",
+    "not-started": "not started",
+    "in-progress": "in progress",
+    "complete": "completed",
+    "overdue": "past its deadline and not completed",
+    # scopeStalled arrived with api-v2 dbf1e155c (#10450) and moves tasks in a
+    # process that has gone quiet out of `overdue`. Accepted by owner decision
+    # 2026-09-28 ahead of that commit reaching api-v2 production: staging
+    # filters on it (measured: 9 tasks, exactly the 9 missing from `overdue`),
+    # while production ignores it and answers every task until it promotes.
+    "stalled": "past its deadline in a process that has gone quiet",
+    "due-soon": "due within 24 hours",
+    "on-time": "not completed and not yet due",
+    "has-problem": "carrying an unresolved problem",
+    "has-improvement": "carrying an improvement comment",
+}
+
+# Spellings a caller reasonably sends, mapped onto the code api-v2 filters on.
+# `completed` is THE task status value a read returns, and the one value that
+# silently filtered nothing (#1287).
+_TASK_STATUS_ALIASES = {
+    "completed": "complete",
+    "incomplete": "active",
+    "in-complete": "active",
+    "notstarted": "not-started",
+    "inprogress": "in-progress",
+    "activevisible": "active-visible",
+    "duesoon": "due-soon",
+    "ontime": "on-time",
+    "hasproblem": "has-problem",
+    "hasimprovement": "has-improvement",
+}
+
+# scopeAutoSkipped is `where('status', '!=', 'auto-skipped')`, so this filter
+# returns every task EXCEPT the auto-skipped ones. Measured live 2026-09-28: a
+# process with 19 auto-skipped tasks answered 7 tasks, none of them auto-skipped.
+_TASK_STATUS_INVERTED = frozenset({"auto-skipped", "autoskipped"})
+
+
+def _normalize_task_status_filter(status: Optional[str]) -> Optional[str]:
+    """Map a caller's task-status filter onto a value api-v2 actually filters on.
+
+    Returns None when no filter was given, so the caller's default applies.
+    Raises ToolError for a value api-v2 would silently ignore or invert,
+    because either would return the wrong tasks with a 200 (#1287).
+    """
+    if status is None or not status.strip():
+        return None
+
+    codes: List[str] = []
+    for raw in status.split(","):
+        part = "-".join(raw.strip().lower().replace("_", " ").split())
+        if not part:
+            continue
+        if part in _TASK_STATUS_INVERTED:
+            raise ToolError(
+                "status='auto-skipped' cannot be used as a filter: Tallyfy's API "
+                "currently returns every task EXCEPT the auto-skipped ones for it. "
+                "Use status='all' and read each task's `status` field instead."
+            )
+        code = _TASK_STATUS_ALIASES.get(part, part)
+        if code not in _TASK_STATUS_FILTERS:
+            valid = ", ".join(sorted(_TASK_STATUS_FILTERS))
+            raise ToolError(
+                f"status={raw.strip()!r} is not a task filter Tallyfy's API "
+                f"understands, and it would silently return every task. "
+                f"Use one of: {valid} (comma-separate to combine)."
+            )
+        if code not in codes:
+            codes.append(code)
+
+    if not codes:
+        return None
+    if "all" in codes and len(codes) > 1:
+        raise ToolError(
+            "status='all' cannot be combined with another value: the API drops "
+            "'all' and filters on the rest. Send 'all' alone, or only the others."
+        )
+    return ",".join(codes)
+
+
+def _refuse_status_on_update(status: Optional[str], complete_tool: str, reopen_tool: str) -> None:
+    """Refuse a `status` change on a generic task update.
+
+    api-v2's TaskBuilder::editBasicTaskFields drops `status` from the payload
+    and answers 200, and a maintainer confirmed on api-v2#10362 that this is
+    intentional: status changes only through the completion endpoints, which
+    also advance dependent steps and fire webhooks. So the only honest thing
+    this tool can do with a status is refuse it and name the tool that works.
+    """
+    if status is None or not status.strip():
+        return
+    raise ToolError(
+        f"status cannot be changed by updating a task: Tallyfy ignores it here "
+        f"and would report success. To complete the task call {complete_tool}; "
+        f"to reopen it call {reopen_tool}. Nothing was updated."
+    )
+
 
 def _validate_task_form_fields(form_fields: Any) -> None:
     """Validate caller-supplied one-off-task `form_fields` before they are POSTed.
@@ -949,8 +1063,9 @@ A task's status is one of: not-started, in-progress, auto-skipped, completed.
 For problem tasks read the has_issues field. For overdue, compare deadline to now.
 
 SCOPE: defaults to ACTIVE tasks only, matching what "what are my tasks?" usually
-means. Pass status="all" for every status including completed/archived, or
-status="completed" etc. for one specific status.
+means. Pass status="all" for every task, or a filter such as "complete",
+"not-started", "in-progress" or "overdue". Completed tasks are filtered with
+"complete". "auto-skipped" cannot be used as a filter.
 
 PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. to retrieve subsequent pages.
 meta.total_pages shows how many pages exist. meta.total shows the real count.""",
@@ -974,8 +1089,8 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         Get tasks assigned to the current user in the organization.
 
         Defaults to ACTIVE tasks only, matching what "what are my tasks?" means
-        in practice. Pass status="all" to include completed/archived/auto-skipped
-        tasks, or a specific status to filter to just that one.
+        in practice. Pass status="all" to include completed and auto-skipped
+        tasks, or a specific filter to narrow to just that one.
 
         Before tallyfy/sdk#76 (fixed in SDK 2.1.0+, tallyfy/mcp#618) the SDK's
         `get_my_tasks` took only org_id/page/per_page and api-v2's
@@ -989,18 +1104,20 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         Args:
             page: Page number to fetch (1-based, default: 1).
             status: Task status filter (default: "active"). Pass "all" for
-                every status, or one of not-started/in-progress/auto-skipped/
-                completed for a single status.
+                every task, or a filter such as not-started, in-progress,
+                complete or overdue. Unknown values are refused, because the
+                API would silently ignore them (#1287).
 
         Returns:
             Dict with 'data' (list of tasks) and 'meta' (pagination info).
         """
+        status = _normalize_task_status_filter(status) or "active"
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             content = fetch_single_page(
                 sdk.tasks.get_my_tasks, org_id,
                 page=page,
-                status=status or "active",
+                status=status,
                 compact_fields=["step", "run", "taskdata"],
             )
             return ToolResult(content=content, structured_content=None)
@@ -1023,7 +1140,7 @@ GUEST USERS: This tool is for org members only. For guest tasks, use
 get_guest_tasks(guest_email="...") or get_guest_tasks(guest_id="...") instead.
 
 For the current user's tasks, get_my_tasks() is simpler (no user_id needed) and
-also accepts status="all"/"completed"/etc.
+also accepts status="all"/"complete"/etc.
 
 IMPORTANT: Tallyfy has no "urgent" or "priority" field. No task ever carries
 status="overdue" or status="hasproblem"; those are query-side filter values only.
@@ -1059,7 +1176,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
             user_name: User's full name for automatic ID lookup (optional)
             user_email: User's email address for automatic ID lookup (optional)
             sort_by: Sort order for tasks, e.g. "newest" (default: "newest")
-            status: Filter by status, e.g. "all", "active", "completed" (default: "all")
+            status: Filter by status, e.g. "all", "active", "complete" (default: "all")
             page: Page number to fetch (1-based, default: 1).
 
         Returns:
@@ -1069,6 +1186,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
             raise ToolError(
                 "At least one of 'user_id' (numeric), 'user_name', or 'user_email' must be provided."
             )
+        status = _normalize_task_status_filter(status) or "all"
 
         api_key, org_id = get_authenticated_credentials()
 
@@ -1140,7 +1258,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
             process_id: Process (run) ID to get tasks for (provide this OR run_id OR process_name)
             run_id: Alias for process_id, consistent with run_id used in other task tools
             process_name: Process (run) name to get tasks for (alternative to process_id/run_id)
-            status: Filter tasks by status (optional)
+            status: Filter tasks by status, e.g. "complete", "not-started", "overdue" (optional)
             sort: Sort order for tasks (optional)
             owners: Filter by owner IDs (optional)
             groups: Filter by group IDs (optional)
@@ -1149,6 +1267,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         Returns:
             Dict containing tasks, meta, and process_info
         """
+        status = _normalize_task_status_filter(status)
         api_key, org_id = get_authenticated_credentials()
 
         resolved_process_id = process_id or run_id
@@ -1630,7 +1749,9 @@ detached, but an empty list you DO pass means "unassign everyone here".
                 {"id","text","selected":true}; table a list with one entry per column,
                 each entry holding that column's row values; assignees_form
                 {"users","guests","groups"}.
-            status: Task status string
+            status: Not updatable here. Any value is refused, because Tallyfy
+                ignores it on this endpoint and reports success. Complete or
+                reopen the task with the dedicated tools instead.
             position: Task position (1-based)
             max_assignable: Maximum number of assignees who must complete the task
             top_secret: Hide the task from every member except its assignees and
@@ -1648,6 +1769,7 @@ detached, but an empty list you DO pass means "unassign everyone here".
             neither, so nothing else could show them (#633, #585). Updates that
             touch neither issue no extra request and are unchanged.
         """
+        _refuse_status_on_update(status, "complete_task", "reopen_task")
         if owners is not None and not isinstance(owners, dict):
             raise ToolError(
                 "owners must be a dict with 'users', 'guests' and 'groups' keys, "
@@ -1678,7 +1800,6 @@ detached, but an empty list you DO pass means "unassign everyone here".
                 deadline=deadline,
                 owners=owners,
                 taskdata=taskdata,
-                status=status,
                 position=position,
                 max_assignable=max_assignable,
                 top_secret=top_secret,
@@ -1851,7 +1972,9 @@ CORRECT usage:
                 {"id","text","selected":true}; table a list with one entry per column,
                 each entry holding that column's row values; assignees_form
                 {"users","guests","groups"}.
-            status: Task status string
+            status: Not updatable here. Any value is refused, because Tallyfy
+                ignores it on this endpoint and reports success. Complete or
+                reopen the task with the dedicated tools instead.
             max_assignable: Maximum number of assignees who must complete the task
             top_secret: Hide the task from every member except its assignees and
                 organization admins (api-v2 SecretTaskScope). Reads back on
@@ -1866,6 +1989,9 @@ CORRECT usage:
             `summary` and `top_secret`, for the same reason and on the one-off
             endpoint (#633, #585).
         """
+        _refuse_status_on_update(
+            status, "complete_standalone_task", "reopen_standalone_task"
+        )
         if owners is not None and not isinstance(owners, dict):
             raise ToolError(
                 "owners must be a dict with 'users', 'guests' and 'groups' keys, "
@@ -1903,7 +2029,6 @@ CORRECT usage:
                 deadline=deadline if deadline is not None else current_data.get('deadline'),
                 owners=owners if owners is not None else current_data.get('owners'),
                 taskdata=taskdata,
-                status=status,
                 max_assignable=max_assignable,
                 top_secret=top_secret,
                 prevent_guest_comment=prevent_guest_comment,
@@ -2164,7 +2289,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
             guest_id: Unique guest identifier string (optional — provide this OR guest_email)
             guest_email: Guest's email address for automatic ID lookup (optional)
             sort_by: Sort order for tasks, e.g. "newest" (default: "newest")
-            status: Filter by status, e.g. "all", "active", "completed" (default: "all")
+            status: Filter by status, e.g. "all", "active", "complete" (default: "all")
             page: Page number to fetch (1-based, default: 1).
 
         Returns:
@@ -2174,6 +2299,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
             raise ToolError(
                 "At least one of 'guest_id' or 'guest_email' must be provided."
             )
+        status = _normalize_task_status_filter(status) or "all"
 
         api_key, org_id = get_authenticated_credentials()
 

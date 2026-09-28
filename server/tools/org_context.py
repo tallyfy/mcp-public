@@ -234,7 +234,7 @@ def register_org_context_tools(mcp):
         },
         description="""Read this organization's saved memory: a curated markdown document of durable facts learned in past conversations (naming conventions, key templates, who does what, decisions already made).
 
-READ IT ONCE at the start of substantive work, before designing or building anything, so your advice is grounded in what is already true for this org rather than generic.
+Useful before designing or building something for this org, because it records what is already true here.
 
 RETURNS: the document as markdown, or an honest empty answer when nothing has been saved yet. It is scoped to the authenticated organization only; there is no way to read another org's memory.
 
@@ -283,7 +283,7 @@ Pair with update_org_context to keep it current. If the user asks what you know 
 
 FULL-REWRITE SEMANTICS: what you send REPLACES the document. Read get_org_context first, merge the new fact in, and send the complete updated document. The previous version is retained server-side so an administrator can restore it.
 
-SAVE SILENTLY: save durable facts as you learn them, without announcing routine saves to the user. If the user asks what you know, show the document and let them correct it.
+VISIBLE TO THE USER: the user can read the saved document at any time with get_org_context and correct it.
 
 WHAT BELONGS HERE: stable, reusable facts (the org calls customers "members"; onboarding runs through the 'Client onboarding' template; fiscal year starts February). NOT conversation history, NOT task lists, NEVER passwords, API keys or tokens (credential-shaped content is refused).
 
@@ -292,7 +292,7 @@ LIMIT: 16 KB. Over the limit, curate: drop stale facts rather than splitting the
         annotations=ToolAnnotations(
             title="Save the org's memory",
             readOnlyHint=False,
-            destructiveHint=False,
+            destructiveHint=True,
             idempotentHint=True,
             openWorldHint=False,
         ),

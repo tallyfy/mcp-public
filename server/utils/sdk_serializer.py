@@ -17,7 +17,7 @@ for tool chaining.
 
 import json
 import logging
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from dataclasses import fields, is_dataclass
 
 from utils.response_sanitizer import sanitize_for_user_text
@@ -212,6 +212,93 @@ def unwrap_fractal(response: Any, includes: Iterable[str] = ()) -> Dict[str, Any
     return raw
 
 
+def _encoded_len(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":"), default=str))
+
+
+def _largest_prefix_that_fits(count: int, build: Callable[[int], Any]) -> int:
+    """Largest ``n`` in ``[1, count]`` whose ``build(n)`` encodes under MAX_RESULT_BYTES.
+
+    ``build`` returns the WHOLE result for a prefix of length ``n``, marker
+    included, so the marker's own bytes are counted in every trial. Never
+    returns less than 1: a single item over the ceiling is still returned,
+    because an empty page would read as "there is nothing here".
+
+    The one binary search behind every list trim in this module, so the trims
+    cannot drift apart (rule 16 in the repo CLAUDE.md).
+    """
+    lo, hi = 1, count
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _encoded_len(build(mid)) <= MAX_RESULT_BYTES:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def page_list_by_bytes(
+    items: List[Any],
+    offset: int,
+    *,
+    item_label: str,
+    offset_param: str,
+) -> Any:
+    """Return as many of ``items[offset:]`` as fit under MAX_RESULT_BYTES.
+
+    Unlike ``compact_result``, which drops the tail with no way to reach it, the
+    cut here is a page boundary: the marker names the offset to call again
+    with, so every item is reachable (#626).
+
+    Shapes:
+
+    - ``offset == 0`` and the whole list fits: the list itself, unchanged, so a
+      small result reads exactly as it did before paging existed.
+    - more items remain: ``{"data": [...], "_truncated": "... Call again with
+      <offset_param>=N ..."}``. ``_truncated`` is the same key every other
+      trimmed read uses, so a model that already watches for it keeps working.
+    - the last page of a paged read: ``{"data": [...], "_page": "... This is
+      the LAST part."}``, so the final call says it is final rather than
+      leaving the caller to infer it from a missing key.
+
+    ``offset`` is validated by the caller, which knows the parameter's name
+    and can refuse before any API call; here it is only asserted in range.
+    """
+    total = len(items)
+    if offset < 0 or (total and offset >= total) or (not total and offset):
+        raise ValueError(f"offset {offset} is outside 0..{max(total - 1, 0)}")
+
+    if offset == 0 and _encoded_len(items) <= MAX_RESULT_BYTES:
+        return items
+
+    rest = items[offset:]
+
+    def build(n: int) -> Dict[str, Any]:
+        first, last = offset + 1, offset + n
+        if last < total:
+            return {
+                "data": rest[:n],
+                "_truncated": (
+                    f"Showing {item_label} {first} to {last} of {total}. The rest are "
+                    f"NOT in this response. Call again with {offset_param}={last} "
+                    f"for the next part."
+                ),
+            }
+        return {
+            "data": rest[:n],
+            "_page": (
+                f"Showing {item_label} {first} to {last} of {total}. "
+                "This is the LAST part."
+            ),
+        }
+
+    kept = _largest_prefix_that_fits(len(rest), build)
+    logger.info(
+        "Paged %s: offset %d, returned %d of %d", item_label, offset, kept, total
+    )
+    return build(kept)
+
+
 def compact_dict_list_field(
     result: Dict[str, Any],
     list_key: str,
@@ -247,18 +334,11 @@ def compact_dict_list_field(
         return result
 
     total_count = len(items)
-    lo, hi = 1, total_count
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        trial = {
-            **result,
-            list_key: items[:mid],
-            "_truncated": f"Showing {mid} of {total_count} {item_label}",
-        }
-        if len(json.dumps(trial, separators=(",", ":"), default=str)) <= MAX_RESULT_BYTES:
-            lo = mid
-        else:
-            hi = mid - 1
+    lo = _largest_prefix_that_fits(total_count, lambda n: {
+        **result,
+        list_key: items[:n],
+        "_truncated": f"Showing {n} of {total_count} {item_label}",
+    })
 
     logger.info("Compacted %s: %d -> %d %s", list_key, total_count, lo, item_label)
     return {
@@ -439,17 +519,10 @@ def compact_result(result: Any) -> Any:
     # alongside the data — the binary search includes it in every trial.
     if isinstance(result, list):
         total_count = len(result)
-        lo, hi = 1, total_count
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            trial = {
-                "data": result[:mid],
-                "_truncated": f"Showing {mid} of {total_count} items",
-            }
-            if len(json.dumps(trial, separators=(",", ":"), default=str)) <= MAX_RESULT_BYTES:
-                lo = mid
-            else:
-                hi = mid - 1
+        lo = _largest_prefix_that_fits(total_count, lambda n: {
+            "data": result[:n],
+            "_truncated": f"Showing {n} of {total_count} items",
+        })
         logger.info(f"Compacted list result: {total_count} → {lo} items")
         return {
             "data": result[:lo],

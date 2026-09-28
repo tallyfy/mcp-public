@@ -145,7 +145,7 @@ PRIVACY_HTML = """<!DOCTYPE html>
     <li><strong>Disconnect at any time</strong> &mdash; Remove the Tallyfy MCP server from your AI assistant's connector / settings to revoke access immediately (for example, Claude Desktop's <em>Connectors</em> panel, ChatGPT's <em>Apps &amp; GPTs</em>, or your client's equivalent)</li>
     <li><strong>Session control</strong> &mdash; Your session expires automatically after 60 minutes of inactivity</li>
     <li><strong>Data access and deletion</strong> &mdash; Contact us to request access to or deletion of any data we hold about you</li>
-    <li><strong>Tallyfy account controls</strong> &mdash; Your underlying Tallyfy data is governed by <a href="https://tallyfy.com/privacy">Tallyfy's privacy policy</a></li>
+    <li><strong>Tallyfy account controls</strong> &mdash; Your underlying Tallyfy data is governed by <a href="https://tallyfy.com/legal/privacy-policy/">Tallyfy's privacy policy</a></li>
 </ul>
 
 <h2>9. Children's Privacy</h2>
