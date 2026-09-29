@@ -6,10 +6,11 @@ and `/about` aliases) for humans who visit mcp.tallyfy.com in a browser.
 
 Why a dedicated path instead of `GET /`: FastMCP's streamable-http MCP
 transport at `path='/'` is registered before our `custom_route` handlers
-in the Starlette app, so the OAuth challenge always wins for `GET /`
-regardless of `Accept` headers. Putting the landing under `/info` keeps
-the MCP transport untouched for clients (Claude, ChatGPT, Cursor, etc.)
-while still giving humans a real page to land on.
+in the Starlette app, so a route here can never win `GET /`. Putting the
+landing under `/info` keeps the MCP transport untouched for clients
+(Claude, ChatGPT, Cursor, etc.) while still giving humans a real page to
+land on. `GET /` itself is served the same page by `RootLandingMiddleware`
+in `server.py`, a recorded decision (#1240).
 
 Closes #433.
 """
@@ -126,7 +127,21 @@ def _render_landing_for_host(host: str) -> str:
     )
     html = html.replace("{ENV_BADGE}", _STAGING_BADGE if staging else _PROD_BADGE)
     html = html.replace("{TOOL_COUNT}", str(_total_tools()))
+    html = html.replace("{PROTOCOL_VERSION}", _served_protocol_version())
     return html
+
+
+def _served_protocol_version() -> str:
+    """The protocol revision the copy-paste example sends, read from the SDK.
+
+    The example hardcoded ``2025-06-18`` and went stale when the FastMCP 4
+    upgrade (#1236) moved us to the next revision, and under that revision a
+    wrong version is a 400 rather than something ignored (#1240). Reading it
+    from the SDK moves the example with the pin rather than with a hand edit.
+    """
+    from mcp.types import LATEST_PROTOCOL_VERSION
+
+    return LATEST_PROTOCOL_VERSION
 
 
 def _total_tools() -> int:
@@ -549,7 +564,8 @@ _LANDING_HTML = """<!DOCTYPE html>
     <h2>Try it from the command line</h2>
 
     <p>You'll need an OAuth-issued JWT token from <a href="https://go.tallyfy.com/">go.tallyfy.com</a>.
-    Initialize a session and list tools:</p>
+    List the tools. No session is needed: the <code>MCP-Protocol-Version</code> and
+    <code>Mcp-Method</code> headers must match the body, or the server answers 400:</p>
 
     <pre><code>JWT="&lt;your token&gt;"
 ORG="&lt;your org id&gt;"
@@ -559,11 +575,11 @@ curl -X POST {MCP_ENDPOINT} \\
   -H "X-Tallyfy-Org-Id: $ORG" \\
   -H "Content-Type: application/json" \\
   -H "Accept: application/json, text/event-stream" \\
-  -H "MCP-Protocol-Version: 2025-06-18" \\
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize",
-       "params":{"protocolVersion":"2025-06-18",
-                 "capabilities":{},
-                 "clientInfo":{"name":"my-client","version":"1.0"}}}'</code></pre>
+  -H "MCP-Protocol-Version: {PROTOCOL_VERSION}" \\
+  -H "Mcp-Method: tools/list" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list",
+       "params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"{PROTOCOL_VERSION}",
+                          "io.modelcontextprotocol/clientCapabilities":{}}}}'</code></pre>
 
     <h2>Authentication</h2>
     <p>OAuth 2.1 with Dynamic Client Registration (DCR), PKCE S256, and RS256-signed JWTs.

@@ -342,6 +342,8 @@ app.routes.insert(0, Route("/api/tool-names", tool_display_names, methods=["GET"
 # streaming). Intercepts GET/HEAD on "/" for plain browser/monitor requests and
 # returns the landing HTML. MCP client SSE polls (Mcp-Session-Id or
 # Accept: text/event-stream) pass through untouched to the MCP transport.
+# Keeping the landing page here instead of the 2026-07-28 spec's 405 is a
+# recorded decision (#1240): see server/CLAUDE.md "Modern request headers".
 from routes.landing import _LANDING_HTML, _render_landing_for_host  # noqa: E402 - deliberately late: the comment above explains that this middleware is installed after the app and its routes exist
 
 class RootLandingMiddleware:
