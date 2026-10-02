@@ -53,7 +53,7 @@ def _normalize_folder_type(folder_type: str | None) -> str:
     if resolved is None:
         raise ToolError(
             f"folder_type must be 'checklist' (template folder) or 'run' "
-            f"(process folder) — got {folder_type!r}"
+            f"(process folder), got {folder_type!r}"
         )
     return resolved
 

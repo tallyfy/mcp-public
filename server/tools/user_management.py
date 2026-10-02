@@ -543,7 +543,7 @@ Use get_guest(email=...) to read a guest's current profile.""",
         """
         if associated_members is None:
             raise ToolError(
-                "associated_members is required — it is the only field this endpoint "
+                "associated_members is required. It is the only field this endpoint "
                 "can change. Pass a list of numeric member user IDs, or [] to clear. "
                 "A guest's first_name / last_name / phone / company_name cannot be "
                 "updated through the API; re-create the guest or edit them in the "

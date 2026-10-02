@@ -15,7 +15,14 @@ from tallyfy import TallyfySDK, TaskOwners
 # dataclass does not enumerate (#784, root cause tallyfy/sdk#33). Re-adding the
 # import is the first step of reintroducing that loss.
 from mcp.types import ToolAnnotations
-from utils.date_utils import DateExtractor
+from utils.date_utils import (
+    API_DATETIME_FORMAT,
+    DeadlineFormatError,
+    local_deadline_to_utc,
+    now_local_string,
+    parse_api_deadline,
+    utc_to_local_string,
+)
 from utils.fastmcp_errors import handle_tallyfy_errors
 from utils.field_value_encoding import coerce_field_values_safely
 from utils.guest_assignment import normalize_guest_emails
@@ -27,7 +34,8 @@ from utils.fastmcp_types import (
     ProcessId,
     TaskId,
     TaskTitle,
-    NaturalLanguageInput,
+    LocalDeadline,
+    OptionalLocalDeadline,
     OptionalString,
     OptionalInt,
     OptionalBool,
@@ -825,10 +833,6 @@ def _search_process_by_name(sdk, org_id: str, process_name: str) -> str:
 
 logger = logging.getLogger(__name__)
 
-# Global date extractor instance
-date_extractor = DateExtractor()
-
-
 def resolve_user_ids(api_key: str, org_id: str, user_names: List[str], user_emails: List[str]) -> List[int]:
     """Resolve user names and emails to user IDs.
 
@@ -893,7 +897,7 @@ def resolve_user_ids(api_key: str, org_id: str, user_names: List[str], user_emai
                         for u in candidates
                     )
                     raise ToolError(
-                        f"Name '{name}' is ambiguous \u2014 {len(candidates)} users match: "
+                        f"Name '{name}' is ambiguous, {len(candidates)} users match: "
                         f"{rendered}. Provide a more specific user_name (full name), "
                         f"or pass user_email or user_id directly."
                     )
@@ -1018,23 +1022,83 @@ def _resolve_user_timezone(api_key: str, org_id: str) -> tuple:
     return effective_timezone, not effective_timezone
 
 
-def _format_local_deadline(result: dict, parsed_deadline: str, effective_timezone: Optional[str], utc_fallback: bool):
-    """Add deadline_local to result dict with timezone conversion."""
-    if parsed_deadline and effective_timezone and not utc_fallback:
-        try:
-            import pytz
-            from datetime import datetime as _dt
-            tz = pytz.timezone(effective_timezone)
-            utc_dt = pytz.utc.localize(_dt.strptime(parsed_deadline, "%Y-%m-%d %H:%M:%S"))
-            local_dt = utc_dt.astimezone(tz)
-            result["deadline_local"] = local_dt.strftime(f"%Y-%m-%d %H:%M ({effective_timezone})")
-        except Exception:
-            pass
-    elif utc_fallback:
-        result["deadline_local"] = (
-            f"{parsed_deadline} (UTC — no org/user timezone configured; "
-            "update Tallyfy profile settings)"
+def _deadline_for_api(deadline: str, effective_timezone: Optional[str]) -> str:
+    """Turn a caller's exact LOCAL deadline into the bare UTC string api-v2 stores.
+
+    api-v2 reads every task deadline as UTC and drops any offset (#1385), so
+    the conversion has to happen here. The refusal carries the current local
+    time so the caller can work out "tomorrow" or "Friday" and retry.
+    """
+    try:
+        return local_deadline_to_utc(deadline, effective_timezone)
+    except DeadlineFormatError as e:
+        raise ToolError(
+            f"Could not use the deadline: {e}. Send an exact local date and time "
+            f"as 'YYYY-MM-DD HH:MM', e.g. '2026-10-02 17:00'. Now it is "
+            f"{now_local_string(effective_timezone)}."
         )
+
+
+def _render_deadline(moment, effective_timezone: Optional[str], utc_fallback: bool) -> Optional[str]:
+    """A UTC deadline in the org's local time, or in UTC when none is configured."""
+    as_utc = moment.strftime(API_DATETIME_FORMAT)
+    if utc_fallback:
+        return f"{as_utc} (UTC)"
+    return utc_to_local_string(as_utc, effective_timezone)
+
+
+def _format_local_deadline(result: dict, parsed_deadline: str, effective_timezone: Optional[str], utc_fallback: bool):
+    """Add deadline_local, the deadline Tallyfy STORED, to a task write result.
+
+    api-v2 does not always store the deadline it is sent: it runs every task
+    deadline through WorkingDayAdjuster with the organization's working_days,
+    so a deadline outside working hours is stored at the next working time.
+    Measured on staging 2026-09-29 (#1435), org working Monday to Friday 09:00
+    to 17:00: a Saturday deadline was stored as Monday 09:00. The response's
+    `deadline` is the stored value, so deadline_local is computed from it, and
+    deadline_moved says so in words when it differs from `parsed_deadline`,
+    the UTC value this server sent.
+
+    When the response carries no readable deadline, deadline_local shows the
+    requested time and says that is what it is, rather than claiming a stored
+    value this server never saw.
+    """
+    sent = parse_api_deadline(parsed_deadline)
+    if sent is None:
+        return
+    stored = parse_api_deadline(result.get("deadline"))
+    shown = stored or sent
+    local = _render_deadline(shown, effective_timezone, utc_fallback)
+    if local is None:
+        return
+    if utc_fallback:
+        local = (
+            f"{shown.strftime(API_DATETIME_FORMAT)} (UTC, no org/user timezone "
+            "configured; update Tallyfy profile settings)"
+        )
+    if stored is None:
+        result["deadline_local"] = (
+            f"{local}, as requested; the response did not include the stored "
+            "deadline, so read the task back to confirm it"
+        )
+        return
+    result["deadline_local"] = local
+
+    # Compared to the minute: the caller cannot send finer than that through
+    # the documented format, and a dropped second is not a move.
+    if stored.replace(second=0, microsecond=0) == sent.replace(second=0, microsecond=0):
+        return
+    note = (
+        f"Tallyfy stored this deadline as "
+        f"{_render_deadline(stored, effective_timezone, utc_fallback)}, not the "
+        f"requested {_render_deadline(sent, effective_timezone, utc_fallback)}."
+    )
+    if stored > sent:
+        note += (
+            " Tallyfy moves a deadline that falls outside the organization's "
+            "working days or hours to the next working time."
+        )
+    result["deadline_moved"] = note + " Tell the user the stored time."
 
 
 def register_task_management_tools(mcp):
@@ -1329,8 +1393,8 @@ appear in get_organization_runs. Only the fan-out flag below creates one.
 REQUIRED: title, deadline, at least one assignee. If deadline or assignee is
 missing, ASK the user before calling.
 
-DEADLINE: natural language, e.g. "Friday at 5pm", "April 12 2026 at 3pm". Resolved
-to UTC using the org timezone automatically.
+DEADLINE: exact LOCAL time, 'YYYY-MM-DD HH:MM' (e.g. '2026-10-02 17:00'). Not
+natural language, not UTC: the server converts with the org timezone.
 
 TASK TYPE: task (default) | approval | expiring (auto-completes at deadline) |
 'email' (a DRAFT: a human reviews and clicks SEND) |
@@ -1370,7 +1434,7 @@ required (explicit - no default); dropdown/radio/multiselect also need options
     @handle_tallyfy_errors("create standalone task")
     def create_standalone_task(
         title: TaskTitle,
-        deadline: NaturalLanguageInput,
+        deadline: LocalDeadline,
         description: OptionalString = None,
         task_type: OptionalString = None,
         user_names: Optional[Union[str, List[str]]] = None,
@@ -1392,7 +1456,7 @@ required (explicit - no default); dropdown/radio/multiselect also need options
 
         Args:
             title: Task name
-            deadline: Deadline as natural language — e.g. "April 12 2026 at 3pm", "next Monday"
+            deadline: Exact local deadline, 'YYYY-MM-DD HH:MM' in the org timezone
             description: Task description/summary (optional). HTML. To reference a form field write <span class="insert-variable-tag" contenteditable="false">{{alias}}</span> using the field's alias; a bare {{alias}} shows as dead text in the editor. Snippets, blueprints and mentions: read tallyfy://variable-markup
             string (task|approval|expiring|email|expiring_email)
             task_type: Task type: string (task|approval|expiring|email|expiring_email)
@@ -1430,11 +1494,7 @@ required (explicit - no default); dropdown/radio/multiselect also need options
 
         effective_timezone, utc_fallback = _resolve_user_timezone(api_key, org_id)
 
-        parsed_deadline = date_extractor._parse_date_with_fallbacks(deadline, timezone=effective_timezone)
-        if not parsed_deadline:
-            raise ToolError(
-                "Could not parse deadline. Use a format like 'April 12 2026 at 3pm', 'next Monday at noon', or 'tomorrow at 5pm'."
-            )
+        parsed_deadline = _deadline_for_api(deadline, effective_timezone)
 
         user_ids = resolve_user_ids(api_key, org_id, user_names or [], user_emails or [])
         group_ids = resolve_group_ids(api_key, org_id, group_names or [])
@@ -1654,7 +1714,7 @@ WRONG usage (will fail or create a misleading audit):
         """
         if not reason.strip():
             raise ToolError(
-                "reason is required — the native Tallyfy UI requires a reason "
+                "reason is required. The native Tallyfy UI requires a reason "
                 "before reopening a task. Please provide an explanation."
             )
         api_key, org_id = get_authenticated_credentials()
@@ -1711,7 +1771,7 @@ detached, but an empty list you DO pass means "unassign everyone here".
         task_id: TaskId,
         title: OptionalString = None,
         summary: OptionalString = None,
-        deadline: OptionalString = None,
+        deadline: OptionalLocalDeadline = None,
         owners: Optional[Dict[str, Any]] = None,
         taskdata: Optional[Dict[str, Any]] = None,
         status: OptionalString = None,
@@ -1731,7 +1791,8 @@ detached, but an empty list you DO pass means "unassign everyone here".
             task_id: Task ID to update (REQUIRED - 32-character hex string)
             title: New task title
             summary: New task description. HTML. To reference a form field write <span class="insert-variable-tag" contenteditable="false">{{alias}}</span> using the field's alias; a bare {{alias}} shows as dead text in the editor. Snippets, blueprints and mentions: read tallyfy://variable-markup
-            deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
+            deadline: New deadline, exact local time 'YYYY-MM-DD HH:MM' in the
+                org timezone. Converted to UTC here (#1385)
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}.
                 Replaces the assignee list rather than adding to it. Any of the three
                 buckets you omit is read back off the task and re-sent unchanged, so it
@@ -1777,6 +1838,13 @@ detached, but an empty list you DO pass means "unassign everyone here".
             )
 
         api_key, org_id = get_authenticated_credentials()
+        # The caller's deadline is LOCAL; api-v2 reads it as UTC (#1385).
+        # Resolved only when a deadline was supplied, so other updates issue
+        # exactly the requests they did before.
+        effective_timezone = utc_fallback = None
+        if deadline is not None:
+            effective_timezone, utc_fallback = _resolve_user_timezone(api_key, org_id)
+            deadline = _deadline_for_api(deadline, effective_timezone)
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             # A partially-supplied `owners` detaches every assignee in the
             # buckets it omits. Complete it before sending; see
@@ -1821,6 +1889,8 @@ detached, but an empty list you DO pass means "unassign everyone here".
                     f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}",
                     task_id,
                 ))
+            if deadline is not None and content:
+                _format_local_deadline(content, deadline, effective_timezone, utc_fallback)
             return ToolResult(content=content, structured_content=None)
 
     @mcp.tool(
@@ -1936,7 +2006,7 @@ CORRECT usage:
         task_id: TaskId,
         title: OptionalString = None,
         summary: OptionalString = None,
-        deadline: OptionalString = None,
+        deadline: OptionalLocalDeadline = None,
         owners: Optional[Dict[str, Any]] = None,
         taskdata: Optional[Dict[str, Any]] = None,
         status: OptionalString = None,
@@ -1954,7 +2024,8 @@ CORRECT usage:
             task_id: Standalone task ID (REQUIRED - 32-character hex string)
             title: New task title
             summary: New task description. HTML. To reference a form field write <span class="insert-variable-tag" contenteditable="false">{{alias}}</span> using the field's alias; a bare {{alias}} shows as dead text in the editor. Snippets, blueprints and mentions: read tallyfy://variable-markup
-            deadline: New deadline in "YYYY-MM-DD HH:MM:SS" format
+            deadline: New deadline, exact local time 'YYYY-MM-DD HH:MM' in the
+                org timezone. Converted to UTC here (#1385)
             owners: Assignees dict, e.g. {"users": [123, 456], "guests": ["email@x.com"], "groups": []}.
                 Replaces the assignee list rather than adding to it. Any of the three
                 buckets you omit is read back off the task and re-sent unchanged, so it
@@ -1999,6 +2070,13 @@ CORRECT usage:
             )
 
         api_key, org_id = get_authenticated_credentials()
+        # The caller's deadline is LOCAL; api-v2 reads it as UTC (#1385).
+        # Resolved only when a deadline was supplied, so other updates issue
+        # exactly the requests they did before.
+        effective_timezone = utc_fallback = None
+        if deadline is not None:
+            effective_timezone, utc_fallback = _resolve_user_timezone(api_key, org_id)
+            deadline = _deadline_for_api(deadline, effective_timezone)
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             current_task = sdk.tasks.get_standalone_task(org_id, task_id)
             current_data = serialize_dataclass(current_task) if current_task else {}
@@ -2045,6 +2123,8 @@ CORRECT usage:
                 content.update(_task_after_write(
                     sdk, f"organizations/{org_id}/tasks/{task_id}", task_id
                 ))
+            if deadline is not None and content:
+                _format_local_deadline(content, deadline, effective_timezone, utc_fallback)
             return ToolResult(content=content, structured_content=None)
 
     @mcp.tool(
@@ -2185,7 +2265,7 @@ WRONG usage (will fail or create a misleading audit):
         """
         if not reason.strip():
             raise ToolError(
-                "reason is required — the native Tallyfy UI requires a reason "
+                "reason is required. The native Tallyfy UI requires a reason "
                 "before reopening a task. Please provide an explanation."
             )
         api_key, org_id = get_authenticated_credentials()
@@ -2205,6 +2285,81 @@ WRONG usage (will fail or create a misleading audit):
             sdk.threads.add_task_comment(org_id, task_id, reason.strip())
             return ToolResult(
                 content=serialize_task(result) if result else {},
+                structured_content=None
+            )
+
+    @mcp.tool(
+        name="delete_standalone_task",
+        description="""Permanently delete a standalone (one-off) task. REQUIRED: 'task_id'.
+
+This cannot be undone. The task, its form fields and their answers are removed,
+and Tallyfy has no restore for a deleted task. Confirm with the user before
+calling it. Use it to clean up a task made with create_standalone_task, for
+example one created for testing.
+
+A task inside a process is NOT deleted this way, and neither is a one-off task
+linked to a process (any task with a run_id, including the tasks
+separate_task_for_each_assignee creates). The tool reads the task first and
+refuses those before anything is deleted.
+
+Tallyfy can refuse the delete with a permission error when the caller is
+neither an administrator nor the member who created the task.
+
+CORRECT usage:
+  delete_standalone_task(task_id="...")
+""",
+        tags={"tasks", "standalone", "write", "delete"},
+        annotations=ToolAnnotations(
+            title="Delete a standalone task",
+            readOnlyHint=False,
+            destructiveHint=True,
+            # A repeat call finds nothing to delete and answers not found, so
+            # it changes nothing further, the same as delete_tag.
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("delete_standalone_task")
+    @handle_tallyfy_errors("delete standalone task")
+    def delete_standalone_task(task_id: TaskId) -> ToolResult:
+        """
+        Permanently delete a standalone (one-off) task (tallyfy/mcp#1090).
+
+        api-v2 has two DELETE routes for a one-off task. The bare
+        ``DELETE organizations/{org}/tasks/{id}`` is
+        OneOffTasksController::destroy, documented "Archive One-Off Task":
+        OneOffTaskService::destroy archives the task and ``PUT .../restore``
+        brings it back. ``DELETE .../tasks/{id}/delete`` is
+        OneOffTasksController::delete, documented "Delete a Task. Cannot be
+        undone": OneOffTasksRepository::delete force-deletes the task, its
+        form fields and their answers. The SDK's
+        ``tasks.delete_standalone_task`` calls the archive route, so this
+        tool sends the request itself.
+
+        The archive route refuses a task with a run_id ("Cannot delete linked
+        tasks.") and the permanent route checks nothing of the kind, so the
+        refusal is made here, before any write.
+
+        Args:
+            task_id: Standalone task ID (REQUIRED - 32-character hex string)
+
+        Returns:
+            {"deleted": True, "task_id": task_id}
+        """
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            task = sdk.tasks.get_standalone_task(org_id, task_id)
+            run_id = getattr(task, "run_id", None) if task is not None else None
+            if run_id:
+                raise ToolError(
+                    f"Task {task_id} belongs to process {run_id}, so it was not "
+                    "deleted. delete_standalone_task deletes only a standalone "
+                    "task that is not part of a process."
+                )
+            sdk._make_request("DELETE", f"organizations/{org_id}/tasks/{task_id}/delete")
+            return ToolResult(
+                content={"deleted": True, "task_id": task_id},
                 structured_content=None
             )
 

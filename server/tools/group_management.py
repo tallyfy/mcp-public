@@ -214,7 +214,7 @@ CORRECT usage:
         """
         if not description or not description.strip():
             raise ToolError(
-                "description is required and cannot be empty — the Tallyfy API "
+                "description is required and cannot be empty. The Tallyfy API "
                 "rejects a group create without one. Provide a short description "
                 "of the group's purpose."
             )

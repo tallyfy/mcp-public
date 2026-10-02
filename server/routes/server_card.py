@@ -150,7 +150,7 @@ def build_server_card(base_url: str) -> Dict[str, Any]:
             # tests/unit/server/routes/test_server_card.py asserts these values
             # against routes.capabilities.category_breakdown(), which counts the
             # tools each module actually registers. Update both or neither.
-            "toolCount": 119,
+            "toolCount": 120,
             "toolCategories": 16,
             "categories": [
                 "user_management",

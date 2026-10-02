@@ -769,8 +769,9 @@ def register_automation_tools(mcp):
         name="create_automation_rule",
         description="""Create conditional automation (if-then rules).
 
-A conditional form SECTION ("section C only if amount > 5000") is TWO rules: hide that
-step by default AND show it when the field says so. One alone leaves it always visible.
+A conditional SECTION ("C only if amount > 5000") is ONE show rule: a show action
+hides its step at launch until the condition is met; no hide rule is needed.
+Automations need a Pro plan or trial.
 
 REQUIRED: 'template_id' + 'automation_data' (dict with `conditions`+`actions`).
 
@@ -799,7 +800,7 @@ Same envelope, other "actions":
 
 Every action needs `target_step_id`. deadline needs ALL of value/unit/option
 (unit minutes|hours|days|weeks|months, option before|from). webhook needs webhook_url+alias_name.
-Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name); this tool fills one in if omitted.""",
+Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name), filled in if omitted.""",
         tags=["automation", "rules", "conditional", "write"],
         annotations=ToolAnnotations(
             title="Create automation rule",

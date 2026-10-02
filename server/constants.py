@@ -339,7 +339,15 @@ class LogColors:
 # These loggers are noisy and we handle their concerns via custom middleware
 SUPPRESSED_LOGGERS: Dict[str, str] = {
     "mcp.server.lowlevel.server": "WARNING",
-    "FastMCP.fastmcp.tools.tool_manager": "FATAL",
+    # "FastMCP.fastmcp.tools.tool_manager": "FATAL" was here from FastMCP 2.x
+    # and silenced nothing: fastmcp 3 and 4 name each logger after its module,
+    # with no `FastMCP.` prefix, and have no tools/tool_manager module. A
+    # failing tool call is now logged by `fastmcp.server.server` (measured
+    # 2026-10-02 on fastmcp 4.0.3, tallyfy/mcp#1247). That logger is left at
+    # its default on purpose: it also carries the "Invalid arguments for tool"
+    # warning and the traceback of an exception no decorator wrapped, and
+    # FATAL would hide both. tests/unit/server/test_suppressed_fastmcp_loggers.py
+    # fails if a fastmcp name here stops matching a real module.
     "mcp.server.streamable_http_manager": "WARNING",
     "mcp.server.streamable_http": "WARNING",
     "docket.worker": "WARNING",
@@ -539,7 +547,7 @@ Validation, Org Memory, Universal API Fallback.
 - A PROCESS is ONE running instance of it: "Onboarding - Jane Doe", never just "Onboarding".
 - TASKS live inside a process; one-off tasks can also stand alone.
 - Users mix these words up. Work out which they mean and name it plainly ("your template", "the running process for Jane") before acting.
-- ONE PROCESS PER REAL-WORLD THING: one hire, one client, one vehicle = one process each. If that sounds like too many processes, the fix is less LAUNCHING WORK, not fewer processes: batch the launching (repeat launch_process per row) instead of doing it by hand. Never merge distinct things into one process. If the duplication is in their TEMPLATES, that is the other fix: one template plus a kickoff field, with PAIRED show/hide rules for the differing steps.
+- ONE PROCESS PER REAL-WORLD THING: one hire, one client, one vehicle = one process each. If that sounds like too many processes, the fix is less LAUNCHING WORK, not fewer processes: batch the launching (repeat launch_process per row) instead of doing it by hand. Never merge distinct things into one process. If the duplication is in their TEMPLATES, that is the other fix: one template plus a kickoff field, with a show rule per differing step.
 
 ## Before you build anything
 
@@ -564,14 +572,14 @@ that ships beats a map nobody launches.
 2. add_step_to_template - each step in order. step_type: 'approval' for approve/reject (enables approved/rejected conditions); 'email' is a DRAFT a human sends; 'expiring_email' sends itself at the deadline; 'expiring' auto-completes at it; 'task' otherwise.
 3. add_form_field_to_step - fields on steps that collect data during the work.
 4. add_kickoff_field - data known BEFORE launch belongs here, not in step 1: the discriminating facts (department, request type, nominee, dates).
-5. create_automation_rule - if-then, at STEP level (show/hide/assign/deadline a step); no field-level show/hide. Every branch needs its happy-path rule AND its alternative (hide-by-default + show, or show + hide).
+5. create_automation_rule - if-then, at STEP level (show/hide/assign/deadline a step); no field-level show/hide. A show rule hides its step at launch until its condition is met, so no hide rule is needed. Automations need a Pro plan or trial.
 6. launch_process - offer a test run named after a real example.
 
 Steps run sequentially; model parallel branches with show/hide rules.
 
 ## Design rules that answer most questions
 
-- VARIANTS: workflows sharing most steps: build ONE template + a kickoff field capturing the variant + the paired rules above. Little overlap: separate templates, or a parent that launches children. Ask about overlap first.
+- VARIANTS: workflows sharing most steps: build ONE template + a kickoff field capturing the variant + the show rules above. Little overlap: separate templates, or a parent that launches children. Ask about overlap first.
 - ASSIGNMENT: a job title is a placeholder resolved at launch; a group is a fixed set; a guest (outside the org) sees ONLY their own tasks, never the whole process. To let outsiders start one, share the public kickoff link.
 - CLUTTER: "too many" is usually housekeeping, not redesign: archive_process the finished ones, tag the rest, group templates in folders.
 - A spreadsheet is usually the current system. Offer: keep it as the source and launch one process per row, or move its columns into kickoff fields.
@@ -591,8 +599,8 @@ hunting for "the steps inside my form" wants a template with a kickoff form.
 3. KICKOFF HOLDS THE MINIMUM: what is ALWAYS needed to start and known
    then, plus whatever names or routes the process. Everything else moves to the
    step where that work happens. A 40-field kickoff recreates the problem they came with.
-4. THE FIELD THAT DECIDES BECOMES RULES, IN PAIRS: "section C only if over 5000" is
-   hide-by-default AND show-when-over-5000; one rule alone leaves it always visible.
+4. THE FIELD THAT DECIDES BECOMES A SHOW RULE: "section C only if over 5000" is
+   one rule showing that step when over 5000; it stays hidden until then.
    An approver-picker DOES drive assignment: give the assignment action
    actionable_id (that field) + actionable_type "kickoff"|"field" instead of assignees.
    Never leave these as written instructions to follow.

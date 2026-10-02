@@ -294,12 +294,27 @@ def read_error_class(error: BaseException) -> Optional[str]:
 #        X-Organization-ID header, JWT claim or env var is present (Sentry
 #        MCP-4T, issue #511). The user-facing message names the remedy.
 #   401  the credential is expired or no longer accepted.
-#   402  a plan limit refused the write. Today that is the trial cap
-#        ("Trial limit reached: 100 unique task assignments", code
-#        TRIAL_LIMIT_REACHED_100_U). Same class as 409 below: a gate working
-#        as designed, on customer-controlled state we cannot fix, whose own
-#        message names the remedy. Without it every trial org that reaches its
-#        cap pages us once per attempt (Sentry MCP-SERVER-5T, issue #1080).
+#   402  a plan limit refused the write. Today that is the trial cap. Same
+#        class as 409 below: a gate working as designed, on customer-controlled
+#        state we cannot fix, whose own message names the remedy. Without it
+#        every trial org that reaches its cap pages us once per attempt
+#        (Sentry MCP-SERVER-5T, issue #1080).
+#
+#        Its wording is changing. api-v2 production (21864c4, read 2026-10-01)
+#        sends "Trial limit reached: 100 unique task assignments. Please
+#        upgrade to continue.", code TRIAL_LIMIT_REACHED_100_U. api-v2 master
+#        replaced it in #10487 (575fef3a0, 2026-09-17), not yet on production
+#        when read, with ActiveUsersLimitReachedException::trialAssignmentCap:
+#        "Your free trial is limited to <limit> task assignments in this
+#        account, and this would go past it. Upgrade, or email
+#        support@tallyfy.com and we can raise the limit.", the configured limit
+#        interpolated. api-v2 derives `code` from the message text
+#        (api_error_payload_translation_code: upper-cased, punctuation removed,
+#        spaces to underscores, first 25 characters), so the code changes too:
+#        computed from that function it is YOUR_FREE_TRIAL_IS_LIMITE, not read
+#        off a live response. Nothing in this repository branches on the
+#        message or the code; classify_upstream_status keys on the HTTP status,
+#        and 402 is unchanged.
 #   403  insufficient scope, or a business rule refusing the call.
 #   404  the resource was deleted, or the model referenced a stale id.
 #   409  a business rule refused the write, currently the allocated-seats gate
@@ -734,7 +749,7 @@ def _build_error_message(operation_name: str, error: TallyfyError) -> str:
     captured in logs and Sentry.
     """
     api_msg = _extract_api_message(error)
-    return f"Could not {operation_name} — {api_msg}"
+    return f"Could not {operation_name}: {api_msg}"
 
 
 def handle_tallyfy_errors(operation_name: str):
@@ -851,7 +866,7 @@ def handle_tallyfy_errors(operation_name: str):
 
                     raise tag_error_class(
                         ToolError(
-                            f"Could not {operation_name} — {api_msg} "
+                            f"Could not {operation_name}: {api_msg} "
                             f"{_auth_error_hint(decision)}"
                         ),
                         classify_tool_error(e, status),
@@ -892,7 +907,7 @@ def handle_tallyfy_errors(operation_name: str):
                 # Full context is already captured in the log/Sentry above
                 raise tag_error_class(
                     ToolError(
-                        f"Could not {operation_name} — {_sanitize_api_error(str(e))}"
+                        f"Could not {operation_name}: {_sanitize_api_error(str(e))}"
                     ),
                     ERROR_CLASS_INTERNAL_ERROR,
                 )

@@ -488,6 +488,36 @@ TimestampString = Annotated[Optional[str], Field(
     examples=["2025-05-01T14:30:00Z"]
 )]
 
+# A task deadline, as an exact LOCAL time (#1385). The server converts it to
+# UTC with the org timezone, because api-v2 stores whatever it receives as UTC
+# and drops any offset. Natural language is refused: the date arithmetic is the
+# calling model's job, the timezone arithmetic is ours. The description lives
+# here because a parameter description does not count against the 2000-byte
+# tool-description cap, and three tools share it.
+_LOCAL_DEADLINE_DESCRIPTION = (
+    "Deadline as an exact date and time in the organization's LOCAL timezone, "
+    "format 'YYYY-MM-DD HH:MM' (e.g. '2026-10-02 17:00'). Do NOT convert to "
+    "UTC; the server converts it. A date alone ('2026-10-02') means 09:00 "
+    "local. Natural language such as 'Friday at 5pm' is refused: work out the "
+    "calendar date first. An explicit offset ('2026-10-02 17:00-05:00') "
+    "overrides the organization timezone. The response's deadline_local is the "
+    "deadline Tallyfy stored, in local time. Tallyfy moves a deadline outside "
+    "the organization's working days or hours to the next working time; "
+    "deadline_moved then gives both times. Tell the user the stored one."
+)
+
+LocalDeadline = Annotated[str, Field(
+    min_length=10,
+    max_length=40,
+    description=_LOCAL_DEADLINE_DESCRIPTION,
+    examples=["2026-10-02 17:00"],
+)]
+
+OptionalLocalDeadline = Annotated[Optional[str], Field(
+    description=_LOCAL_DEADLINE_DESCRIPTION,
+    examples=["2026-10-02 17:00"],
+)]
+
 # Group-related types (for future use)
 # core.groups.id is character varying(32) (db-schema.sql:3472) — a 32-char hex
 # string, NOT a "group_<n>" slug. Verified live against GET /organizations/{org}/groups.

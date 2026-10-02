@@ -113,12 +113,12 @@ _RESULT_CONTAINER_ALLOWANCE = 128
 # unknown-key check runs, so an entry here would be unreachable.
 _STEP_REJECTED_KEYS = {
     "alias": (
-        "steps have no settable alias at creation — CreateStepRequest has no rule "
-        "for it, so the API discards it"
+        "steps have no settable alias at creation, because CreateStepRequest has "
+        "no rule for it and the API discards it"
     ),
     "roles": (
-        "roles cannot be set at step creation — CreateStepRequest has no rule for "
-        "it, so the API discards it"
+        "roles cannot be set at step creation, because CreateStepRequest has no "
+        "rule for it and the API discards it"
     ),
     "captures": (
         "use add_form_field_to_step instead, which normalizes option shapes that "
@@ -172,20 +172,20 @@ _STEP_UPDATE_REJECTED_KEYS = {
         "API discards it on an update"
     ),
     "folders": (
-        "validated but consumed by nothing on the step update path — neither "
-        "StepBuilder, StepService nor StepControllerNew reads it"
+        "validated but consumed by nothing on the step update path (neither "
+        "StepBuilder, StepService nor StepControllerNew reads it)"
     ),
     "captures": (
         "use add_form_field_to_step or update_form_field instead, which "
         "normalize option shapes that the raw update path does not"
     ),
     "alias": (
-        "steps have no settable alias — UpdateStepRequest has no rule for it, "
-        "so the API discards it"
+        "steps have no settable alias, because UpdateStepRequest has no rule for "
+        "it and the API discards it"
     ),
     "roles": (
-        "roles cannot be set through a step update — UpdateStepRequest has no "
-        "rule for it, so the API discards it"
+        "roles cannot be set through a step update, because UpdateStepRequest has "
+        "no rule for it and the API discards it"
     ),
 }
 

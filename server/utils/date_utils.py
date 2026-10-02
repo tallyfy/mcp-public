@@ -6,6 +6,8 @@ import re
 import dateparser
 import os
 from datetime import datetime, timedelta
+from datetime import time as _time, timezone as _dt_timezone, tzinfo as _tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from typing import Optional, Tuple
 import logging
 from constants import TIME_MAPPINGS, DATE_PARSING_MAX_ATTEMPTS, DATE_PARSING_FUTURE_YEAR_LIMIT
@@ -335,3 +337,144 @@ class DateExtractor:
         text = re.sub(r'(\d{1,2})(pm|am)', r'\1 \2', text, flags=re.IGNORECASE)
 
         return text
+
+
+# ---------------------------------------------------------------------------
+# Exact local deadlines (#1385)
+#
+# api-v2 has no timezone handling for a task deadline. `is_proper_date` only
+# checks that Carbon can parse the string, the app timezone is UTC, and
+# `core.run_tasks.deadline` is `timestamp without time zone`, which silently
+# DROPS any offset in its input. So whatever this server sends is read as UTC,
+# and an offset string would be stored as its wall-clock digits. The
+# conversion therefore has to happen here, and the value sent has to be a bare
+# UTC timestamp.
+#
+# The tools used to take natural language and hand it to DateExtractor, which
+# read "tomorrow at 5pm" as 09:00 and "Friday" as a date weeks in the past.
+# The calling model now does the date arithmetic and sends an exact local time;
+# this module only does the timezone arithmetic, which it can do exactly.
+# ---------------------------------------------------------------------------
+
+API_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# The default for a date given with no time, stated in the parameter
+# description. Applied in LOCAL time, before conversion.
+DEFAULT_DEADLINE_TIME = _time(9, 0)
+
+_LOCAL_DEADLINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}"
+    r"(?:[ T]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?$"
+)
+
+# Profile timezones are usually IANA names, but `_resolve_user_timezone` can
+# fall back to a user's UTC_offset, which is a bare offset.
+_OFFSET_RE = re.compile(r"^(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+
+
+class DeadlineFormatError(ValueError):
+    """The deadline could not be turned into an exact UTC timestamp."""
+
+
+def resolve_zone(tz_name: Optional[str]) -> Optional[_tzinfo]:
+    """Return a tzinfo for an IANA name or a fixed offset, or None if neither."""
+    if not tz_name or not isinstance(tz_name, str):
+        return None
+    name = tz_name.strip()
+    if name.upper() in ("UTC", "GMT", "Z"):
+        return _dt_timezone.utc
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        pass
+    match = _OFFSET_RE.match(name)
+    if match:
+        sign, hours, minutes = match.groups()
+        delta = timedelta(hours=int(hours), minutes=int(minutes or 0))
+        if delta < timedelta(hours=15):
+            return _dt_timezone(-delta if sign == "-" else delta)
+    return None
+
+
+def local_deadline_to_utc(value: str, tz_name: Optional[str]) -> str:
+    """Convert an exact local deadline to the bare UTC string api-v2 stores.
+
+    ``value`` is ``YYYY-MM-DD HH:MM[:SS]`` in the org's local time, or a date
+    alone, which means DEFAULT_DEADLINE_TIME local. An explicit offset or ``Z``
+    is honoured instead of the org timezone. ``tz_name`` None means no
+    timezone is configured, and a naive value is then taken as UTC.
+
+    Raises DeadlineFormatError for anything else, including natural language,
+    and for a naive value when ``tz_name`` is set but cannot be resolved:
+    guessing UTC there would store the wrong deadline without a word.
+    """
+    text = (value or "").strip()
+    if not _LOCAL_DEADLINE_RE.match(text):
+        raise DeadlineFormatError(
+            f"deadline {value!r} is not an exact date and time"
+        )
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as e:
+        raise DeadlineFormatError(f"deadline {value!r} is not a real date: {e}") from e
+    if len(text) == 10:
+        parsed = datetime.combine(parsed.date(), DEFAULT_DEADLINE_TIME)
+
+    if parsed.tzinfo is None:
+        if tz_name:
+            zone = resolve_zone(tz_name)
+            if zone is None:
+                raise DeadlineFormatError(
+                    f"the organization timezone {tz_name!r} is not recognised, so "
+                    "a local time cannot be converted. Add the UTC offset, e.g. "
+                    "'2026-10-02 17:00-05:00'"
+                )
+        else:
+            zone = _dt_timezone.utc
+        parsed = parsed.replace(tzinfo=zone)
+
+    return parsed.astimezone(_dt_timezone.utc).strftime(API_DATETIME_FORMAT)
+
+
+def parse_api_deadline(value: Optional[str]) -> Optional[datetime]:
+    """Read a task deadline as an aware UTC datetime, or None if it cannot.
+
+    Two shapes reach this: the bare ``YYYY-MM-DD HH:MM:SS`` this server sends,
+    and the ISO 8601 string api-v2 answers with, such as
+    ``2026-10-05T14:00:00Z`` (read back on staging 2026-09-29, #1435). A value
+    with no offset is UTC, because api-v2 stores every task deadline as UTC.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text[-1] in "Zz":
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_dt_timezone.utc)
+    return parsed.astimezone(_dt_timezone.utc)
+
+
+def utc_to_local_string(utc_value: str, tz_name: Optional[str]) -> Optional[str]:
+    """Render a bare UTC timestamp in ``tz_name``, or None if it cannot."""
+    zone = resolve_zone(tz_name)
+    if zone is None:
+        return None
+    try:
+        utc_dt = datetime.strptime(utc_value, API_DATETIME_FORMAT).replace(
+            tzinfo=_dt_timezone.utc
+        )
+    except (TypeError, ValueError):
+        return None
+    return utc_dt.astimezone(zone).strftime(f"%Y-%m-%d %H:%M ({tz_name})")
+
+
+def now_local_string(tz_name: Optional[str]) -> str:
+    """The current time in ``tz_name`` (UTC when unresolvable), with the weekday."""
+    zone = resolve_zone(tz_name)
+    label = tz_name if zone is not None else "UTC"
+    now = datetime.now(zone or _dt_timezone.utc)
+    return now.strftime(f"%Y-%m-%d %H:%M, %A ({label})")

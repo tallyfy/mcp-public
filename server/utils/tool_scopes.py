@@ -238,6 +238,7 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "complete_task": _TASKS_W,
     "complete_standalone_task": _TASKS_W,
     "create_standalone_task": _TASKS_W,
+    "delete_standalone_task": _TASKS_W,
     "reopen_task": _TASKS_W,
     "reopen_standalone_task": _TASKS_W,
     "update_standalone_task": _TASKS_W,

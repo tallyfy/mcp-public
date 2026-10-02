@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import threading
 from dataclasses import dataclass, field
@@ -36,6 +37,18 @@ logger = logging.getLogger(__name__)
 _SPEC_URL = "https://api.tallyfy.com/docs/index"
 _REFRESH_SECONDS = 3600  # 1 h
 _FETCH_TIMEOUT_SECONDS = 10.0
+
+# The test configuration sets this to "1" (tests/conftest.py), so booting the
+# app in a test does not fetch the production spec (#1262). Only the exact
+# value "1" skips the fetch: unset, empty or anything else fetches as before,
+# so a variable missing from a deployed environment can never switch path
+# validation off.
+SKIP_STARTUP_FETCH_ENV = "TALLYFY_SPEC_CACHE_SKIP_STARTUP_FETCH"
+
+
+def startup_fetch_skipped() -> bool:
+    """True only when the test configuration asked to skip the startup fetch."""
+    return os.environ.get(SKIP_STARTUP_FETCH_ENV) == "1"
 
 
 @dataclass(frozen=True)
@@ -133,7 +146,18 @@ class TallyfySpecCache:
         )
 
     async def start_refresh_task(self) -> None:
-        """Kick off the background refresh loop. Call once at server boot."""
+        """Kick off the background refresh loop. Call once at server boot.
+
+        Does nothing when ``startup_fetch_skipped()``: no fetch and no loop.
+        The cache then starts empty, and the API fallback tools fetch it on
+        first use exactly as they do after a failed startup fetch.
+        """
+        if startup_fetch_skipped():
+            logger.info(
+                "Tallyfy spec startup fetch skipped (%s=1); the cache starts empty",
+                SKIP_STARTUP_FETCH_ENV,
+            )
+            return
         await self.refresh_once()
         self._task = asyncio.create_task(self._refresh_loop(), name="tallyfy_spec_refresh")
 
