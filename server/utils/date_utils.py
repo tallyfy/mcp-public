@@ -406,7 +406,8 @@ def local_deadline_to_utc(value: str, tz_name: Optional[str]) -> str:
 
     Raises DeadlineFormatError for anything else, including natural language,
     and for a naive value when ``tz_name`` is set but cannot be resolved:
-    guessing UTC there would store the wrong deadline without a word.
+    guessing UTC there would store the wrong deadline without a word. Also for
+    a date that leaves Python's year 1 to 9999 range on conversion to UTC.
     """
     text = (value or "").strip()
     if not _LOCAL_DEADLINE_RE.match(text):
@@ -433,7 +434,14 @@ def local_deadline_to_utc(value: str, tz_name: Optional[str]) -> str:
             zone = _dt_timezone.utc
         parsed = parsed.replace(tzinfo=zone)
 
-    return parsed.astimezone(_dt_timezone.utc).strftime(API_DATETIME_FORMAT)
+    # A well-formed date near year 1 or 9999 can leave Python's date range
+    # when it is moved to UTC, and astimezone then raises OverflowError.
+    try:
+        return parsed.astimezone(_dt_timezone.utc).strftime(API_DATETIME_FORMAT)
+    except OverflowError as e:
+        raise DeadlineFormatError(
+            f"deadline {value!r} is outside the range of dates that can be stored"
+        ) from e
 
 
 def parse_api_deadline(value: Optional[str]) -> Optional[datetime]:
@@ -455,7 +463,10 @@ def parse_api_deadline(value: Optional[str]) -> Optional[datetime]:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=_dt_timezone.utc)
-    return parsed.astimezone(_dt_timezone.utc)
+    try:
+        return parsed.astimezone(_dt_timezone.utc)
+    except OverflowError:
+        return None
 
 
 def utc_to_local_string(utc_value: str, tz_name: Optional[str]) -> Optional[str]:
@@ -469,7 +480,12 @@ def utc_to_local_string(utc_value: str, tz_name: Optional[str]) -> Optional[str]
         )
     except (TypeError, ValueError):
         return None
-    return utc_dt.astimezone(zone).strftime(f"%Y-%m-%d %H:%M ({tz_name})")
+    # This runs after a task write has landed, so it must answer None rather
+    # than raise: an OverflowError here reported a created task as a failure.
+    try:
+        return utc_dt.astimezone(zone).strftime(f"%Y-%m-%d %H:%M ({tz_name})")
+    except OverflowError:
+        return None
 
 
 def now_local_string(tz_name: Optional[str]) -> str:
