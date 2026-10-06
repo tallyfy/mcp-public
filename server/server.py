@@ -33,6 +33,7 @@ from tools.api_fallback import register_api_fallback_tool, report_fallback_flag_
 from tools.template_mapping_validation import register_template_mapping_validation_tools
 from tools.org_context import register_org_context_tools
 from tools.file_management import register_file_management_tools
+from tools.automation_history import register_automation_history_tools
 from utils.org_id_middleware import OrgIdMiddleware
 from utils.tallyfy_spec_cache import SPEC_CACHE
 from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ACCEPTED_MCP_RESOURCES, ENFORCE_AUDIENCE, SERVER_VERSION, INSTRUCTIONS_TEMPLATE
@@ -203,6 +204,7 @@ register_api_fallback_tool(mcp)
 register_template_mapping_validation_tools(mcp)
 register_org_context_tools(mcp)
 register_file_management_tools(mcp)
+register_automation_history_tools(mcp)
 
 # Enforce the token's mcp_scopes per tool (#559). This is a FastMCP TOOL
 # middleware, so it is added here with mcp.add_middleware() rather than to the

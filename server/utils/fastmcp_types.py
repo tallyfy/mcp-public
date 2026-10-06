@@ -122,6 +122,21 @@ TaskId = Annotated[str, Field(
     examples=["f4a1c2b39e7d48a6b0c15e2d3f6a8b90"]
 )]
 
+# Optional counterpart to TaskId (tallyfy/mcp#1437), shaped like OptionalProcessId below
+# and for the same reasons: a typed optional rather than OptionalString (#696), and the
+# empty string stays valid because a model that sends "" for an optional field must not
+# be refused before the function body can treat it as absent.
+OptionalTaskId = Annotated[Optional[str], Field(
+    default=None,
+    max_length=32,
+    pattern="^(?:[a-f0-9]{32})?$",
+    description=(
+        "Task ID, as a 32-character hex string, of one task inside the process. "
+        "It identifies the TASK, not the process. Leave it out to cover the whole process."
+    ),
+    examples=["f4a1c2b39e7d48a6b0c15e2d3f6a8b90"]
+)]
+
 # api-v2: CreateOneOffTaskRequest.php:19 / UpdateTasksRequest.php:61 -> 'max:600'
 TaskTitle = Annotated[str, Field(
     min_length=1,

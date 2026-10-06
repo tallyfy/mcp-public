@@ -34,7 +34,7 @@ Transport is streamable HTTP and authentication is OAuth against your Tallyfy ac
 
 ## What it can do
 
-120 tools across the Tallyfy domain, grouped by area:
+121 tools across the Tallyfy domain, grouped by area:
 
 | Area | Examples |
 |------|----------|
@@ -42,9 +42,10 @@ Transport is streamable HTTP and authentication is OAuth against your Tallyfy ac
 | Processes (runs) | launch a process from a template, advance and track steps |
 | Templates (checklists) | read, create, and edit templates and their steps |
 | Form fields | read and populate kick-off and step form fields |
-| Automation | inspect and manage automated actions / rules |
+| Automation | inspect and manage automated actions / rules, and explain why a step in a running process is shown or hidden |
 | People & access | users, groups, guests, organization membership |
 | Organization | tags, folders, comments, search across the org |
+| Files | read and upload files attached to form fields, kickoff fields and task comments |
 | API fallback | read from or write to any Tallyfy REST endpoint that has no dedicated tool |
 | Product docs | search the public Tallyfy documentation index |
 | Org memory | read and update a per-organization memory document held server-side |

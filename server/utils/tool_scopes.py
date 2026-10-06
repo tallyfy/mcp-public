@@ -319,6 +319,12 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     # template document and change nothing.
     "test_template": _AUTO_R,
     "test_template_scenario": _AUTO_R,
+    # tallyfy/mcp#1437. Reads one process, its tasks and its activity feed, and
+    # the rules of the template version it launched from, and changes nothing.
+    # Both families, because the answer is about a process AND its rules.
+    "explain_step_visibility": frozenset(
+        {MCPScopes.PROCESSES_READ, MCPScopes.AUTOMATION_READ}
+    ),
     "create_automation_rule": _AUTO_W,
     "update_automation_rule": _AUTO_W,
     "delete_automation_rule": _AUTO_W,

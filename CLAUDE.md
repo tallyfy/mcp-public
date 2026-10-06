@@ -19,7 +19,7 @@ Deliberately not published (kept private): hosting/WebSocket layer, monitoring a
 
 - Hosted endpoint: `https://mcp.tallyfy.com/` (streamable HTTP, OAuth against a Tallyfy account).
 - Run locally: see `README.md` (Docker, or Python 3.11 + `server/requirements.txt`).
-- Tools: 120, scoped to the authenticated user. Most call the public Tallyfy API as that user. `search_product_docs` reads the public docs search index (no credentials, no org data), `get_org_context` / `update_org_context` read and write the server-side org memory store, and `validate_template_mapping` and the three `ask_user_*` tools do their work without calling the API.
+- Tools: 121, scoped to the authenticated user. Most call the public Tallyfy API as that user. `search_product_docs` reads the public docs search index (no credentials, no org data), `get_org_context` / `update_org_context` read and write the server-side org memory store, and `validate_template_mapping` and the three `ask_user_*` tools do their work without calling the API.
 
 ## Reporting issues
 
