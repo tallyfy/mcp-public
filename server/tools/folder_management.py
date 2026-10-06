@@ -58,6 +58,44 @@ def _normalize_folder_type(folder_type: str | None) -> str:
     return resolved
 
 
+# add_object_to_folder's object_type, resolved to the folder_type it must match.
+_OBJECT_TYPE_TO_FOLDER_TYPE = {
+    "run": "run",
+    "checklist": "checklist",
+    "template": "checklist",
+}
+
+
+def _require_matching_folder_type(sdk, org_id: str, folder_id: str, folder_type: str) -> None:
+    """Refuse to file an object into a folder of the other type (#597).
+
+    api-v2 guards only one direction. A process goes through FolderObjectRequest,
+    whose folder_id rule requires folder_type = Run::class. A template is filed by
+    PUT /checklists/{id} with folder_id, and UpdateChecklistRequest checks that
+    folder_id only exists, with no folder_type condition, so a template filed into
+    a process folder is stored with a 200 and cannot be unfiled (#619).
+
+    Fails closed: a folder whose type cannot be read is refused, never assumed.
+    """
+    folder = sdk.folders.get_folder(org_id, folder_id)
+    actual = getattr(folder, "folder_type", None)
+    if actual not in ("run", "checklist"):
+        raise ToolError(
+            f"Could not read the type of folder {folder_id}, so nothing was filed. "
+            "Check the id with get_template_folders() or get_process_folders()."
+        )
+    if actual != folder_type:
+        wanted, have, finder = (
+            ("process", "template", "get_process_folders()")
+            if folder_type == "run"
+            else ("template", "process", "get_template_folders()")
+        )
+        raise ToolError(
+            f"Folder {folder_id} is a {have} folder and cannot hold a {wanted}. "
+            f"Nothing was filed. Pick a {wanted} folder from {finder}."
+        )
+
+
 def register_folder_management_tools(mcp):
     """Register all folder management tools with the MCP server"""
 
@@ -298,23 +336,22 @@ REQUIRED: 'folder_id', 'object_id' (32-char hex ID of the process or
 template), and 'object_type': 'run' for processes, 'checklist'/'template' for templates.
 
 THE FOLDER'S TYPE MUST MATCH object_type. Folder type is fixed at creation:
-- object_type='run' requires a folder created with create_folder(..., folder_type='run').
-  Passing a template folder fails with "No such a folder exists in Processes."
+- object_type='run' needs a process folder (create_folder(..., folder_type='run')).
   Use get_process_folders() to find valid targets.
-- object_type='template'/'checklist' requires a template folder (the create_folder default).
+- object_type='template'/'checklist' needs a template folder (the create_folder default).
   Use get_template_folders() to find valid targets.
+The tool reads the folder first and refuses a mismatch before writing anything.
 
-RETURNS true/false, NOT a relation id. Never invent one.
+RETURNS depend on object_type:
+- 'run': the folder-membership record. Its integer 'id' is what
+  remove_object_from_folder takes. Keep it: no tool can look it up later.
+- 'template'/'checklist': true, and NOT a relation id. Never invent one.
 
-UNFILING is asymmetric:
-- 'run': linked by a membership row. Get its integer id by LISTING the folder's
-  objects ('id' on each entry), then pass it to remove_object_from_folder.
-- 'template'/'checklist': NO membership row exists. Filing sets folder_id as an
-  attribute on the template. UNFILING A TEMPLATE IS NOT POSSIBLE THROUGH ANY TOOL:
-  remove_object_from_folder needs an integer id that does not exist, and
-  update_template silently DISCARDS folder_id (absent from the SDK's allowed
-  fields, so it returns success having changed nothing). Say so rather than
-  guessing, and never report a template as unfiled. Tracked in mcp#619.
+UNFILING A TEMPLATE IS NOT POSSIBLE THROUGH ANY TOOL. Filing sets folder_id as an
+attribute on the template, so there is no membership row for
+remove_object_from_folder, and update_template silently DISCARDS folder_id (absent
+from the SDK's allowed fields, so it returns success having changed nothing). Say
+so rather than guessing, and never report a template as unfiled. Tracked in mcp#619.
 
 REPEAT CALLS ERROR rather than passing quietly: adding an object already in the
 folder returns 422 "already in this folder". Nothing is duplicated or harmed, so
@@ -347,14 +384,18 @@ treat it as already-done, not as a failure to retry.
             object_type: Type of object: 'run' for processes, 'checklist' for templates (REQUIRED)
 
         Returns:
-            Created folder-object relation
+            For a process, the created folder-object relation (integer 'id').
+            For a template, true.
         """
-        # Normalize: "template" is an alias for "checklist"
-        if object_type == "template":
-            object_type = "checklist"
+        folder_type = _OBJECT_TYPE_TO_FOLDER_TYPE.get(object_type)
+        if folder_type is None:
+            raise ToolError(
+                f"object_type must be 'run' (process) or 'checklist'/'template', got {object_type!r}"
+            )
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.folders.add_object_to_folder(org_id, folder_id, object_id, object_type)
+            _require_matching_folder_type(sdk, org_id, folder_id, folder_type)
+            result = sdk.folders.add_object_to_folder(org_id, folder_id, object_id, folder_type)
             return ToolResult(
                 content=serialize_dataclass(result) if result else {},
                 structured_content=None
@@ -364,10 +405,12 @@ treat it as already-done, not as a failure to retry.
         name="remove_object_from_folder",
         description="""Remove an object from a folder using the folder-object relation ID.
 
-REQUIRED: 'folder_object_id', a positive INTEGER (e.g. 12345), NOT a 32-char hex ID.
-This is the id of the folder-membership row itself, not the id of the process or
-template inside the folder. It is returned by add_object_to_folder and appears as
-the 'id' of the entries returned when listing a folder's objects.
+REQUIRED: 'folder_object_id', a positive INTEGER (e.g. 12345, or "12345" exactly as
+add_object_to_folder returns it), NOT a 32-char hex ID.
+This is the id of the folder-membership row itself, not the id of the process
+inside the folder. It is the 'id' that add_object_to_folder(object_type='run')
+returns. No tool can look it up afterwards, so if that id was not kept, say so
+rather than guessing.
 
 CORRECT:   remove_object_from_folder(folder_object_id=12345)
 WRONG:     remove_object_from_folder(folder_object_id="7c9e6679742540de944be07fc1f90ae7")  # that's the process id
@@ -377,9 +420,6 @@ row exists only for a process. A TEMPLATE is filed by an attribute on the templa
 itself, not by a relation, so there is no id to pass here and no way to unfile a
 template through any current tool (see add_object_to_folder). Do not pass a
 template's hex id hoping it works, and do not invent an integer.
-
-add_object_to_folder does NOT return this id. Get it by listing the folder's objects
-and reading the 'id' on each entry.
 
 """,
         tags=["folders", "organization", "write"],
@@ -400,7 +440,8 @@ and reading the 'id' on each entry.
 
         Args:
             folder_object_id: Folder-object relation ID (REQUIRED — positive integer
-                from core.folder_objects.id, not the process/template hex ID)
+                from core.folder_objects.id, or the same digits as a string, which
+                is how add_object_to_folder returns it; not the process hex ID)
 
         Returns:
             Result of the removal operation

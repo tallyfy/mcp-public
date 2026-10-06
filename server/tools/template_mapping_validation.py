@@ -23,11 +23,20 @@ Expected mapping shape (the host/agent produces this from the document):
   "title": str,
   "summary": str,
   "kickoff_form": [ {alias, label, field_type, required, options?, ...} ],
-  "steps": [ {temp_id, position, title, step_type, assignees?, deadline?, form_fields?} ],
+  "steps": [ {temp_id, position, title, step_type, assignees?, groups?, guests?,
+              assign_run_starter?, deadline?, form_fields?} ],
   "automations": [ {automated_alias, conditions:[{on,type,operation,statement,logic}],
                     then_actions:[{action_type,action_verb,target,
-                                   deadline?, assignees?, webhook_url?, alias_name?}]} ]
+                                   deadline?, assignees?, actionable_id?,
+                                   actionable_type?, webhook_url?, alias_name?}]} ]
 }
+
+Who does a step (assignees, groups, guests, assign_run_starter) is carried and
+NOT checked: nothing below reads those four keys, so a wrong id passes. They are
+named in the published schema so a draft can say who does a step under the keys
+add_step_to_template takes (tallyfy/work-queue#3654). Leaving them all out does
+not leave the built step empty: api-v2 gives it to whoever launches the process,
+and a step with no deadline is due 1 day after launch.
 
 Two DIFFERENT deadline vocabularies live in this file, and conflating them is a
 live bug rather than a tidiness issue (#629):
@@ -549,7 +558,7 @@ validator. Pass the full mapping object you intend to build.
 
 mapping shape:
 {"title","summary","kickoff_form":[{alias,label,field_type,required,...}],
- "steps":[{temp_id,position,title,step_type,assignees,deadline,form_fields}],
+ "steps":[{temp_id,position,title,step_type,assignees,groups,guests,assign_run_starter,deadline,form_fields}],
  "automations":[{automated_alias,conditions:[{on,type:'step'|'field',operation,statement,logic}],
                  then_actions:[{action_type,action_verb,target,
                                 deadline,assignees,webhook_url,alias_name}]}]}
@@ -558,7 +567,8 @@ action_type CONSTRAINS action_verb, they are NOT independent:
   visibility -> show|hide  deadline -> deadline  status -> reopen
   webhook -> emit_webhook  assignment -> assign|assign_only|unassign|clear_assignees
 webhook also needs webhook_url AND alias_name; assignment other than
-clear_assignees needs a non-empty assignees {users,guests,groups}.
+clear_assignees needs assignees {users,guests,groups} or a field
+(actionable_id + actionable_type).
 
 The two deadline vocabularies DIFFER and are checked separately:
   steps[].deadline         unit minutes|hours|days|weeks|months, singular such as

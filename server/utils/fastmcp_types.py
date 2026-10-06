@@ -5,7 +5,7 @@ This module provides reusable, validated parameter types for all MCP tools
 following FastMCP best practices with Pydantic validation.
 """
 
-from typing import Annotated, List, Optional, Dict, Any, Union
+from typing import Annotated, List, Literal, Optional, Dict, Any, Union
 from pydantic import Field
 from constants import TALLYFY_AUTH_SERVER, TOOL_SECURITY_METADATA, MCPScopes
 
@@ -376,6 +376,16 @@ TagColor = Annotated[Optional[str], Field(
     examples=["#FF5733", "#01803D"]
 )]
 
+# api-v2: AddTagChecklistRequest.php -> 'tag_type' => 'required|in:private,public',
+# and it decides which table tag_id is validated against (tags vs tags_public).
+# A public id sent as 'private' 422s with a message blaming tag_id. #620.
+TagType = Annotated[Literal["private", "public"], Field(
+    description="Which table the tag_id belongs to. 'private' (default) is an "
+                "organization tag, which is every tag get_tags and create_tag return. "
+                "'public' is only for an id from Tallyfy's public tag set; sending a "
+                "public id as 'private' fails with an error that blames tag_id."
+)]
+
 # Automation-related types
 RuleId = Annotated[str, Field(
     min_length=32,
@@ -596,11 +606,22 @@ FolderName = Annotated[str, Field(
 # core.folder_objects.id is an auto-increment INTEGER (db-schema.sql:3418),
 # not a hex string — the value comes back on the folder-object relation
 # created by add_object_to_folder.
-FolderObjectId = Annotated[int, Field(
-    ge=1,
-    description="Folder-object relation ID (positive integer)",
-    examples=[12345]
-)]
+#
+# A digit-only STRING is accepted too (#597). FolderObjectsTransformer sends the
+# id as a JSON string ("id": "927", measured on staging 2026-10-04), and with
+# FASTMCP_STRICT_INPUT_VALIDATION=true (staging and production) a bare int type
+# rejects that string, so the id add_object_to_folder returned could not be
+# passed back unchanged. The pattern keeps hex ids and negatives out.
+FolderObjectId = Annotated[
+    Union[
+        Annotated[int, Field(ge=1)],
+        Annotated[str, Field(pattern=r"^[1-9][0-9]{0,18}$")],
+    ],
+    Field(
+        description="Folder-object relation ID (positive integer, or the same digits as a string)",
+        examples=[12345, "12345"],
+    ),
+]
 
 FolderType = Annotated[str, Field(
     description="Folder kind: 'checklist' for template folders, 'run' for process folders",

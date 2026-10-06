@@ -695,12 +695,32 @@ class MappingStep(_Payload):
     position: int = Field(default=None)
     title: str = Field(default=None)
     step_type: str = Field(default=None, json_schema_extra={"enum": _STEP_TYPES})
-    assignees: List[Any] = Field(default=None)
+    # Who does the step, under the same four keys `add_step_to_template` takes,
+    # so a draft can say it and the build can send it unchanged
+    # (tallyfy/work-queue#3654). Documented only: `validate_mapping` reads none
+    # of them, which is why `assignees` says so.
+    assignees: List[Any] = Field(
+        default=None,
+        description=(
+            "Member ids. This tool does not check assignees, groups, guests or "
+            "assign_run_starter"
+        ),
+    )
+    groups: List[str] = Field(default=None, description="Group ids")
+    guests: List[str] = Field(default=None, description="Guest email addresses")
+    assign_run_starter: bool = Field(
+        default=None,
+        description=(
+            "True gives the step to whoever launches the process. A step built "
+            "with no assignee, group or guest gets that anyway"
+        ),
+    )
     deadline: Dict[str, Any] = Field(
         default=None,
         description=(
             "STEP vocabulary: unit minutes to months, singular such as 'day' "
-            "also accepted; option from or prior_to"
+            "also accepted; option from or prior_to. A step built without one "
+            "is due 1 day after launch"
         ),
     )
     form_fields: List[MappingKickoffField] = Field(default=None)
@@ -717,6 +737,9 @@ class MappingAutomation(_Payload):
         description=(
             "Each carries action_type, action_verb, target, and whichever of "
             "deadline, assignees, webhook_url and alias_name that pair needs. "
+            "An assignment can take its people from a form field instead of "
+            "assignees: actionable_id (the field's alias) with actionable_type "
+            "'kickoff' or 'field'. "
             "An ACTION deadline uses unit plural and option before or from"
         ),
     )
