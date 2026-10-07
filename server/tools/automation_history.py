@@ -37,11 +37,34 @@ Two things the record does NOT hold, and the tool says so rather than guessing:
   step a show action targets when the process is created, on Pro plans and
   trials, and writes no row for it. So a hidden step with a show rule is
   explained from the launched version's show rules.
+
+``find_open_tasks_for_step`` (tallyfy/mcp#1438) answers the question that comes
+after an assignee rule changes: which processes already running still hold that
+step open, who has it now, and could an old rule still move it. Read on api-v2
+``origin/master`` 86687df3 and ``origin/production`` 0e89c240 on 2026-10-06:
+
+* ``GET runs?checklist_id=`` filters on ``runs.blueprint_timeline``
+  (``Run::scopeChecklist``), so it returns processes launched from EVERY version
+  of the template. ``active`` and ``problem`` are separate status scopes.
+* A task's ``step_id`` and a step's ``id`` are both timeline ids
+  (``TaskTransformer``, ``StepTransformer``), which stay the same across
+  versions, so one step id finds its task in a process of any version.
+* Launching freezes the version (``core.run_starting``), so a rule edited today
+  lives in a new version and never reaches a running process.
+* ``Task\\ApplyRules`` and ``ApplyRulesWithPrerunConditions`` skip an automation
+  that already executed in the process (``automation_executions``), so a rule
+  fires at most once per process. One that has not fired can still fire on a
+  later completion and, if the task is still open, set its assignees
+  (``BaseAction::applyAssignmentActionOnTarget``).
+* The feed filter ``type=execution&verb=executed`` exists on api-v2 master since
+  c2727ed4 (#11092) and answers 422 where it does not, so the tool falls back to
+  paging the whole feed.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
@@ -51,7 +74,7 @@ from tallyfy import TallyfySDK, TallyfyError
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.fastmcp_errors import handle_tallyfy_errors
-from utils.fastmcp_types import GenericDict, OptionalTaskId, ProcessId
+from utils.fastmcp_types import GenericDict, OptionalTaskId, ProcessId, StepId, TemplateId
 from utils.response_sanitizer import sanitize_for_user_text
 from utils.sdk_serializer import compact_dict_list_field
 
@@ -827,6 +850,496 @@ def build_explanation(run: Dict[str, Any], tasks: List[dict], checks: List[dict]
 
 
 # ---------------------------------------------------------------------------
+# Open tasks for one step across the running processes (tallyfy/mcp#1438)
+# ---------------------------------------------------------------------------
+
+#: Process statuses still in motion. A ``problem`` process is running with a
+#: problem reported. api-v2 filters each with its own scope, so they are read
+#: one status at a time.
+STATUSES_IN_MOTION = ("active", "problem")
+
+#: Up to 500 processes per status. The result says when this cap was hit.
+MAX_RUN_PAGES = 5
+
+OPEN_TASK_STATUSES = frozenset({"not-started", "in-progress"})
+COMPLETED_STATUS = "completed"
+ASSIGNMENT_ACTION_TYPE = "assignment"
+
+#: The chat host gives a tool call 30 seconds (``DEFAULT_MCP_CLIENT_TIMEOUT``).
+#: The rule checks and the name lookups each cost a request, so they stop when
+#: this many seconds have passed since the call began; what was not checked is
+#: marked as not checked, never as safe. Measured on staging 2026-10-06: one
+#: process's rules took 0.4 s and its filtered feed 0.4 s; the whole feed of
+#: one process took 1.1 s per 100 rows.
+OPTIONAL_READS_BUDGET_SECONDS = 18.0
+
+MAX_NAME_LOOKUPS = 25
+
+_VERB_EFFECT = {
+    "assign_only": "replace the assignees with",
+    "assign": "add",
+    "clear_assignees": "remove everyone from it",
+}
+
+
+def read_template_with_steps(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
+    """The template's current version, with its steps and rules."""
+    endpoint = f"organizations/{org_id}/checklists/{template_id}"
+    try:
+        response = sdk._make_request("GET", endpoint, params={"with": "steps"})
+    except TallyfyError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            raise ToolError(
+                f"No template with id {template_id} was found in this organization. "
+                "A template id is the 32-character id of a template, not a process id "
+                "or a step id."
+            )
+        raise
+    template = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(template, dict) or not template.get("id"):
+        raise ToolError(f"No template with id {template_id} was found in this organization.")
+    steps = _unwrap(template.get("steps"))
+    template["steps"] = [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+    return template
+
+
+def read_processes_in_motion(sdk, org_id: str, template_id: str) -> Tuple[List[dict], bool, int]:
+    """Running processes launched from any version of the template, with their tasks.
+
+    ``with=tasks`` carries every task except hidden ones (``Run::tasks`` drops
+    ``auto-skipped``), which is all an open-task question needs. A row whose
+    template or status does not match what was asked for is dropped here, so a
+    filter api-v2 stopped honouring cannot widen the answer.
+    """
+    processes: List[dict] = []
+    seen: Set[str] = set()
+    complete = True
+    total = 0
+    for status in STATUSES_IN_MOTION:
+        rows, done, count = _read_pages(
+            sdk,
+            f"organizations/{org_id}/runs",
+            {"checklist_id": template_id, "status": status, "with": "tasks"},
+            MAX_RUN_PAGES,
+        )
+        complete = complete and done
+        total += count if isinstance(count, int) else len(rows)
+        for row in rows:
+            run_id = row.get("id")
+            if (
+                run_id and run_id not in seen
+                and row.get("checklist_id") == template_id
+                and row.get("status") == status
+            ):
+                seen.add(run_id)
+                processes.append(row)
+    return processes, complete, total
+
+
+def _tasks_for_step(process: Dict[str, Any], step_id: str) -> List[dict]:
+    tasks = _unwrap(process.get("tasks"))
+    if not isinstance(tasks, list):
+        return []
+    return [
+        t for t in tasks
+        if isinstance(t, dict) and t.get("step_id") == step_id and not t.get("archived_at")
+    ]
+
+
+def read_launched_version(sdk, org_id: str, process_id: str) -> Optional[Dict[str, Any]]:
+    """The template version one process launched from, or None when unreadable."""
+    response = sdk._make_request(
+        "GET", f"organizations/{org_id}/runs/{process_id}", params={"with": "checklist"}
+    )
+    run = response.get("data") if isinstance(response, dict) else None
+    version = _unwrap(run.get("checklist")) if isinstance(run, dict) else None
+    return version if isinstance(version, dict) else None
+
+
+def _executed_automation_ids(rows: List[dict], process_id: str) -> Set[str]:
+    return {
+        r["audit_state"]["automation_id"]
+        for r in rows
+        if _first(r.get("type")) == "execution"
+        and _first(r.get("verb")) == "executed"
+        and isinstance(r.get("audit_state"), dict)
+        and r["audit_state"].get("automation_id")
+        and r.get("auditable_id") in (None, process_id)
+    }
+
+
+def read_executed_automations(sdk, org_id: str, process_id: str,
+                              state: Dict[str, Any]) -> Tuple[Set[str], bool]:
+    """Ids of the automations that have executed in the process, and whether all were read.
+
+    Asks for the executed rows only. Where api-v2 refuses that filter with a
+    422, it pages the whole feed instead and stops asking for the rest of this
+    call. The verb and type are checked here either way.
+    """
+    if state.get("feed_filter", True):
+        try:
+            rows, complete, _total = _read_pages(
+                sdk,
+                f"organizations/{org_id}/activity-feeds",
+                {"entity_type": "run", "entity_id": process_id,
+                 "type": "execution", "verb": "executed"},
+                MAX_FEED_PAGES,
+            )
+            return _executed_automation_ids(rows, process_id), complete
+        except TallyfyError as exc:
+            if getattr(exc, "status_code", None) != 422:
+                raise
+            state["feed_filter"] = False
+    checks, complete, _total = read_automation_checks(sdk, org_id, process_id)
+    return _executed_automation_ids(checks, process_id), complete
+
+
+def _buckets(raw: Any) -> Dict[str, list]:
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        key: [v for v in raw.get(key) or [] if v not in (None, "")]
+        for key in ("users", "guests", "groups")
+    }
+
+
+def _assignment_rules_for_step(document: Dict[str, Any], step_id: str) -> List[Dict[str, Any]]:
+    """Each rule in a version whose assignment actions target the step."""
+    rules = []
+    for automation in document.get("automated_actions") or []:
+        if not isinstance(automation, dict) or not automation.get("id"):
+            continue
+        actions = [
+            a for a in automation.get("then_actions") or []
+            if isinstance(a, dict)
+            and a.get("action_type") == ASSIGNMENT_ACTION_TYPE
+            and a.get("target_step_id") == step_id
+        ]
+        if actions:
+            rules.append({"automation": automation, "actions": actions})
+    return rules
+
+
+class _Names:
+    """Best-effort names for user and group ids, read once each and capped."""
+
+    def __init__(self):
+        self.users: Dict[Any, Dict[str, Any]] = {}
+        self.groups: Dict[Any, Dict[str, Any]] = {}
+        self.complete = True
+
+    def collect(self, buckets: Dict[str, list], wanted_users: Set[Any], wanted_groups: Set[Any]):
+        wanted_users.update(u for u in buckets["users"] if isinstance(u, (int, str)))
+        wanted_groups.update(g for g in buckets["groups"] if isinstance(g, str))
+
+    def read(self, sdk, org_id: str, user_ids: Set[Any], group_ids: Set[Any], deadline: float):
+        lookups = [("users", u) for u in sorted(user_ids, key=str)] + [
+            ("groups", g) for g in sorted(group_ids)
+        ]
+        for count, (kind, key) in enumerate(lookups):
+            if count >= MAX_NAME_LOOKUPS or time.monotonic() >= deadline:
+                self.complete = False
+                return
+            try:
+                response = sdk._make_request("GET", f"organizations/{org_id}/{kind}/{key}")
+            except TallyfyError:
+                continue
+            data = response.get("data") if isinstance(response, dict) else None
+            if not isinstance(data, dict):
+                continue
+            if kind == "users":
+                name = data.get("full_name") or " ".join(
+                    p for p in (data.get("first_name"), data.get("last_name")) if p
+                )
+                entry = {"name": name or None, "email": data.get("email")}
+                self.users[key] = {k: v for k, v in entry.items() if v}
+            else:
+                if data.get("name"):
+                    self.groups[key] = {"name": data.get("name")}
+
+    def people(self, buckets: Dict[str, list]) -> Dict[str, list]:
+        return {
+            "users": [{"id": u, **self.users.get(u, {})} for u in buckets["users"]],
+            "guests": list(buckets["guests"]),
+            "groups": [{"id": g, **self.groups.get(g, {})} for g in buckets["groups"]],
+        }
+
+    def phrase(self, buckets: Dict[str, list]) -> str:
+        names = [
+            (self.users.get(u) or {}).get("name") or (self.users.get(u) or {}).get("email") or f"user {u}"
+            for u in buckets["users"]
+        ]
+        names += list(buckets["guests"])
+        names += [(self.groups.get(g) or {}).get("name") or f"group {g}" for g in buckets["groups"]]
+        return ", ".join(names) if names else "nobody"
+
+
+def _field_reference(action: Dict[str, Any], document: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The form field an assignment reads its people from, when it reads one."""
+    field_id = action.get("actionable_id")
+    if not field_id:
+        return None
+    kind = str(action.get("actionable_type") or "").lower()
+    reference: Dict[str, Any] = {
+        "field_id": field_id,
+        "field_type": _SUBJECT_KINDS.get(kind, kind or None),
+    }
+    label = None
+    if kind == "prerun":
+        for field in _unwrap(document.get("prerun")) or []:
+            if isinstance(field, dict) and field.get("id") == field_id:
+                label = field.get("label")
+    else:
+        for step in document.get("steps") or []:
+            for capture in _unwrap(step.get("captures") if isinstance(step, dict) else None) or []:
+                if isinstance(capture, dict) and capture.get("id") == field_id:
+                    label = capture.get("label")
+    if label:
+        reference["label"] = label
+    return reference
+
+
+def _describe_rule(rule: Dict[str, Any], document: Dict[str, Any],
+                   steps_fallback: Optional[List[dict]] = None) -> Dict[str, Any]:
+    """One rule's assignment actions and conditions, in the words a person uses.
+
+    A launched version read through ``runs/{run}?with=checklist`` carries no
+    steps, so a condition on a step would have no name. Step ids are timeline
+    ids and stay the same across versions, so ``steps_fallback`` (the current
+    template's steps) names them instead.
+    """
+    automation = rule["automation"]
+    actions = []
+    for action in rule["actions"]:
+        entry: Dict[str, Any] = {
+            "action": action.get("action_verb"),
+            "assignees": _buckets(action.get("assignees")),
+        }
+        reference = _field_reference(action, document)
+        if reference:
+            entry["from_field"] = reference
+        actions.append(entry)
+    described: Dict[str, Any] = {
+        "automation_id": automation["id"],
+        "name": automation.get("automated_alias"),
+        "actions": actions,
+    }
+    conditions = [c for c in automation.get("conditions") or [] if isinstance(c, dict)]
+    if conditions:
+        steps = document.get("steps") or steps_fallback or []
+        version = _Version({"checklist": {**document, "steps": steps}}, [])
+        described["conditions"] = _first_logic_dropped([
+            _describe_template_condition(c, version)
+            for c in sorted(conditions, key=lambda c: c.get("position") or 0)
+        ])
+    return described
+
+
+def _render_rule(rule: Dict[str, Any], names: "_Names") -> Dict[str, Any]:
+    """A described rule with its people named. Leaves the input untouched."""
+    rendered = dict(rule)
+    rendered["actions"] = [
+        {**action, "assignees": names.people(action["assignees"])} for action in rule["actions"]
+    ]
+    return rendered
+
+
+def _rule_effects(rules: List[Dict[str, Any]], names: "_Names") -> List[str]:
+    effects = []
+    for rule in rules:
+        for action in rule["actions"]:
+            effect = _VERB_EFFECT.get(action.get("action"))
+            if not effect:
+                continue
+            if action.get("action") == "clear_assignees":
+                effects.append(effect)
+            elif action.get("from_field"):
+                label = action["from_field"].get("label") or "a form field"
+                effects.append(f"{effect} the people named in {_quoted(label)}")
+            else:
+                effects.append(f"{effect} {names.phrase(action['assignees'])}")
+    return effects
+
+
+def _rule_warning(names: List[str], effects: List[str]) -> str:
+    one = len(names) == 1
+    return (
+        f"The {'rule' if one else 'rules'} {' and '.join(_quoted(n) for n in names)} from the "
+        f"template version this process launched with {'has' if one else 'have'} not fired "
+        f"here yet. If {'it fires' if one else 'one fires'} later while this task is open, it "
+        f"will {' or '.join(effects)}, which can undo a change made now."
+    )
+
+
+def build_open_tasks_answer(template: Dict[str, Any], step_id: str, processes: List[dict], *,
+                            processes_complete: bool, processes_total: int,
+                            rule_checks: Dict[str, Dict[str, Any]], names: _Names,
+                            checks_stopped: bool) -> Dict[str, Any]:
+    """Assemble the answer. Pure, so the unit tests drive it with recorded bodies."""
+    step = next((s for s in template["steps"] if s.get("id") == step_id), {})
+    result: Dict[str, Any] = {
+        "template": {"id": template.get("id"), "title": template.get("title")},
+        "step": {"id": step_id, "title": step.get("title"), "position": step.get("position")},
+        "assignment_rules_now": [],
+        "limits": [],
+    }
+    for rule in _assignment_rules_for_step(template, step_id):
+        result["assignment_rules_now"].append(_render_rule(_describe_rule(rule, template), names))
+
+    open_tasks: List[Dict[str, Any]] = []
+    completed = 0
+    not_open = 0
+    flagged = 0
+    unchecked = 0
+    for process in processes:
+        tasks = _tasks_for_step(process, step_id)
+        open_here = [t for t in tasks if t.get("status") in OPEN_TASK_STATUSES]
+        if not open_here:
+            if tasks and all(t.get("status") == COMPLETED_STATUS for t in tasks):
+                completed += 1
+            else:
+                not_open += 1
+            continue
+        check = rule_checks.get(process["id"])
+        for task in open_here:
+            entry: Dict[str, Any] = {
+                "process_id": process["id"],
+                "process_name": _clean_name(process.get("name")),
+                "process_status": process.get("status"),
+                "task_id": task.get("id"),
+                "task_title": task.get("title"),
+                "task_status": task.get("status"),
+                "current_assignees": names.people(_buckets(task.get("owners"))),
+            }
+            if task.get("deadline"):
+                entry["deadline"] = task.get("deadline")
+            if check is None:
+                entry["may_be_reassigned_by_old_rule"] = None
+                entry["warning"] = (
+                    "Not checked in this call, so whether a rule from the version this "
+                    "process launched with can still reassign this task is not known."
+                )
+                unchecked += 1
+            else:
+                entry["launched_from_older_version"] = check["older_version"]
+                pending = check["pending"]
+                entry["old_assignment_rules"] = [_render_rule(r, names) for r in pending]
+                entry["may_be_reassigned_by_old_rule"] = bool(pending)
+                if pending:
+                    flagged += 1
+                    entry["warning"] = _rule_warning(
+                        [r.get("name") or r["automation_id"] for r in pending],
+                        _rule_effects(pending, names) or ["change the assignees"],
+                    )
+                if check.get("feed_incomplete"):
+                    entry["rule_check_note"] = (
+                        "Only the newest part of this process's activity was read, so a rule "
+                        "shown as not fired may have fired earlier."
+                    )
+            open_tasks.append(entry)
+
+    result["summary"] = {
+        "processes_in_motion": processes_total,
+        "processes_read": len(processes),
+        "open_tasks": len(open_tasks),
+        "processes_with_this_task_completed": completed,
+        "processes_where_this_step_is_not_open": not_open,
+        "open_tasks_an_old_rule_may_reassign": flagged,
+        "open_tasks_not_checked_for_old_rules": unchecked,
+    }
+    result["open_tasks"] = open_tasks
+    if not processes_complete:
+        result["limits"].append(
+            f"Only the first {PAGE_SIZE * MAX_RUN_PAGES} running processes of each status were "
+            f"read, of {processes_total}."
+        )
+    if checks_stopped:
+        result["limits"].append(
+            "The time for this call ran out before every open task's process was checked for "
+            "old assignment rules; those tasks say not checked."
+        )
+    if not names.complete:
+        result["limits"].append("Some people are shown by id only, because not every name was read.")
+    if not result["limits"]:
+        result.pop("limits")
+    return compact_dict_list_field(
+        sanitize_for_user_text(result), "open_tasks", item_label="open tasks"
+    )
+
+
+def find_open_tasks(sdk, org_id: str, template_id: str, step_id: str,
+                    started: float) -> Dict[str, Any]:
+    """The reads behind ``find_open_tasks_for_step``, in order of importance."""
+    deadline = started + OPTIONAL_READS_BUDGET_SECONDS
+    template = read_template_with_steps(sdk, org_id, template_id)
+    if not any(s.get("id") == step_id for s in template["steps"]):
+        raise ToolError(
+            f"Step {step_id} is not a step of the template {_quoted(template.get('title'))}. "
+            "get_template_steps lists its steps and their ids."
+        )
+    processes, complete, total = read_processes_in_motion(sdk, org_id, template_id)
+
+    rule_checks: Dict[str, Dict[str, Any]] = {}
+    state: Dict[str, Any] = {}
+    checks_stopped = False
+    for process in processes:
+        if not any(t.get("status") in OPEN_TASK_STATUSES for t in _tasks_for_step(process, step_id)):
+            continue
+        if time.monotonic() >= deadline:
+            checks_stopped = True
+            break
+        try:
+            version = read_launched_version(sdk, org_id, process["id"])
+        except TallyfyError as exc:
+            logger.info("Could not read the launched version of %s: %s", process["id"], exc)
+            continue
+        if version is None:
+            continue
+        rules = _assignment_rules_for_step(version, step_id)
+        executed: Set[str] = set()
+        feed_complete = True
+        if rules:
+            try:
+                executed, feed_complete = read_executed_automations(sdk, org_id, process["id"], state)
+            except TallyfyError as exc:
+                logger.info("Could not read the rule checks of %s: %s", process["id"], exc)
+                continue
+        older = bool(version.get("archived_at")) or (
+            bool(version.get("last_updated")) and bool(template.get("last_updated"))
+            and version.get("last_updated") != template.get("last_updated")
+        )
+        rule_checks[process["id"]] = {
+            "older_version": older,
+            "pending": [
+                _describe_rule(rule, version, template["steps"]) for rule in rules
+                if rule["automation"]["id"] not in executed
+            ],
+            "feed_incomplete": bool(rules) and not feed_complete,
+        }
+
+    names = _Names()
+    wanted_users: Set[Any] = set()
+    wanted_groups: Set[Any] = set()
+    for rule in _assignment_rules_for_step(template, step_id):
+        for action in rule["actions"]:
+            names.collect(_buckets(action.get("assignees")), wanted_users, wanted_groups)
+    for process in processes:
+        for task in _tasks_for_step(process, step_id):
+            if task.get("status") in OPEN_TASK_STATUSES:
+                names.collect(_buckets(task.get("owners")), wanted_users, wanted_groups)
+    for check in rule_checks.values():
+        for rule in check["pending"]:
+            for action in rule["actions"]:
+                names.collect(action["assignees"], wanted_users, wanted_groups)
+    names.read(sdk, org_id, wanted_users, wanted_groups, deadline)
+
+    return build_open_tasks_answer(
+        template, step_id, processes,
+        processes_complete=complete, processes_total=total,
+        rule_checks=rule_checks, names=names, checks_stopped=checks_stopped,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -901,4 +1414,63 @@ def register_automation_history_tools(mcp):
             tasks_complete=tasks_complete,
             task_id=task_id or None,
         )
+        return ToolResult(content=result, structured_content=None)
+
+    @mcp.tool(
+        name="find_open_tasks_for_step",
+        description=(
+            "Lists the open tasks for one step of a template across every process still "
+            "running from it, whichever version of the template each launched from, with each "
+            "task's current assignees. REQUIRED: 'template_id' and 'step_id' (both "
+            "32-character hex; the step id as get_template_steps returns it).\n\n"
+            "A task is open when it is not started or in progress, and a process counts as "
+            "running when it is active or has a problem reported. Processes where the task is "
+            "completed, hidden, or missing from the version they launched from are counted in "
+            "'summary' and not listed.\n\n"
+            "Each process runs the automation rules of the template version it launched from, "
+            "so a rule changed on the template today never reaches it. Tallyfy fires a rule at "
+            "most once per process: one that has fired cannot fire again, and one that has not "
+            "can still fire on a later completion and set the assignees again. For each open "
+            "task, 'old_assignment_rules' lists the assignment rules of its launched version "
+            "that target this step and have not fired there, and "
+            "'may_be_reassigned_by_old_rule' is true when there is one, false when there is "
+            "none, and null when this call ran out of time to check; 'warning' says it in a "
+            "sentence. 'assignment_rules_now' holds the template's current assignment rules "
+            "for the step, with the people they name.\n\n"
+            "An unknown template id is an error, and a template with no running processes "
+            "returns an empty 'open_tasks'. Read-only: it changes nothing. update_task with "
+            "'owners' is what changes a task's assignees."
+        ),
+        tags=["automation", "history", "process", "task", "assignment", "read-only"],
+        annotations=ToolAnnotations(
+            title="Find the open tasks for a step in running processes",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None,
+    )
+    @track_tool_execution("find_open_tasks_for_step")
+    @handle_tallyfy_errors("find open tasks for step")
+    def find_open_tasks_for_step(
+        template_id: TemplateId,
+        step_id: StepId,
+    ) -> GenericDict:
+        """
+        List the open tasks for one template step across the processes still running.
+
+        Args:
+            template_id: The template, 32-character hex. Covers every version of it.
+            step_id: One step of that template, 32-character hex.
+
+        Returns:
+            template, step, assignment_rules_now, summary, open_tasks (each with its
+            process, current assignees, old_assignment_rules,
+            may_be_reassigned_by_old_rule and warning) and, when a cap was hit, limits.
+        """
+        started = time.monotonic()
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            result = find_open_tasks(sdk, org_id, template_id, step_id, started)
         return ToolResult(content=result, structured_content=None)

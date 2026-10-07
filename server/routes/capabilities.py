@@ -52,7 +52,7 @@ CATEGORY_DESCRIPTIONS = [
     ("Universal API Fallback", "api_fallback", "Catch-all read and write access to any Tallyfy REST API endpoint"),
     ("Org Memory", "org_context", "Per-organization curated memory document: read and full-rewrite update, stored server-side"),
     ("File Management", "file_management", "Read and upload files attached to form fields, kickoff fields and task comments"),
-    ("Automation History", "automation_history", "Why a step in a running process is shown or hidden, read from the rule checks Tallyfy recorded"),
+    ("Automation History", "automation_history", "Why a step in a running process is shown or hidden, and which running processes still hold a step open, read from what Tallyfy recorded"),
 ]
 
 _breakdown_cache: list | None = None

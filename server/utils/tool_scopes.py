@@ -325,6 +325,14 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "explain_step_visibility": frozenset(
         {MCPScopes.PROCESSES_READ, MCPScopes.AUTOMATION_READ}
     ),
+    # tallyfy/mcp#1438. Reads a template, the processes running from it with
+    # their tasks, and the rules and rule checks of each launched version, and
+    # changes nothing. Three families, because the answer is about a template,
+    # its processes AND their rules. Names are read best effort and are not
+    # required, so the users family is left out.
+    "find_open_tasks_for_step": frozenset(
+        {MCPScopes.TEMPLATES_READ, MCPScopes.PROCESSES_READ, MCPScopes.AUTOMATION_READ}
+    ),
     "create_automation_rule": _AUTO_W,
     "update_automation_rule": _AUTO_W,
     "delete_automation_rule": _AUTO_W,
