@@ -58,7 +58,8 @@ step open, who has it now, and could an old rule still move it. Read on api-v2
   (``BaseAction::applyAssignmentActionOnTarget``).
 * The feed filter ``type=execution&verb=executed`` exists on api-v2 master since
   c2727ed4 (#11092) and answers 422 where it does not, so the tool falls back to
-  paging the whole feed.
+  paging the whole feed. Either read stops when the call's time budget runs
+  out, and that process is then reported as not checked (tallyfy/mcp#1520).
 """
 
 import logging
@@ -76,7 +77,7 @@ from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentia
 from utils.fastmcp_errors import handle_tallyfy_errors
 from utils.fastmcp_types import GenericDict, OptionalTaskId, ProcessId, StepId, TemplateId
 from utils.response_sanitizer import sanitize_for_user_text
-from utils.sdk_serializer import compact_dict_list_field
+from utils.sdk_serializer import _largest_prefix_that_fits, compact_dict_list_field
 
 logger = logging.getLogger(__name__)
 
@@ -236,12 +237,27 @@ def read_run_with_version(sdk, org_id: str, process_id: str) -> Dict[str, Any]:
     return run
 
 
-def _read_pages(sdk, endpoint: str, params: Dict[str, Any], max_pages: int) -> Tuple[List[dict], bool, Optional[int]]:
-    """Every row of a paginated read, whether the read was complete, and the total."""
+class OutOfTime(Exception):
+    """The call's time budget ran out before the next page of a read.
+
+    Raised rather than returned, so a caller cannot mistake a read the clock
+    cut short for one that reached the end or the page cap.
+    """
+
+
+def _read_pages(sdk, endpoint: str, params: Dict[str, Any], max_pages: int,
+                deadline: Optional[float] = None) -> Tuple[List[dict], bool, Optional[int]]:
+    """Every row of a paginated read, whether the read was complete, and the total.
+
+    With ``deadline`` (a ``time.monotonic()`` value), no page is requested once
+    it has passed; ``OutOfTime`` is raised instead (tallyfy/mcp#1520).
+    """
     rows: List[dict] = []
     total: Optional[int] = None
     page = 1
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise OutOfTime(endpoint)
         response = sdk._make_request(
             "GET", endpoint, params={**params, "per_page": PAGE_SIZE, "page": page}
         )
@@ -266,17 +282,20 @@ def read_run_tasks(sdk, org_id: str, process_id: str) -> Tuple[List[dict], bool]
     return rows, complete
 
 
-def read_automation_checks(sdk, org_id: str, process_id: str) -> Tuple[List[dict], bool, Optional[int]]:
+def read_automation_checks(sdk, org_id: str, process_id: str,
+                           deadline: Optional[float] = None) -> Tuple[List[dict], bool, Optional[int]]:
     """The run's activity feed, filtered to rule evaluations.
 
     Returns the evaluation rows, whether the WHOLE feed was read, and how many
-    feed rows exist in total.
+    feed rows exist in total. With ``deadline``, raises ``OutOfTime`` rather
+    than read a page after it.
     """
     rows, complete, total = _read_pages(
         sdk,
         f"organizations/{org_id}/activity-feeds",
         {"entity_type": "run", "entity_id": process_id},
         MAX_FEED_PAGES,
+        deadline,
     )
     checks = [
         r for r in rows
@@ -875,6 +894,14 @@ OPTIONAL_READS_BUDGET_SECONDS = 18.0
 
 MAX_NAME_LOOKUPS = 25
 
+#: Open tasks listed per call; ``offset`` reaches the rest (tallyfy/mcp#1520).
+#: Each process on a page costs up to two reads for its rule check, so a page
+#: is sized for the time budget as well as the 25,000 byte result cap. The
+#: recorded staging task with an old rule and its warning encodes to about
+#: 1,500 bytes, so ten fit with room; a page that still does not fit is cut
+#: further, and the next offset says where the next call starts.
+OPEN_TASKS_PAGE_SIZE = 10
+
 _VERB_EFFECT = {
     "assign_only": "replace the assignees with",
     "assign": "add",
@@ -969,12 +996,18 @@ def _executed_automation_ids(rows: List[dict], process_id: str) -> Set[str]:
 
 
 def read_executed_automations(sdk, org_id: str, process_id: str,
-                              state: Dict[str, Any]) -> Tuple[Set[str], bool]:
+                              state: Dict[str, Any],
+                              deadline: Optional[float] = None) -> Tuple[Set[str], bool]:
     """Ids of the automations that have executed in the process, and whether all were read.
 
     Asks for the executed rows only. Where api-v2 refuses that filter with a
     422, it pages the whole feed instead and stops asking for the rest of this
     call. The verb and type are checked here either way.
+
+    Both reads stop at ``deadline`` and raise ``OutOfTime``. The whole-feed
+    read is the one that needs it: production api-v2 refuses the filter, so
+    there a process with a long feed costs up to 20 pages, about 1.1 seconds
+    each on staging (tallyfy/mcp#1520).
     """
     if state.get("feed_filter", True):
         try:
@@ -984,13 +1017,14 @@ def read_executed_automations(sdk, org_id: str, process_id: str,
                 {"entity_type": "run", "entity_id": process_id,
                  "type": "execution", "verb": "executed"},
                 MAX_FEED_PAGES,
+                deadline,
             )
             return _executed_automation_ids(rows, process_id), complete
         except TallyfyError as exc:
             if getattr(exc, "status_code", None) != 422:
                 raise
             state["feed_filter"] = False
-    checks, complete, _total = read_automation_checks(sdk, org_id, process_id)
+    checks, complete, _total = read_automation_checks(sdk, org_id, process_id, deadline)
     return _executed_automation_ids(checks, process_id), complete
 
 
@@ -1020,7 +1054,14 @@ def _assignment_rules_for_step(document: Dict[str, Any], step_id: str) -> List[D
 
 
 class _Names:
-    """Best-effort names for user and group ids, read once each and capped."""
+    """Best-effort names for user and group ids, read once each and capped.
+
+    ``complete`` is False whenever an id was not named: the lookup cap or the
+    time budget ran out, or a lookup failed (a 403 for a standard member, a 404
+    for a removed user, any other error, or a body with no record). A failed
+    lookup used to be skipped with ``complete`` left True, so the result said
+    nothing while showing a bare id (tallyfy/mcp#1515).
+    """
 
     def __init__(self):
         self.users: Dict[Any, Dict[str, Any]] = {}
@@ -1041,10 +1082,13 @@ class _Names:
                 return
             try:
                 response = sdk._make_request("GET", f"organizations/{org_id}/{kind}/{key}")
-            except TallyfyError:
+            except TallyfyError as exc:
+                logger.info("Could not read the name of %s %s: %s", kind, key, exc)
+                self.complete = False
                 continue
             data = response.get("data") if isinstance(response, dict) else None
             if not isinstance(data, dict):
+                self.complete = False
                 continue
             if kind == "users":
                 name = data.get("full_name") or " ".join(
@@ -1170,105 +1214,165 @@ def _rule_warning(names: List[str], effects: List[str]) -> str:
     )
 
 
+def _open_tasks_in_order(processes: List[dict], step_id: str) -> List[Tuple[dict, dict]]:
+    """Every open task for the step, as ``(process, task)``, in a fixed order.
+
+    Sorted by process name, then process id and task id, so two calls list the
+    tasks in the same order and an offset taken from one page starts the next
+    page where it left off. api-v2's own order is not relied on.
+    """
+    pairs = [
+        (process, task)
+        for process in processes
+        for task in _tasks_for_step(process, step_id)
+        if task.get("status") in OPEN_TASK_STATUSES
+    ]
+    return sorted(pairs, key=lambda pair: (
+        str(_clean_name(pair[0].get("name")) or "").casefold(),
+        str(pair[0].get("id")),
+        str(pair[1].get("id")),
+    ))
+
+
+def _page_of(pairs: List[Tuple[dict, dict]], offset: int) -> List[Tuple[dict, dict]]:
+    return pairs[offset:offset + OPEN_TASKS_PAGE_SIZE]
+
+
+def _open_task_entry(process: Dict[str, Any], task: Dict[str, Any],
+                     check: Optional[Dict[str, Any]], names: _Names) -> Dict[str, Any]:
+    entry: Dict[str, Any] = {
+        "process_id": process["id"],
+        "process_name": _clean_name(process.get("name")),
+        "process_status": process.get("status"),
+        "task_id": task.get("id"),
+        "task_title": task.get("title"),
+        "task_status": task.get("status"),
+        "current_assignees": names.people(_buckets(task.get("owners"))),
+    }
+    if task.get("deadline"):
+        entry["deadline"] = task.get("deadline")
+    if check is None:
+        entry["may_be_reassigned_by_old_rule"] = None
+        entry["warning"] = (
+            "Not checked in this call, so whether a rule from the version this "
+            "process launched with can still reassign this task is not known."
+        )
+        return entry
+    entry["launched_from_older_version"] = check["older_version"]
+    pending = check["pending"]
+    entry["old_assignment_rules"] = [_render_rule(r, names) for r in pending]
+    entry["may_be_reassigned_by_old_rule"] = bool(pending)
+    if pending:
+        entry["warning"] = _rule_warning(
+            [r.get("name") or r["automation_id"] for r in pending],
+            _rule_effects(pending, names) or ["change the assignees"],
+        )
+    if check.get("feed_incomplete"):
+        entry["rule_check_note"] = (
+            "Only the newest part of this process's activity was read, so a rule "
+            "shown as not fired may have fired earlier."
+        )
+    return entry
+
+
 def build_open_tasks_answer(template: Dict[str, Any], step_id: str, processes: List[dict], *,
                             processes_complete: bool, processes_total: int,
                             rule_checks: Dict[str, Dict[str, Any]], names: _Names,
-                            checks_stopped: bool) -> Dict[str, Any]:
-    """Assemble the answer. Pure, so the unit tests drive it with recorded bodies."""
-    step = next((s for s in template["steps"] if s.get("id") == step_id), {})
-    result: Dict[str, Any] = {
-        "template": {"id": template.get("id"), "title": template.get("title")},
-        "step": {"id": step_id, "title": step.get("title"), "position": step.get("position")},
-        "assignment_rules_now": [],
-        "limits": [],
-    }
-    for rule in _assignment_rules_for_step(template, step_id):
-        result["assignment_rules_now"].append(_render_rule(_describe_rule(rule, template), names))
+                            checks_stopped: bool, offset: int = 0) -> Dict[str, Any]:
+    """Assemble the answer for one page of open tasks, starting at ``offset``.
 
-    open_tasks: List[Dict[str, Any]] = []
+    The counts in ``summary`` cover every process read. ``open_tasks`` holds at
+    most ``OPEN_TASKS_PAGE_SIZE`` tasks, fewer when they do not fit the 25,000
+    byte result cap; ``summary.next_offset`` and a line in ``limits`` say where
+    the next call starts (tallyfy/mcp#1520). Before that the list was cut to fit
+    with no way to reach the rest.
+    """
+    step = next((s for s in template["steps"] if s.get("id") == step_id), {})
+    rules_now = [
+        _render_rule(_describe_rule(rule, template), names)
+        for rule in _assignment_rules_for_step(template, step_id)
+    ]
+
     completed = 0
     not_open = 0
-    flagged = 0
-    unchecked = 0
     for process in processes:
         tasks = _tasks_for_step(process, step_id)
-        open_here = [t for t in tasks if t.get("status") in OPEN_TASK_STATUSES]
-        if not open_here:
-            if tasks and all(t.get("status") == COMPLETED_STATUS for t in tasks):
-                completed += 1
-            else:
-                not_open += 1
+        if any(t.get("status") in OPEN_TASK_STATUSES for t in tasks):
             continue
-        check = rule_checks.get(process["id"])
-        for task in open_here:
-            entry: Dict[str, Any] = {
-                "process_id": process["id"],
-                "process_name": _clean_name(process.get("name")),
-                "process_status": process.get("status"),
-                "task_id": task.get("id"),
-                "task_title": task.get("title"),
-                "task_status": task.get("status"),
-                "current_assignees": names.people(_buckets(task.get("owners"))),
-            }
-            if task.get("deadline"):
-                entry["deadline"] = task.get("deadline")
-            if check is None:
-                entry["may_be_reassigned_by_old_rule"] = None
-                entry["warning"] = (
-                    "Not checked in this call, so whether a rule from the version this "
-                    "process launched with can still reassign this task is not known."
-                )
-                unchecked += 1
-            else:
-                entry["launched_from_older_version"] = check["older_version"]
-                pending = check["pending"]
-                entry["old_assignment_rules"] = [_render_rule(r, names) for r in pending]
-                entry["may_be_reassigned_by_old_rule"] = bool(pending)
-                if pending:
-                    flagged += 1
-                    entry["warning"] = _rule_warning(
-                        [r.get("name") or r["automation_id"] for r in pending],
-                        _rule_effects(pending, names) or ["change the assignees"],
-                    )
-                if check.get("feed_incomplete"):
-                    entry["rule_check_note"] = (
-                        "Only the newest part of this process's activity was read, so a rule "
-                        "shown as not fired may have fired earlier."
-                    )
-            open_tasks.append(entry)
+        if tasks and all(t.get("status") == COMPLETED_STATUS for t in tasks):
+            completed += 1
+        else:
+            not_open += 1
 
-    result["summary"] = {
-        "processes_in_motion": processes_total,
-        "processes_read": len(processes),
-        "open_tasks": len(open_tasks),
-        "processes_with_this_task_completed": completed,
-        "processes_where_this_step_is_not_open": not_open,
-        "open_tasks_an_old_rule_may_reassign": flagged,
-        "open_tasks_not_checked_for_old_rules": unchecked,
-    }
-    result["open_tasks"] = open_tasks
-    if not processes_complete:
-        result["limits"].append(
-            f"Only the first {PAGE_SIZE * MAX_RUN_PAGES} running processes of each status were "
-            f"read, of {processes_total}."
-        )
-    if checks_stopped:
-        result["limits"].append(
-            "The time for this call ran out before every open task's process was checked for "
-            "old assignment rules; those tasks say not checked."
-        )
-    if not names.complete:
-        result["limits"].append("Some people are shown by id only, because not every name was read.")
-    if not result["limits"]:
-        result.pop("limits")
-    return compact_dict_list_field(
-        sanitize_for_user_text(result), "open_tasks", item_label="open tasks"
-    )
+    pairs = _open_tasks_in_order(processes, step_id)
+    total = len(pairs)
+    entries = [
+        _open_task_entry(process, task, rule_checks.get(process["id"]), names)
+        for process, task in _page_of(pairs, offset)
+    ]
+
+    def assemble(count: int) -> Dict[str, Any]:
+        shown = entries[:count]
+        summary: Dict[str, Any] = {
+            "processes_in_motion": processes_total,
+            "processes_read": len(processes),
+            "open_tasks": total,
+            "open_tasks_returned": len(shown),
+            "offset": offset,
+            "processes_with_this_task_completed": completed,
+            "processes_where_this_step_is_not_open": not_open,
+            "open_tasks_an_old_rule_may_reassign": sum(
+                1 for e in shown if e["may_be_reassigned_by_old_rule"] is True),
+            "open_tasks_not_checked_for_old_rules": sum(
+                1 for e in shown if e["may_be_reassigned_by_old_rule"] is None),
+        }
+        limits: List[str] = []
+        if offset + len(shown) < total:
+            summary["next_offset"] = offset + len(shown)
+            limits.append(
+                f"Open tasks {offset + 1} to {offset + len(shown)} of {total} are listed. "
+                f"The rest are not in this result: call again with offset="
+                f"{offset + len(shown)} for the next ones."
+            )
+        if not processes_complete:
+            limits.append(
+                f"Only the first {PAGE_SIZE * MAX_RUN_PAGES} running processes of each "
+                f"status were read, of {processes_total}."
+            )
+        if checks_stopped:
+            limits.append(
+                "The time for this call ran out before every open task's process was "
+                "checked for old assignment rules; those tasks say not checked."
+            )
+        if not names.complete:
+            limits.append(
+                "Some people are shown by id only, because not every name was read."
+            )
+        result: Dict[str, Any] = {
+            "template": {"id": template.get("id"), "title": template.get("title")},
+            "step": {"id": step_id, "title": step.get("title"), "position": step.get("position")},
+            "assignment_rules_now": rules_now,
+            "summary": summary,
+            "open_tasks": shown,
+        }
+        if limits:
+            result["limits"] = limits
+        return sanitize_for_user_text(result)
+
+    if not entries:
+        return assemble(0)
+    # The one binary search the other list trims use (rule 16 in the repo
+    # CLAUDE.md). It counts the next-offset line in every trial.
+    return assemble(_largest_prefix_that_fits(len(entries), assemble))
 
 
 def find_open_tasks(sdk, org_id: str, template_id: str, step_id: str,
-                    started: float) -> Dict[str, Any]:
-    """The reads behind ``find_open_tasks_for_step``, in order of importance."""
+                    started: float, offset: int = 0) -> Dict[str, Any]:
+    """The reads behind ``find_open_tasks_for_step``, in order of importance.
+
+    Only the processes holding a task on the requested page are checked for old
+    rules, so a later page gets the same time budget as the first.
+    """
     deadline = started + OPTIONAL_READS_BUDGET_SECONDS
     template = read_template_with_steps(sdk, org_id, template_id)
     if not any(s.get("id") == step_id for s in template["steps"]):
@@ -1278,12 +1382,23 @@ def find_open_tasks(sdk, org_id: str, template_id: str, step_id: str,
         )
     processes, complete, total = read_processes_in_motion(sdk, org_id, template_id)
 
+    pairs = _open_tasks_in_order(processes, step_id)
+    if offset and offset >= len(pairs):
+        raise ToolError(
+            f"offset={offset} is past the end: this step has {len(pairs)} open tasks "
+            f"now, so the largest offset is {max(len(pairs) - 1, 0)}. offset=0 lists "
+            "them from the start."
+        )
+    page = _page_of(pairs, offset)
+    page_processes: List[dict] = []
+    for process, _task in page:
+        if all(p["id"] != process["id"] for p in page_processes):
+            page_processes.append(process)
+
     rule_checks: Dict[str, Dict[str, Any]] = {}
     state: Dict[str, Any] = {}
     checks_stopped = False
-    for process in processes:
-        if not any(t.get("status") in OPEN_TASK_STATUSES for t in _tasks_for_step(process, step_id)):
-            continue
+    for process in page_processes:
         if time.monotonic() >= deadline:
             checks_stopped = True
             break
@@ -1299,7 +1414,15 @@ def find_open_tasks(sdk, org_id: str, template_id: str, step_id: str,
         feed_complete = True
         if rules:
             try:
-                executed, feed_complete = read_executed_automations(sdk, org_id, process["id"], state)
+                executed, feed_complete = read_executed_automations(
+                    sdk, org_id, process["id"], state, deadline
+                )
+            except OutOfTime:
+                # A feed cut short by the clock cannot say which rules have not
+                # fired, so this process is left not checked, like the ones the
+                # loop never reaches (tallyfy/mcp#1520).
+                checks_stopped = True
+                break
             except TallyfyError as exc:
                 logger.info("Could not read the rule checks of %s: %s", process["id"], exc)
                 continue
@@ -1322,10 +1445,8 @@ def find_open_tasks(sdk, org_id: str, template_id: str, step_id: str,
     for rule in _assignment_rules_for_step(template, step_id):
         for action in rule["actions"]:
             names.collect(_buckets(action.get("assignees")), wanted_users, wanted_groups)
-    for process in processes:
-        for task in _tasks_for_step(process, step_id):
-            if task.get("status") in OPEN_TASK_STATUSES:
-                names.collect(_buckets(task.get("owners")), wanted_users, wanted_groups)
+    for _process, task in page:
+        names.collect(_buckets(task.get("owners")), wanted_users, wanted_groups)
     for check in rule_checks.values():
         for rule in check["pending"]:
             for action in rule["actions"]:
@@ -1336,6 +1457,7 @@ def find_open_tasks(sdk, org_id: str, template_id: str, step_id: str,
         template, step_id, processes,
         processes_complete=complete, processes_total=total,
         rule_checks=rule_checks, names=names, checks_stopped=checks_stopped,
+        offset=offset,
     )
 
 
@@ -1422,7 +1544,8 @@ def register_automation_history_tools(mcp):
             "Lists the open tasks for one step of a template across every process still "
             "running from it, whichever version of the template each launched from, with each "
             "task's current assignees. REQUIRED: 'template_id' and 'step_id' (both "
-            "32-character hex; the step id as get_template_steps returns it).\n\n"
+            "32-character hex; the step id as get_template_steps returns it). OPTIONAL: "
+            "'offset', the number of open tasks to skip, 0 by default.\n\n"
             "A task is open when it is not started or in progress, and a process counts as "
             "running when it is active or has a problem reported. Processes where the task is "
             "completed, hidden, or missing from the version they launched from are counted in "
@@ -1437,6 +1560,11 @@ def register_automation_history_tools(mcp):
             "none, and null when this call ran out of time to check; 'warning' says it in a "
             "sentence. 'assignment_rules_now' holds the template's current assignment rules "
             "for the step, with the people they name.\n\n"
+            f"At most {OPEN_TASKS_PAGE_SIZE} open tasks are listed per call, ordered by "
+            "process name. "
+            "'summary.open_tasks' counts all of them and 'summary.open_tasks_returned' the "
+            "ones listed; when more remain, 'summary.next_offset' is the 'offset' that lists "
+            "the next ones, and 'limits' says so.\n\n"
             "An unknown template id is an error, and a template with no running processes "
             "returns an empty 'open_tasks'. Read-only: it changes nothing. update_task with "
             "'owners' is what changes a task's assignees."
@@ -1456,6 +1584,7 @@ def register_automation_history_tools(mcp):
     def find_open_tasks_for_step(
         template_id: TemplateId,
         step_id: StepId,
+        offset: int = 0,
     ) -> GenericDict:
         """
         List the open tasks for one template step across the processes still running.
@@ -1463,14 +1592,21 @@ def register_automation_history_tools(mcp):
         Args:
             template_id: The template, 32-character hex. Covers every version of it.
             step_id: One step of that template, 32-character hex.
+            offset: How many open tasks to skip, 0 or more. A result that does
+                not hold every open task gives the next value as
+                summary.next_offset (tallyfy/mcp#1520).
 
         Returns:
-            template, step, assignment_rules_now, summary, open_tasks (each with its
-            process, current assignees, old_assignment_rules,
-            may_be_reassigned_by_old_rule and warning) and, when a cap was hit, limits.
+            template, step, assignment_rules_now, summary (with open_tasks,
+            open_tasks_returned, offset and, when more remain, next_offset),
+            open_tasks (each with its process, current assignees,
+            old_assignment_rules, may_be_reassigned_by_old_rule and warning) and,
+            when a cap was hit or the list was cut, limits.
         """
+        if offset < 0:
+            raise ToolError(f"offset must be 0 or more, got {offset}.")
         started = time.monotonic()
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = find_open_tasks(sdk, org_id, template_id, step_id, started)
+            result = find_open_tasks(sdk, org_id, template_id, step_id, started, offset)
         return ToolResult(content=result, structured_content=None)
