@@ -22,7 +22,7 @@ from utils.authoring_payloads import (
     AutomationRuleUpdateData,
     documented_payload,
 )
-from utils.sdk_serializer import serialize_dataclass
+from utils.sdk_serializer import MAX_RESULT_BYTES, compact_dict_list_field, serialize_dataclass
 from template_testing.references import orphaned_reference_ids
 from template_testing.checks import PLAN_STATE_ACTIVE, PLAN_STATE_INACTIVE
 from template_testing.document import NotATemplateDocument
@@ -44,6 +44,63 @@ import logging
 
 
 logger = logging.getLogger(__name__)
+
+
+def _bounded_automation_read(result, list_key: str, item_label: str, secondary=None):
+    """Keep an automation read under the response ceiling, and say when it does not fit.
+
+    ``analyze_template_automations`` and ``suggest_automation_consolidation``
+    returned their lists with no size control, so a template with enough rules
+    went over the ceiling and the client cut it with nothing saying so
+    (tallyfy/mcp#986, reproduced on staging: 60 rules answered 42,551 bytes).
+    The shared trimmer adds ``_truncated: "Showing N of M <item_label>"`` only
+    when it actually trims, and leaves every other key alone, so the totals
+    beside the list stay true.
+
+    ``secondary`` is an optional ``(key, label)`` for a second list that can
+    still hold the result over the ceiling after the first is trimmed. On
+    analyze that is ``redundant_groups``: every group names each of its rules
+    with an alias, so a template of 120 identical rules is still about 28 KB
+    with its ``automations`` cut. The primary list is trimmed first, because
+    the groups are what tell the model those rules are duplicates. The first
+    marker rides in a placeholder key while the second list is measured, so the
+    final, combined marker is shorter than what was measured and the result
+    cannot land over the ceiling.
+
+    KNOWN BOUNDARY, the same one every caller of the shared trimmer has: it
+    never returns fewer than one item, so ONE group that is itself over the
+    ceiling (well over a hundred identical rules with long aliases) still comes
+    back over it. The ``automations`` note is still there; no false note is
+    added for the group.
+
+    This sits at module level on purpose. A tool body that names
+    ``compact_dict_list_field`` joins the template-read sweep in
+    ``test_tool_descriptions.py``, whose required tokens are about template
+    steps. These reads carry their own guard,
+    ``TestAutomationReadsAreBounded``.
+    """
+    bounded = compact_dict_list_field(result, list_key, item_label=item_label)
+    encoded = len(json.dumps(bounded, separators=(",", ":"), default=str))
+    if secondary is None or encoded <= MAX_RESULT_BYTES:
+        return bounded
+
+    key, label = secondary
+    before = bounded.get(key)
+    first = bounded.pop("_truncated", None)
+    if first is not None:
+        bounded["_truncated_primary"] = first
+    bounded = compact_dict_list_field(bounded, key, item_label=label)
+    first = bounded.pop("_truncated_primary", None)
+    second = bounded.pop("_truncated", None)
+    # The shared trimmer never keeps fewer than one item, so a single group
+    # over the ceiling comes back whole with "Showing 1 of 1". That note would
+    # be false, so it is dropped and only a real cut is reported.
+    if isinstance(before, list) and len(bounded.get(key) or []) == len(before):
+        second = None
+    notes = [note for note in (first, second) if note]
+    if notes:
+        bounded["_truncated"] = "; ".join(notes)
+    return bounded
 
 
 def register_automation_tools(mcp):
@@ -1077,7 +1134,8 @@ when they ask for analysis.
 RETURNS: template_id, template_title, automations (every rule in full: its
 conditions, its then_actions, their targets and ids), step_lookup (step id ->
 title), redundant_groups (pre-computed duplicates and merge candidates),
-total_automations, total_steps.
+total_automations, total_steps. Over the size limit, automations (then
+redundant_groups) are cut and `_truncated` says "Showing N of M"; totals stay true.
 
 HIDDEN AT LAUNCH: a step targeted by a "visibility"/"show" action starts HIDDEN
 in every process launched from this template, revealed when the rule fires. That
@@ -1133,15 +1191,20 @@ REQUIRED: 'template_id'.""",
             redundant_groups = _detect_redundant_groups(automations)
 
             return ToolResult(
-                content={
-                    'template_id': template_id,
-                    'template_title': template.title,
-                    'automations': automations,
-                    'step_lookup': step_lookup,
-                    'redundant_groups': redundant_groups,
-                    'total_automations': len(automations),
-                    'total_steps': len(steps),
-                },
+                content=_bounded_automation_read(
+                    {
+                        'template_id': template_id,
+                        'template_title': template.title,
+                        'automations': automations,
+                        'step_lookup': step_lookup,
+                        'redundant_groups': redundant_groups,
+                        'total_automations': len(automations),
+                        'total_steps': len(steps),
+                    },
+                    'automations',
+                    'automation rules',
+                    secondary=('redundant_groups', 'redundant groups'),
+                ),
                 structured_content=None
             )
 
@@ -1309,6 +1372,7 @@ REQUIRED: 'template_id'.""",
 - `same_trigger_merge` (medium): same trigger, non-conflicting actions across rules. Recommended: merge via `update_automation_rule`, delete the rest.
 
 RETURN: {template_id, template_title, suggestions: [{type, priority:"high"|"medium"|"low", rule_ids, rules:[{id,alias}], description, recommended_action:"review"|"delete_duplicates"|"review_and_resolve"|"merge_actions"}], summary: {total_automations, total_suggestions, high_priority, medium_priority}}
+Over the size limit, low-priority suggestions are cut and `_truncated` says so; summary stays true.
 
 EXAMPLE: suggest_automation_consolidation(template_id="58c03f...") returns {template_title:"New hire onboarding", suggestions:[{type:"orphaned_rule",priority:"high",rule_ids:["3f8a1c0d9e2b4a6c8d0e1f2a3b4c5d6e"],orphaned_step_ids:["7a1b2c3d4e5f60718293a4b5c6d7e8f9"],recommended_action:"review"},{type:"exact_duplicate",priority:"high",rule_ids:["b1c2d3e4f5061728394a5b6c7d8e9f00","c2d3e4f5061728394a5b6c7d8e9f0011"],recommended_action:"delete_duplicates"}], summary:{total_automations:12,total_suggestions:5,high_priority:2}}. Remediation: "delete_duplicates" then `delete_automation_rule`; "merge_actions" then `update_automation_rule`; "review"/"review_and_resolve" then ask a human before deleting.
 
@@ -1379,18 +1443,24 @@ REQUIRED: 'template_id'. Never call without it.""",
                 automations, step_lookup, valid_capture_ids, valid_prerun_ids
             )
 
+            # Suggestions are sorted high priority first, so a trim keeps the
+            # most important ones, and the summary counts stay the true totals.
             return ToolResult(
-                content={
-                    'template_id': template_id,
-                    'template_title': template.title,
-                    'suggestions': suggestions,
-                    'summary': {
-                        'total_automations': len(automations),
-                        'total_suggestions': len(suggestions),
-                        'high_priority': sum(1 for s in suggestions if s['priority'] == 'high'),
-                        'medium_priority': sum(1 for s in suggestions if s['priority'] == 'medium'),
+                content=_bounded_automation_read(
+                    {
+                        'template_id': template_id,
+                        'template_title': template.title,
+                        'suggestions': suggestions,
+                        'summary': {
+                            'total_automations': len(automations),
+                            'total_suggestions': len(suggestions),
+                            'high_priority': sum(1 for s in suggestions if s['priority'] == 'high'),
+                            'medium_priority': sum(1 for s in suggestions if s['priority'] == 'medium'),
+                        },
                     },
-                },
+                    'suggestions',
+                    'suggestions',
+                ),
                 structured_content=None
             )
 
