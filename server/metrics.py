@@ -167,8 +167,26 @@ mcp_server_info.info({
 jwt_validation_total = Counter(
     'mcp_server_jwt_validation_total',
     'Total number of JWT validation attempts',
-    ['status']  # status: success, failed, invalid_token
+    ['status']  # status: one of JWT_VALIDATION_STATUSES
 )
+
+# Every status utils/tallyfy_auth_provider.py records. `expired` is recorded
+# before signature checking, `failed` when the signature or key does not check
+# out (and for every token when no verification key is configured), and
+# `invalid_token` when the audience check refuses a verified token.
+JWT_VALIDATION_STATUSES = ('success', 'expired', 'failed', 'invalid_token')
+
+# Published at 0 from import (tallyfy/mcp#1596). HighAuthFailureRate in
+# monitoring/prometheus/alerts.yml reads increase() over `failed` and
+# `invalid_token`. A labelled counter has no series until its first .labels()
+# call, so without this the first failure after a restart made the series
+# appear already at 1, which increase() reads as no increase, and
+# `invalid_token` had no series at all on 2026-10-14. Same reasoning as
+# initialize_auth_challenge_series below and the audit counter in
+# host/metrics.py.
+for _status in JWT_VALIDATION_STATUSES:
+    jwt_validation_total.labels(status=_status)
+del _status
 
 # Shadow census of WHO is presenting tokens here (tallyfy/mcp#743 AC1).
 #
@@ -286,6 +304,24 @@ auth_challenge_total = Counter(
     'mcp_server_auth_challenge_total',
     'Downstream 401 challenge decisions, by whether a challenge was issued',
     ['decision']  # see middleware.downstream_auth_challenge.CHALLENGE_DECISIONS
+)
+
+# Failed requests the durable failure record deliberately does NOT file
+# (tallyfy/mcp#1597), so the volume stays visible after it left the record.
+#   reason       no_credential: a 401 on the MCP transport to a request with
+#                no Authorization header, which is the protocol asking for a
+#                credential. no_route: a 404 from the catch-all route, to a
+#                request with no Authorization header.
+#   http_method  GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS or other.
+#   mcp_method   the JSON-RPC method from a closed list, none, or other.
+# Every label value is mapped onto a closed set in
+# middleware/request_logging.py before it gets here, because both methods come
+# from the caller. Before this change these requests were about 98% of the rows
+# in system_events for log_type='mcp'.
+durable_record_skipped_total = Counter(
+    'mcp_server_durable_record_skipped_total',
+    'Failed requests counted here instead of being filed to the durable record',
+    ['reason', 'http_method', 'mcp_method']
 )
 
 # ============================================================================
@@ -581,7 +617,7 @@ def record_jwt_validation(status: str):
     Record a JWT validation attempt.
 
     Args:
-        status: Validation status (success, failed, invalid_token)
+        status: Validation status, one of JWT_VALIDATION_STATUSES
     """
     jwt_validation_total.labels(status=status).inc()
 
@@ -624,6 +660,17 @@ def record_forwarded_token_freshness(state: str):
         state: one of utils.auth_context._FRESHNESS_STATES
     """
     forwarded_token_freshness_total.labels(state=state).inc()
+
+
+def record_durable_record_skip(reason: str, http_method: str, mcp_method: str):
+    """Count one failed request that was deliberately not filed durably.
+
+    Every argument must already be from a closed set; see the counter's
+    declaration and middleware/request_logging.py.
+    """
+    durable_record_skipped_total.labels(
+        reason=reason, http_method=http_method, mcp_method=mcp_method
+    ).inc()
 
 
 def record_auth_challenge(decision: str):

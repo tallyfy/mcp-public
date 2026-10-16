@@ -41,6 +41,7 @@ from utils.fastmcp_types import (
     OptionalBool,
     TopSecretFlag,
     PageNumber,
+    PageOffset,
 )
 from utils.sdk_serializer import (
     serialize_dataclass,
@@ -1147,6 +1148,7 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
     @handle_tallyfy_errors("get my tasks")
     def get_my_tasks(
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
         status: OptionalString = "active",
     ) -> ToolResult:
         """
@@ -1180,7 +1182,7 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             content = fetch_single_page(
                 sdk.tasks.get_my_tasks, org_id,
-                page=page,
+                page=page, page_offset=page_offset or 0,
                 status=status,
                 compact_fields=["step", "run", "taskdata"],
             )
@@ -1231,6 +1233,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         sort_by: OptionalString = "newest",
         status: OptionalString = "all",
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
     ) -> ToolResult:
         """
         Get tasks assigned to the given user in the organization.
@@ -1268,7 +1271,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             content = fetch_single_page(
                 sdk.tasks.get_user_tasks, org_id, resolved_user_id,
-                page=page,
+                page=page, page_offset=page_offset or 0,
                 compact_fields=["step", "run", "taskdata"],
                 sort_by=sort_by,
                 status=status,
@@ -1314,6 +1317,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         owners: OptionalString = None,
         groups: OptionalString = None,
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
     ) -> ToolResult:
         """
         Get tasks for a given process (run).
@@ -1345,7 +1349,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
             result = fetch_single_page(
                 sdk.tasks.get_tasks_for_process,
                 org_id,
-                page=page,
+                page=page, page_offset=page_offset or 0,
                 # `taskdata` holds every submitted form-field answer, so stripping it
                 # made the per-task tracker view show WHO has a task but never WHAT
                 # they answered. `step` stays stripped: it is the template-side step
@@ -2436,6 +2440,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         sort_by: OptionalString = "newest",
         status: OptionalString = "all",
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
     ) -> ToolResult:
         """
         Get tasks assigned to the given guest in the organization.
@@ -2466,7 +2471,7 @@ PAGINATION: Returns 20 tasks per page. Use page=2, page=3, etc. for more. meta.t
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             content = fetch_single_page(
                 sdk.users.get_guest_tasks, org_id, guest_id,
-                page=page,
+                page=page, page_offset=page_offset or 0,
                 compact_fields=["step", "run", "taskdata"],
                 sort_by=sort_by,
                 status=status,

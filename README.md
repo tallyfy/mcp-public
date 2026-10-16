@@ -34,12 +34,12 @@ Transport is streamable HTTP and authentication is OAuth against your Tallyfy ac
 
 ## What it can do
 
-122 tools across the Tallyfy domain, grouped by area:
+129 tools across the Tallyfy domain, grouped by area:
 
 | Area | Examples |
 |------|----------|
 | Tasks | create, complete, reassign, comment on, and search tasks |
-| Processes (runs) | launch a process from a template, advance and track steps |
+| Processes (runs) | launch a process from a template now or on a schedule, advance and track steps |
 | Templates (checklists) | read, create, and edit templates and their steps |
 | Form fields | read and populate kick-off and step form fields |
 | Automation | inspect and manage automated actions / rules, explain why a step in a running process is shown or hidden, and list the open tasks for a step across the processes still running |

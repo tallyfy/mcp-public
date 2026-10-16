@@ -18,7 +18,7 @@ from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
 from utils.fastmcp_errors import handle_tallyfy_errors
 from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
-from utils.fastmcp_types import SearchQuery, PageNumber, PageSize, OptionalBool
+from utils.fastmcp_types import SearchQuery, PageNumber, PageOffset, PageSize, OptionalBool
 from utils.pagination import fetch_single_page
 from utils.sdk_serializer import serialize_dataclass, compact_search_all_buckets
 from metrics import track_tool_execution
@@ -152,6 +152,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
     def search_for_tasks(
         query: SearchQuery,
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
         per_page: PageSize = 20,
         tags: OptionalBool = False,
     ) -> ToolResult:
@@ -178,7 +179,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
             page_payload = fetch_single_page(
                 sdk.searches.search_tasks,
                 org_id, query,
-                page=page, per_page=per_page, tags=tags,
+                page=page, page_offset=page_offset or 0, per_page=per_page, tags=tags,
             )
             # Issue #157: search API omits run_id; back-fill from
             # get_standalone_task for process tasks so the LLM can identify
@@ -226,6 +227,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
     def search_for_processes(
         query: SearchQuery,
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
         per_page: PageSize = 20,
         tags: OptionalBool = False,
     ) -> ToolResult:
@@ -247,7 +249,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
                 content=fetch_single_page(
                     sdk.searches.search_processes,
                     org_id, query,
-                    page=page, per_page=per_page, tags=tags,
+                    page=page, page_offset=page_offset or 0, per_page=per_page, tags=tags,
                 ),
                 structured_content=None,
             )
@@ -286,6 +288,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
     def search_for_templates(
         query: SearchQuery,
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
         per_page: PageSize = 20,
         tags: OptionalBool = False,
     ) -> ToolResult:
@@ -307,7 +310,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
                 content=fetch_single_page(
                     sdk.searches.search_templates,
                     org_id, query,
-                    page=page, per_page=per_page, tags=tags,
+                    page=page, page_offset=page_offset or 0, per_page=per_page, tags=tags,
                 ),
                 structured_content=None
             )
@@ -344,6 +347,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
     def search_for_snippets(
         query: SearchQuery,
         page: PageNumber = 1,
+        page_offset: PageOffset = 0,
         per_page: PageSize = 20,
     ) -> ToolResult:
         """
@@ -363,7 +367,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for more. meta
                 content=fetch_single_page(
                     sdk.searches.search_snippets,
                     org_id, query,
-                    page=page, per_page=per_page,
+                    page=page, page_offset=page_offset or 0, per_page=per_page,
                 ),
                 structured_content=None
             )

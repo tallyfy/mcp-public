@@ -23,6 +23,7 @@ from utils.fastmcp_types import (
     OptionalString,
     OptionalBool,
     PageNumber,
+    PageOffset,
     GenericDict
 )
 from utils.fastmcp_errors import handle_tallyfy_errors
@@ -241,7 +242,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for subsequent
     )
     @track_tool_execution("get_organization_users")
     @handle_tallyfy_errors("get organization users")
-    def get_organization_users(with_groups: OptionalBool = False, page: PageNumber = 1) -> GenericDict:
+    def get_organization_users(with_groups: OptionalBool = False, page: PageNumber = 1, page_offset: PageOffset = 0) -> GenericDict:
         """
         Get organization members with full profile data.
 
@@ -265,7 +266,7 @@ PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. for subsequent
                 content=fetch_single_page(
                     sdk.users.get_organization_users,
                     org_id,
-                    page=page,
+                    page=page, page_offset=page_offset or 0,
                     with_groups=with_groups,
                 ),
                 structured_content=None

@@ -196,9 +196,6 @@ RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 # Default items per page (20 keeps pages comfortably under 25KB cap)
 DEFAULT_PAGE_SIZE = 20
 
-# Maximum serialized JSON size for tool results (bytes)
-MAX_RESULT_SIZE_CHARS = 25_000
-
 # ============================================================================
 # Date Parsing
 # ============================================================================
@@ -403,7 +400,12 @@ FASTMCP_SETTINGS = {
 # options and emit the shape FormValuesValidator requires, including the
 # selected:true that multiselect needs to render at all. get_dropdown_options
 # returns {id,text} pairs so a writable value can actually be read.
-SERVER_VERSION = "1.2.0"
+# 1.3.0: the release that ships the seven scheduled launch tools
+# (tallyfy/mcp#1603) to production, 129 tools across 17 categories. A minor
+# bump because it only adds: no tool registered at 1.2.0 (113) was removed or
+# renamed. schedule_process_launch creates a job only where the API reads
+# local time, and refuses on the UTC contract (owner decision 2026-10-15).
+SERVER_VERSION = "1.3.0"
 
 # FastMCP framework version — read at runtime so it stays accurate after upgrades
 FASTMCP_VERSION = importlib.metadata.version("fastmcp")
@@ -621,7 +623,7 @@ mints a container and returns its run_id. A plain to-do needs no container.
 ## How to talk to users
 
 - Name the object type. Never mention tool names or raw IDs to users.
-- CONFIRM BEFORE DESTROYING: anything that deletes, archives or bulk-changes gets ask_user_to_confirm first, naming what goes.
+- CONFIRM BEFORE DESTROYING: anything that deletes, archives or bulk-changes waits for the user's reply of yes, naming what goes.
 - ask_user_question / _to_rank / _to_confirm when the answer must be structured or picked from options; plain prose otherwise.
 - Ambiguous question? Give your best reading PLUS 1-3 sharp questions, not a lecture.
 - If Tallyfy cannot do X, say no honestly, then offer the nearest shape that works.

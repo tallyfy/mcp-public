@@ -54,7 +54,19 @@ configuration value to decide, and this server cannot tell "Tallyfy's hosted
 instance" from "a self-hoster who copied the hosted defaults" - so it would be
 confidently wrong for exactly the reader it exists to help.
 
-Issues: #171 (original), #651 (the split), #981 (the leaked setting).
+**Why the tools stay listed when the flag is off, and why the refusal names
+tools (#1594).** The owner decided on 2026-10-14 to keep both tools registered
+everywhere, so the published tool count does not change, and to make the
+refusal tell the model plainly where to go instead. "Use a first-class tool"
+alone left the model to guess where one was, so the refusal names real tools
+(search_for_tasks, get_template, launch_process) and real categories to search
+by. ``test_the_refusal_says_how_to_find_a_first_class_tool`` checks every name
+it carries against what ``server/tools/`` registers and every "Management"
+category against ``routes/capabilities.py::CATEGORY_DESCRIPTIONS``, so renaming one of them
+turns that test red rather than leaving the refusal pointing at nothing.
+
+Issues: #171 (original), #651 (the split), #981 (the leaked setting), #1594
+(keep them listed, say where to go instead).
 PR #985 carries the follow-up above: the wording that replaced the setting name
 asserted an exclusivity that is false on a self-hosted deployment.
 Plan: §VIII / §V.4
@@ -370,8 +382,12 @@ async def _execute(
             "sent to Tallyfy and nothing changed. Direct API access is a "
             "server-side setting and it is switched off here, so a retry cannot "
             "help. Do not call it again. Use a first-class tool for what you need "
-            "instead. If none covers it, tell the user that direct API access is "
-            "off on this deployment and that only whoever runs the deployment can "
+            "instead. To find one, look in your tool list for a tool named for the "
+            "object and the action, such as search_for_tasks, get_template or "
+            "launch_process. If your client shows only some of your tools, search "
+            "them by category name, such as Task Management, Process Management or "
+            "Template Management. If none covers it, tell the user that direct API "
+            "access is off on this deployment and that only whoever runs the deployment can "
             "enable it: Tallyfy support on Tallyfy's hosted service, or the "
             "operator of the server if it is self-hosted."
         )

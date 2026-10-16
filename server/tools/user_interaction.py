@@ -1,23 +1,40 @@
 """
 User Interaction Tools
 Tools for asking structured questions, ranking choices, and binary
-confirmations during conversations. Each tool emits a marker that the
-W22 generic interaction block (tallyfy/client#17619) renders as a
-specific child component:
+confirmations during conversations. Each tool returns a description of the
+form it wants shown; it does not show anything itself:
 
-  ask_user_question  → __structured_question__    → tf-question-interaction
-  ask_user_to_rank   → __structured_interaction__ → tf-ranking-interaction
-  ask_user_to_confirm → __structured_interaction__ → tf-confirm-interaction
+  ask_user_question   -> fields, submit_label        -> tf-question-interaction
+  ask_user_to_rank    -> interaction_type "ranking"  -> tf-ranking-interaction
+  ask_user_to_confirm -> interaction_type "confirm"  -> tf-confirm-interaction
 
-The user's submission round-trips through the WebSocket host via
-``answer_question`` (legacy) or ``answer_interaction`` (generic) and is
-forwarded to the agent as a synthetic user turn.
+Only our own chat host draws these forms. It recognises the tool NAME
+(host/client/interaction_payload.py, INTERACTION_TOOLS), pauses the turn, and
+forwards the person's answer as their next message. Every other MCP client
+receives the description as an ordinary tool result and shows no form, so each
+result carries ``status`` and ``note`` saying that nobody has answered yet
+(#1241). Before that, an external client read the result as a successful
+answer that no person had given.
+
+The ``__structured_question__`` / ``__structured_interaction__`` keys these
+results used to carry were removed in #1241: nothing in the host or the client
+read them.
 """
 
 from typing import List, Dict, Any, Optional
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from metrics import track_tool_execution
+
+#: Sent with every result of the three tools. An MCP client that does not draw
+#: forms would otherwise read the result as the person's answer (#1241).
+AWAITING_REPLY_STATUS = "awaiting_user_reply"
+AWAITING_REPLY_NOTE = (
+    "Not answered yet. This result describes the question; it is not the "
+    "user's reply. The user's answer arrives as their next message. Do not act "
+    "on the question until it does, and make sure your reply tells the user "
+    "what you are asking."
+)
 
 
 def register_user_interaction_tools(mcp):
@@ -85,8 +102,9 @@ def register_user_interaction_tools(mcp):
             header: Short header/category label, max 12 chars (e.g., "Confirm", "Select")
 
         Returns:
-            Structured question object with __structured_question__ marker.
-            The UI renders this as a form and pauses the conversation.
+            The question and its fields, plus ``status`` and ``note`` saying
+            nobody has answered yet. Our chat host renders it as a form and
+            pauses the conversation; other clients show no form.
         """
         # Validate fields have required properties
         validated_fields = []
@@ -103,11 +121,12 @@ def register_user_interaction_tools(mcp):
 
         return ToolResult(
             content={
-                "__structured_question__": True,
                 "question": question,
                 "header": header[:12] if header else "",
                 "fields": validated_fields,
                 "submit_label": submit_label or "Submit",
+                "status": AWAITING_REPLY_STATUS,
+                "note": AWAITING_REPLY_NOTE,
             },
             structured_content=None
         )
@@ -163,10 +182,10 @@ def register_user_interaction_tools(mcp):
                 the user to submit. Default True.
 
         Returns:
-            Structured interaction object with ``__structured_interaction__``
-            marker and ``interaction_type='ranking'``. The W22 client
-            renders it as a drag-orderable list and the conversation pauses
-            until the user submits or cancels.
+            Interaction object with ``interaction_type='ranking'``, plus
+            ``status`` and ``note`` saying nobody has answered yet. Our chat
+            host renders it as a drag-orderable list and the conversation
+            pauses until the user submits or cancels.
         """
         # Validate items have required properties — drop bad entries silently
         validated_items: List[Dict[str, Any]] = []
@@ -182,13 +201,14 @@ def register_user_interaction_tools(mcp):
 
         return ToolResult(
             content={
-                "__structured_interaction__": True,
                 "interaction_type": "ranking",
                 "question": question,
                 "header": header[:12] if header else "",
                 "schema": {"items": validated_items},
                 "submit_label": submit_label or "Submit",
                 "cancelable": bool(cancelable),
+                "status": AWAITING_REPLY_STATUS,
+                "note": AWAITING_REPLY_NOTE,
             },
             structured_content=None,
         )
@@ -246,13 +266,12 @@ def register_user_interaction_tools(mcp):
                 "click to acknowledge".
 
         Returns:
-            Structured interaction object with ``__structured_interaction__``
-            marker and ``interaction_type='confirm'``. The W22 client
-            renders it as a confirm/cancel button pair.
+            Interaction object with ``interaction_type='confirm'``, plus
+            ``status`` and ``note`` saying nobody has answered yet. Our chat
+            host renders it as a confirm/cancel button pair.
         """
         return ToolResult(
             content={
-                "__structured_interaction__": True,
                 "interaction_type": "confirm",
                 "question": question,
                 "header": header[:12] if header else "",
@@ -261,6 +280,8 @@ def register_user_interaction_tools(mcp):
                     "cancel_label": cancel_label or "Cancel",
                 },
                 "cancelable": bool(cancelable),
+                "status": AWAITING_REPLY_STATUS,
+                "note": AWAITING_REPLY_NOTE,
             },
             structured_content=None,
         )

@@ -26,6 +26,7 @@ from utils.fastmcp_types import (
     OptionalString,
     OptionalBool,
     PageNumber,
+    PageOffset,
     GenericDict,
     GenericList,
 )
@@ -844,7 +845,7 @@ get_template_steps(step_id=..., full_text=True).""",
     )
     @track_tool_execution("get_all_templates")
     @handle_tallyfy_errors("get all templates")
-    def get_all_templates(page: PageNumber = 1, folder: OptionalString = None) -> GenericDict:
+    def get_all_templates(page: PageNumber = 1, page_offset: PageOffset = 0, folder: OptionalString = None) -> GenericDict:
         """
         Get templates (checklists) with full details.
 
@@ -865,7 +866,7 @@ get_template_steps(step_id=..., full_text=True).""",
             return ToolResult(
                 content=fetch_single_page(
                     sdk.templates.get_all_templates, org_id,
-                    page=page,
+                    page=page, page_offset=page_offset or 0,
                     compact_fields=["guidance"],
                     **kwargs,
                 ),

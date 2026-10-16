@@ -502,6 +502,16 @@ PageSize = Annotated[Optional[int], Field(
     examples=[20]
 )]
 
+PageOffset = Annotated[Optional[int], Field(
+    ge=0,
+    description=(
+        "Rows of the page to skip. Leave unset. Set it only to the "
+        "meta.next_page_offset of a previous response whose meta.truncated was "
+        "true, together with that response's page, to get the rest of that page."
+    ),
+    examples=[0]
+)]
+
 # Date/time types
 DateString = Annotated[Optional[str], Field(
     description="Date in ISO format or natural language",

@@ -261,6 +261,17 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "reopen_kickoff_form": _PROC_W,
     "tag_process": _PROC_W,
     "untag_process": _PROC_W,
+    # Scheduled jobs (tallyfy/mcp#1603). A scheduled launch is a process launch
+    # at a later time, so it takes the process scopes. api-v2's
+    # EnforceMcpTokenScopes maps no recurring-jobs segment today, so this is the
+    # only scope gate these routes have for an MCP token.
+    "get_scheduled_job_types": _PROC_R,
+    "get_scheduled_jobs": _PROC_R,
+    "get_scheduled_job": _PROC_R,
+    "schedule_process_launch": _PROC_W,
+    "pause_scheduled_job": _PROC_W,
+    "resume_scheduled_job": _PROC_W,
+    "delete_scheduled_job": _PROC_W,
     # -- templates (blueprints/checklists) ----------------------------------
     "assess_template_health": _TMPL_R,
     "get_all_templates": _TMPL_R,

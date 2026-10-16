@@ -16,6 +16,7 @@ from starlette.routing import Route
 from sentry_config import init_sentry_server
 from utils.tallyfy_auth_provider import build_auth_provider
 from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, DownstreamAuthChallengeMiddleware, ToolScopeEnforcementMiddleware, RemovedToolHintsMiddleware, DiscoverWithoutAuth
+from middleware.request_logging import mark_unrouted
 from routes import register_all_routes
 from tools.user_management import register_user_management_tools
 from tools.task_management import register_task_management_tools
@@ -374,7 +375,14 @@ app.routes.append(Route("/robots.txt", robots_txt, methods=["GET", "HEAD"]))
 
 # Return 404 for undefined endpoints (instead of redirecting, which leaks the target URL)
 async def catch_all_not_found(request):
-    """Return 404 for undefined endpoints."""
+    """Return 404 for undefined endpoints.
+
+    Marks the scope first, so RequestLoggingMiddleware can tell "no route
+    serves this path" from "a real route answered 404". Only the first kind,
+    from a caller with no credential, is counted instead of filed to the
+    durable failure record (tallyfy/mcp#1597).
+    """
+    mark_unrouted(request.scope)
     return JSONResponse({"error": "not_found"}, status_code=404)
 
 app.routes.append(Route("/{path:path}", catch_all_not_found, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]))

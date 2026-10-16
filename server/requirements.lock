@@ -19,7 +19,7 @@ attrs==26.1.0
     #   referencing
 authlib==1.8.0
     # via fastmcp-slim
-beartype==0.22.9
+beartype==0.23.1
     # via py-key-value-aio
 boto3==1.39.4
     # via -r requirements.txt
@@ -27,7 +27,7 @@ botocore==1.39.17
     # via
     #   boto3
     #   s3transfer
-cachetools==7.2.0
+cachetools==7.2.1
     # via py-key-value-aio
 caio==0.12.9
     # via aiofile
@@ -50,11 +50,11 @@ cryptography==50.0.0
     #   joserfc
     #   pyjwt
     #   secretstorage
-cyclopts==5.1.1
+cyclopts==5.2.0
     # via fastmcp-slim
 dateparser==1.2.1
     # via -r requirements.txt
-dnspython==2.8.0
+dnspython==2.9.0
     # via email-validator
 docstring-parser==0.18.0
     # via cyclopts
@@ -70,7 +70,7 @@ fastmcp-slim[client,server]==4.0.3
     # via fastmcp
 googleapis-common-protos==1.75.5
     # via opentelemetry-exporter-otlp-proto-grpc
-griffelib==2.3.0
+griffelib==2.3.2
     # via fastmcp-slim
 grpcio==1.84.0
     # via opentelemetry-exporter-otlp-proto-grpc
@@ -173,7 +173,7 @@ packaging==26.3
     # via fastmcp-slim
 pathable==0.6.0
     # via jsonschema-path
-platformdirs==4.12.3
+platformdirs==4.13.0
     # via fastmcp-slim
 prometheus-client==0.21.1
     # via -r requirements.txt
@@ -183,16 +183,16 @@ protobuf==6.33.6
     #   opentelemetry-proto
 py-key-value-aio[filetree,keyring,memory]==0.4.6
     # via fastmcp-slim
-pycparser==3.0
+pycparser==3.11
     # via cffi
-pydantic[email]==2.13.5
+pydantic[email]==2.14.1
     # via
     #   fastmcp-slim
     #   mcp
     #   mcp-types
     #   openapi-pydantic
     #   pydantic-settings
-pydantic-core==2.46.5
+pydantic-core==2.50.1
     # via pydantic
 pydantic-settings==2.15.0
     # via fastmcp-slim
@@ -295,7 +295,7 @@ tzdata==2026.4
     # via -r requirements.txt
 tzlocal==5.4.4
     # via dateparser
-uncalled-for==0.4.0
+uncalled-for==0.4.1
     # via fastmcp-slim
 urllib3==2.8.0
     # via

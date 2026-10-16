@@ -67,6 +67,108 @@ _ORG_ID_HEADER_NAMES = frozenset(name.decode("ascii") for name in ORG_ID_HEADERS
 TOOLS_CALL_INSPECT_BUFFER_BYTES = 65536
 
 
+# ---------------------------------------------------------------------------
+# Two kinds of failed request that are counted, not filed (tallyfy/mcp#1597)
+# ---------------------------------------------------------------------------
+#
+# The durable failure record was 98% noise. In the 14 days to 2026-10-13 it took
+# about 41,000 mcp_auth_failure rows, and 40,188 of them carried no credential at
+# all (`ping` 22,339, `tools/list` 11,627, `initialize` 5,749). Only 848 were a
+# real token being refused. Another 1,273 were crawler 404s on paths that are not
+# routes, filed as mcp_upstream_rejected. That cost 35,667 outbound posts in 7
+# days and buried the rows an incident needs.
+#
+# A 401 to an MCP request with no Authorization header is the protocol asking
+# for a credential: the client has not authenticated yet, nothing was refused,
+# and it is how every connector starts (copilot-cli sent most of the recent
+# ones, because it cannot register). A 404 for a path no route serves, from a
+# caller with no credential, is a crawler or a scanner. Neither answers an
+# incident question, so neither is filed. Both are counted in
+# mcp_server_durable_record_skipped_total by HTTP method and MCP method, so the
+# volume, and a sudden change in it, stays visible.
+#
+# What IS still filed, deliberately: any request that presented an
+# Authorization header (a refused real token is exactly what the record is
+# for), a 403, a 401 on a path outside the MCP transport (the OAuth routes), and
+# a 404 from a real route (for example an MCP session the server no longer has).
+
+#: The paths the MCP transport answers on. server.py serves it at '/' and
+#: aliases '/mcp' and '/mcp/' to the same endpoint.
+MCP_TRANSPORT_PATHS = ("/", "/mcp", "/mcp/")
+
+#: Set to True on the ASGI scope by server.py's catch-all route, the one that
+#: answers every path no other route matches. The scope is one dict shared by
+#: reference from the outermost middleware to the endpoint (see the class
+#: docstring below), so the mark is visible here after call_next. Keyed on the
+#: route that actually ran, never on the shape of the path.
+UNROUTED_SCOPE_KEY = "tallyfy.unrouted"
+
+SKIP_NO_CREDENTIAL = "no_credential"
+SKIP_NO_ROUTE = "no_route"
+
+# Closed vocabularies for the counter's labels. Both values come from the
+# caller, and a label taken from caller input unbounded lets anyone mint new
+# Prometheus series at will, so anything outside these sets is `other`.
+_COUNTED_HTTP_METHODS = frozenset(
+    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+)
+_COUNTED_MCP_METHODS = frozenset({
+    "initialize",
+    "ping",
+    "server/discover",
+    "tools/list",
+    "tools/call",
+    "resources/list",
+    "resources/read",
+    "resources/templates/list",
+    "prompts/list",
+    "prompts/get",
+    "completion/complete",
+    "logging/setLevel",
+    "notifications/initialized",
+    "notifications/cancelled",
+    "notifications/progress",
+    "notifications/roots/list_changed",
+})
+
+
+def mark_unrouted(scope) -> None:
+    """Record on the ASGI scope that no route matched this request."""
+    scope[UNROUTED_SCOPE_KEY] = True
+
+
+def counted_http_method(value) -> str:
+    """The HTTP method as a counter label, from a closed set."""
+    method = str(value or "").upper()
+    return method if method in _COUNTED_HTTP_METHODS else "other"
+
+
+def counted_mcp_method(value) -> str:
+    """The MCP method as a counter label: `none` when the request named none,
+    the method when it is a known one, and `other` for anything else."""
+    if not value:
+        return "none"
+    if isinstance(value, str) and value in _COUNTED_MCP_METHODS:
+        return value
+    return "other"
+
+
+def durable_record_skip_reason(*, status, auth_header, path, unrouted):
+    """Why this failed request is counted rather than filed, or None to file it.
+
+    Only a request that presented NO Authorization header can be skipped. A
+    header that is present but wrong, of any scheme, is a credential that was
+    refused, and the record keeps every one of those.
+    """
+    if (auth_header or "").strip():
+        return None
+    if status == 401 and path in MCP_TRANSPORT_PATHS:
+        return SKIP_NO_CREDENTIAL
+    if status == 404 and unrouted:
+        return SKIP_NO_ROUTE
+    return None
+
+
 async def _peek_response_body(body_iterator, max_bytes: int):
     """Read up to ``max_bytes`` from an async chunk iterator.
 
@@ -992,6 +1094,35 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             else:
                 logging.info(log_msg)
 
+        is_noise = (
+            is_scanner
+            or is_oauth_discovery
+            or is_sse_404
+            or is_delete_400
+            or is_favicon
+        )
+
+        # Counted, not filed (#1597). Asked only of a request the noise rules
+        # above have not already dropped and that is not a tool error, so each
+        # skipped request is counted once and a tool failure is never skipped.
+        skip_reason = None
+        if not is_noise and not mcp_error:
+            skip_reason = durable_record_skip_reason(
+                status=status,
+                auth_header=auth_header,
+                path=path,
+                unrouted=bool(request.scope.get(UNROUTED_SCOPE_KEY)),
+            )
+            if skip_reason:
+                try:
+                    metrics.record_durable_record_skip(
+                        skip_reason,
+                        counted_http_method(method),
+                        counted_mcp_method(mcp_method),
+                    )
+                except Exception as exc:  # never let a metric fail a request
+                    logging.debug("durable record skip counter failed (%s)", type(exc).__name__)
+
         # Durable record (#890). Everything above this line goes to stdout and
         # dies with the container; this call is the only thing that outlives a
         # deploy. It is deliberately the LAST statement before the response is
@@ -1018,13 +1149,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             org_id_source=claimed_org_source,
             transport=resolve_transport(auth_header, claims),
             synthetic=request_is_synthetic(request),
-            is_noise=(
-                is_scanner
-                or is_oauth_discovery
-                or is_sse_404
-                or is_delete_400
-                or is_favicon
-            ),
+            is_noise=is_noise or skip_reason is not None,
         )
 
         return response
@@ -1068,8 +1193,11 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         try:
             if is_noise:
                 # Scanner probes, RFC-9728 discovery 401s, /sse 404s and expired
-                # session DELETEs. Each is expected, high-volume, and answers
-                # nothing - the same set the display logic already suppresses.
+                # session DELETEs, the same set the display logic suppresses;
+                # plus, since #1597, credential-less 401s on the MCP transport
+                # and credential-less 404s that no route served, which the
+                # caller has already counted. Each is expected, high-volume, and
+                # answers nothing.
                 return
             if mcp_error:
                 event = EVENT_TOOL_ERROR

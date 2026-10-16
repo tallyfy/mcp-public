@@ -17,6 +17,7 @@ from utils.fastmcp_types import (
     OptionalBool,
     OptionalString,
     PageNumber,
+    PageOffset,
     GenericDict,
     GenericList,
 )
@@ -43,7 +44,7 @@ def register_group_management_tools(mcp):
     )
     @track_tool_execution("get_organization_guests")
     @handle_tallyfy_errors("get organization guests")
-    def get_organization_guests(with_stats: OptionalBool = False, page: PageNumber = 1) -> GenericDict:
+    def get_organization_guests(with_stats: OptionalBool = False, page: PageNumber = 1, page_offset: PageOffset = 0) -> GenericDict:
         """
         Get guests in an organization with full profile data.
 
@@ -60,7 +61,7 @@ def register_group_management_tools(mcp):
                 content=fetch_single_page(
                     sdk.users.get_organization_guests,
                     org_id,
-                    page=page,
+                    page=page, page_offset=page_offset or 0,
                     with_stats=with_stats,
                 ),
                 structured_content=None
