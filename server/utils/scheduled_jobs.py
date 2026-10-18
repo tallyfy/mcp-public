@@ -103,8 +103,8 @@ FINISHED_MESSAGE = (
 # What schedule_process_launch answers on the UTC reading, before any create.
 UTC_CREATE_REFUSAL = (
     "Scheduled launches through the assistant are not available on this Tallyfy "
-    "server yet, so nothing was scheduled. You can set one up on Tallyfy's "
-    "Scheduled jobs page instead."
+    "server yet, so nothing was scheduled. Listing, reading, pausing, resuming and "
+    "deleting scheduled jobs still work."
 )
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
