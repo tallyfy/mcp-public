@@ -809,7 +809,7 @@ Give every time to schedule_process_launch in the organization's local time, the
                 "organization_time_zone": zone,
                 "note": (
                     "Give schedule_process_launch the day and time in "
-                    f"{zone or 'UTC'}; it converts when Tallyfy needs another zone."
+                    f"{zone or 'UTC'}, without converting them."
                 ),
             },
             structured_content=None
@@ -941,7 +941,7 @@ WHEN, in the organization's LOCAL time (get_scheduled_job_types gives the zone).
 
 WHAT: process_name is the name every launched process gets, so name it after what it tracks. prerun optionally fills kickoff fields, keyed by field id as in launch_process.
 
-The reply says which zone Tallyfy reads the time in, the first run in local time, and the next run. A Tallyfy server that still reads schedule times in UTC cannot take a new job from this tool: it says so, and the user can set one up on Tallyfy's Scheduled jobs page.
+The reply says which zone Tallyfy reads the time in, the first run in local time, and the next run. A Tallyfy server that still reads schedule times in UTC cannot take a new job from this tool: it says scheduled launches are not available yet and creates nothing.
 
 To change a schedule, schedule a new job and delete the old one.
 
