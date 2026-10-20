@@ -35,6 +35,12 @@ NEVER_WORDINGS = (
     "will never",
 )
 
+# Text a person reads (titles, details, summaries, diagram labels) says
+# "automation", never "rule", because that is the word the template editor and
+# the help docs use (tallyfy/mcp#1624). Check ids such as ``inert_rule`` and keys
+# such as ``rule_ids`` are read by name and keep their spelling.
+# tests/unit/server/template_testing/test_automation_wording.py enforces it.
+
 
 @dataclass
 class Finding:

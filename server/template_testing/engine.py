@@ -339,7 +339,7 @@ def _summary(
         if coverage["exhaustive"]:
             body = (
                 f"{title} was walked all the way through, every path, and nothing was "
-                f"found. Every step can be reached, every rule can fire, and nobody "
+                f"found. Every step can be reached, every automation can fire, and nobody "
                 f"gets stuck."
             )
         else:

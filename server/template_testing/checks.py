@@ -92,7 +92,14 @@ def _step_label(doc: TemplateDoc, step_id: str) -> str:
 
 
 def _rule_label(rule: AutomationDef) -> str:
-    return f"'{rule.alias}'" if rule.alias else f"rule {rule.id}"
+    """The alias in quotes, or the bare id when the automation has no alias.
+
+    Every caller writes the noun itself ("Automation {label} ..."), so the
+    label must not carry one, or an automation saved without an alias reads
+    "Automation automation 3f2a..." (before tallyfy/mcp#1624 it read
+    "Rule rule 3f2a..."). Customer-facing text says automation, never rule.
+    """
+    return f"'{rule.alias}'" if rule.alias else rule.id
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +177,7 @@ def check_unreachable_step(
             title = f"{_lead(label)} can never appear"
             detail = (
                 f"{_lead(label)} is hidden when a process starts, because an "
-                f"automation targets it with a show action. No rule in this template "
+                f"automation targets it with a show action. No automation in this template "
                 f"ever satisfies that show, on any answer anybody could give. On "
                 f"current settings nobody will ever see this step."
             )
@@ -219,17 +226,17 @@ def check_inert_rule(
         label = _rule_label(rule)
         if rule.id not in ev.applicable:
             if ev.truncated:
-                title = f"Rule {label} did not fire in the paths tested"
+                title = f"Automation {label} did not fire in the paths tested"
                 detail = (
-                    f"Rule {label} did not become applicable in any of the "
+                    f"Automation {label} did not become applicable in any of the "
                     f"{ev.assignments_walked} paths tested. This part of the template "
                     f"was too large to walk exhaustively, so this is what the sample "
                     f"found rather than a statement about every path."
                 )
             else:
-                title = f"Rule {label} can never fire"
+                title = f"Automation {label} can never fire"
                 detail = (
-                    f"Rule {label}'s conditions are never all satisfied together, on "
+                    f"Automation {label}'s conditions are never all satisfied together, on "
                     f"any answer anybody could give. It has no effect on this template."
                 )
             findings.append(
@@ -254,16 +261,16 @@ def check_inert_rule(
         if any(a.is_webhook for a in rule.actions):
             continue
         if ev.truncated:
-            title = f"Rule {label} changed nothing in the paths tested"
+            title = f"Automation {label} changed nothing in the paths tested"
             detail = (
-                f"Rule {label} fired, and on every path tested each of its actions "
+                f"Automation {label} fired, and on every path tested each of its actions "
                 f"was already true, so nothing changed. This part of the template was "
                 f"too large to walk exhaustively."
             )
         else:
-            title = f"Rule {label} fires but changes nothing"
+            title = f"Automation {label} fires but changes nothing"
             detail = (
-                f"Rule {label} does become applicable, and every time it does, each of "
+                f"Automation {label} does become applicable, and every time it does, each of "
                 f"its actions is already true, so applying it changes nothing. Showing "
                 f"a step that is already visible, or hiding one that is already hidden, "
                 f"does nothing at all."
@@ -309,9 +316,9 @@ def check_conflicting_rules(
                         check="conflicting_rules",
                         severity="high",
                         confidence=_confidence(ev.truncated),
-                        title=f"Two rules fight over {label}",
+                        title=f"Two automations fight over {label}",
                         detail=(
-                            f"On one set of answers both rules apply to {label}, one "
+                            f"On one set of answers both automations apply to {label}, one "
                             f"with '{obs.verb_a}' and one with '{obs.verb_b}'. Which one "
                             f"wins depends on the order the earlier steps happen to be "
                             f"completed in, so the same answers can produce different "
@@ -329,11 +336,11 @@ def check_conflicting_rules(
                         check="ordered_override",
                         severity="medium",
                         confidence=_confidence(ev.truncated),
-                        title=f"One rule always overrides another on {label}",
+                        title=f"One automation always overrides another on {label}",
                         detail=(
-                            f"On one set of answers both rules apply to {label}, one "
+                            f"On one set of answers both automations apply to {label}, one "
                             f"with '{obs.verb_a}' and one with '{obs.verb_b}'. The order "
-                            f"is fixed, so rule {obs.winner} always wins and the other "
+                            f"is fixed, so automation {obs.winner} always wins and the other "
                             f"never has any visible effect here."
                         ),
                         step_ids=[obs.target_step_id],
@@ -380,7 +387,7 @@ def check_unassigned_visible_step(
             title = f"Nobody is assigned to {label}"
             detail = (
                 f"{_lead(label)} becomes visible on this path with no assignee, "
-                f"no group, no guest, no role, no owner, and no rule that assigns it. "
+                f"no group, no guest, no role, no owner, and no automation that assigns it. "
                 f"Somebody has to notice it themselves for it to get done."
             )
         findings.append(
@@ -484,14 +491,14 @@ def check_dangling_reference(doc: TemplateDoc, raw: Dict[str, Any]) -> List[Find
                 check="dangling_reference",
                 severity="high",
                 confidence=CONFIDENCE_EXHAUSTIVE,
-                title=f"Rule {_rule_label(rule)} points at something that is gone",
+                title=f"Automation {_rule_label(rule)} points at something that is gone",
                 detail=(
-                    f"Rule {_rule_label(rule)} names "
+                    f"Automation {_rule_label(rule)} names "
                     f"{', '.join(sorted(set(orphaned)))}, which no longer exists in this "
-                    f"template. Review the rule rather than deleting it: a rule can mix "
+                    f"template. Review the automation rather than deleting it: an automation can mix "
                     f"valid and dangling references, so deleting it destroys working "
                     f"logic. Two things this cannot see, so check them by hand if the "
-                    f"rule still looks wrong: an action that was soft deleted appears in "
+                    f"automation still looks wrong: an action that was soft deleted appears in "
                     f"no template read at all, and a deadline anchored from a DIFFERENT "
                     f"template is out of scope here."
                 ),
@@ -632,9 +639,9 @@ def check_stale_condition_value(doc: TemplateDoc) -> List[Finding]:
                             check="stale_condition_value",
                             severity="medium",
                             confidence=CONFIDENCE_EXHAUSTIVE,
-                            title=f"A rule compares '{fdef.label}' as a number",
+                            title=f"An automation compares '{fdef.label}' as a number",
                             detail=(
-                                f"Rule {_rule_label(rule)} asks whether '{fdef.label}' is "
+                                f"Automation {_rule_label(rule)} asks whether '{fdef.label}' is "
                                 f"{cond.operation.replace('_', ' ')} "
                                 f"{cond.statement!r}, but that field is a "
                                 f"'{fdef.field_type}' and cannot hold a number, so the "
@@ -668,13 +675,13 @@ def check_stale_condition_value(doc: TemplateDoc) -> List[Finding]:
                     check="stale_condition_value",
                     severity="medium",
                     confidence=CONFIDENCE_EXHAUSTIVE,
-                    title=f"A rule waits for an answer '{fdef.label}' no longer offers",
+                    title=f"An automation waits for an answer '{fdef.label}' no longer offers",
                     detail=(
-                        f"Rule {_rule_label(rule)} waits for '{fdef.label}' to be "
+                        f"Automation {_rule_label(rule)} waits for '{fdef.label}' to be "
                         f"{', '.join(repr(m) for m in missing)}. That is not one of the "
                         f"choices on the field, which offers "
                         f"{', '.join(repr(o) for o in fdef.options)}. Nobody can give the "
-                        f"answer this rule is waiting for."
+                        f"answer this automation is waiting for."
                     ),
                     step_ids=[fdef.owner_step_id] if fdef.owner_step_id else [],
                     rule_ids=[rule.id],
@@ -739,14 +746,14 @@ def check_always_true_condition(doc: TemplateDoc) -> List[Finding]:
                     check="always_true_condition",
                     severity="medium",
                     confidence=CONFIDENCE_EXHAUSTIVE,
-                    title=f"A rule's test on '{fdef.label}' is always true",
+                    title=f"An automation's test on '{fdef.label}' is always true",
                     detail=(
-                        f"Rule {_rule_label(rule)} fires when '{fdef.label}' is not "
+                        f"Automation {_rule_label(rule)} fires when '{fdef.label}' is not "
                         f"{cond.statement!r}. That is not one of the choices on the "
                         f"field, which offers "
                         f"{', '.join(repr(o) for o in fdef.options)}, so no answer can "
                         f"ever equal it and this test is true whatever the person "
-                        f"picks. The rule is not gated by this condition at all."
+                        f"picks. The automation is not gated by this condition at all."
                     ),
                     step_ids=[fdef.owner_step_id] if fdef.owner_step_id else [],
                     rule_ids=[rule.id],
@@ -860,9 +867,9 @@ def check_empty_rule(doc: TemplateDoc) -> List[Finding]:
                 check="empty_rule",
                 severity="low",
                 confidence=CONFIDENCE_EXHAUSTIVE,
-                title=f"Rule {_rule_label(rule)} is incomplete",
+                title=f"Automation {_rule_label(rule)} is incomplete",
                 detail=(
-                    f"Rule {_rule_label(rule)} has no {missing}, so Tallyfy skips it "
+                    f"Automation {_rule_label(rule)} has no {missing}, so Tallyfy skips it "
                     f"before it is ever evaluated. It does nothing at all."
                 ),
                 step_ids=[],
@@ -906,13 +913,13 @@ def check_never_evaluated_automation(doc: TemplateDoc) -> List[Finding]:
                 check="never_evaluated_automation",
                 severity="medium",
                 confidence=CONFIDENCE_EXHAUSTIVE,
-                title=f"Nothing ever asks rule {_rule_label(rule)}",
+                title=f"Nothing ever asks automation {_rule_label(rule)}",
                 detail=(
-                    f"Rule {_rule_label(rule)} has no kick-off condition, and none of "
+                    f"Automation {_rule_label(rule)} has no kick-off condition, and none of "
                     f"its conditions names a step in this template or a form field on "
-                    f"one. Tallyfy only checks a rule when a process starts, when the "
-                    f"kick-off form is completed, or when a step the rule mentions is "
-                    f"completed or reopened, so this rule is never checked at all."
+                    f"one. Tallyfy only checks an automation when a process starts, when the "
+                    f"kick-off form is completed, or when a step the automation mentions "
+                    f"is completed or reopened, so this automation is never checked at all."
                 ),
                 step_ids=[],
                 rule_ids=[rule.id],
@@ -951,11 +958,11 @@ PLAN_ACTIVE_NOTE = ""
 PLAN_INACTIVE_WARNING = (
     "IMPORTANT, and it applies to every template in this organization rather than "
     "just this one: this organization is not on a Pro plan and is not in a trial, "
-    "so no automation in it runs at all. Every step that a rule would normally "
-    "hide is visible from the moment a process starts, and nothing is revealed or "
-    "hidden as answers come in. The findings above about rules describe what WOULD "
-    "happen on a Pro plan. Until the plan changes, the template runs as a flat list "
-    "of every step."
+    "so no automation in it runs at all. Every step that an automation would "
+    "normally hide is visible from the moment a process starts, and nothing is "
+    "revealed or hidden as answers come in. The findings above about automations "
+    "describe what WOULD happen on a Pro plan. Until the plan changes, the "
+    "template runs as a flat list of every step."
 )
 
 # The plan could not be read. Keep the original wording, because the honest answer
@@ -966,8 +973,8 @@ PLAN_INACTIVE_WARNING = (
 PLAN_CAVEAT = (
     "Automations only run on a Pro plan or during a trial. On any other plan every "
     "automation in this template is inactive and no step is hidden when a process "
-    "starts, so none of the findings above about rules would apply. This tool reads "
-    "the template and cannot see which plan the organization is on."
+    "starts, so none of the findings above about automations would apply. This tool "
+    "reads the template and cannot see which plan the organization is on."
 )
 
 # What the tool passes in. Anything else, including None, means "not known".

@@ -46,7 +46,7 @@ def _edge_label(doc: TemplateDoc, rule) -> str:
             parts.append(f"{name} {cond.operation}")
     if len(rule.conditions) > 2:
         parts.append("...")
-    return _escape(" / ".join(parts)) or "rule"
+    return _escape(" / ".join(parts)) or "automation"
 
 
 def render_mermaid(raw: Dict[str, Any], dead_step_ids: Optional[Iterable[str]] = None) -> str:
@@ -105,7 +105,7 @@ def render_mermaid(raw: Dict[str, Any], dead_step_ids: Optional[Iterable[str]] =
     for step_id in sorted(dead, key=lambda s: index_of.get(s, 0)):
         if step_id in index_of and step_id not in reached:
             lines.append(
-                f'    Start -. "no rule ever shows this" .-> {_node(index_of[step_id])}'
+                f'    Start -. "no automation ever shows this" .-> {_node(index_of[step_id])}'
             )
 
     lines.append("")

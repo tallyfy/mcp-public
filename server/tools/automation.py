@@ -1583,10 +1583,10 @@ REQUIRED: 'template_id'. Never call without it.""",
         description=(
             "Test a template BEFORE anyone runs it. Walks every path through the "
             "template internally and reports PROBLEMS, not paths: a step no answer "
-            "can ever reach, a rule that can never fire, two rules fighting over one "
-            "step, a visible step with nobody assigned, a path where the process gets "
-            "stuck, a rule pointing at something deleted, a deadline counted from a "
-            "step that may not happen, a condition waiting for a dropdown answer that "
+            "can ever reach, an automation that can never fire, two automations fighting "
+            "over one step, a visible step with nobody assigned, a path where the process "
+            "gets stuck, an automation pointing at something deleted, a deadline counted "
+            "from a step that may not happen, a condition waiting for a dropdown answer that "
             "no longer exists, and a start date that is set but ignored. "
             "USE THIS when someone asks whether a template works, why a step never "
             "appears, why nobody was assigned, or before publishing a template. "
@@ -1624,7 +1624,7 @@ REQUIRED: 'template_id'. Never call without it.""",
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
-            max_assignments: Cap on paths walked per independent group of rules
+            max_assignments: Cap on paths walked per independent group of automations
             min_severity: Lowest severity to return (info|low|medium|high)
 
         Returns:
@@ -1657,7 +1657,7 @@ REQUIRED: 'template_id'. Never call without it.""",
         description=(
             "Answer 'what happens if...' for one template WITHOUT running it. Give the "
             "answers you care about and it reports which steps appear, which stay "
-            "hidden, who is assigned, which rules fire, and any problems on those "
+            "hidden, who is assigned, which automations fire, and any problems on those "
             "answers. "
             "USE THIS for a specific question such as what happens when a request is "
             "declined; use test_template for a whole-template health check. "
@@ -1696,10 +1696,11 @@ REQUIRED: 'template_id'. Never call without it.""",
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
             answers: Field label (or id) to answer. May be partial.
-            max_assignments: Cap on paths walked per independent group of rules
+            max_assignments: Cap on paths walked per independent group of automations
 
         Returns:
-            Dictionary with the steps, their certainty, the rules that fire and findings
+            Dictionary with the steps, their certainty, the automations that fire
+            (the rules_that_fire key) and findings
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
