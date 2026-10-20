@@ -46,13 +46,25 @@ running this server yourself is a real path rather than a hypothetical. On one
 of those the person running the container is the ONLY party who can flip the
 flag, Tallyfy support cannot reach it, and a message asserting otherwise tells
 the one person who can act that they cannot - which is the same dead end #981
-exists to remove, pointing the other way. So the message names the party by ROLE
-(whoever runs this server) and gives both cases, which is true either way.
+exists to remove, pointing the other way. So the message gives both cases, which
+is true either way.
 
 A deployment-aware branch was considered and rejected: it would have to read a
 configuration value to decide, and this server cannot tell "Tallyfy's hosted
 instance" from "a self-hoster who copied the hosted defaults" - so it would be
 confidently wrong for exactly the reader it exists to help.
+
+**Why the hosted case no longer names Tallyfy support (#1594).** The refusal
+used to say Tallyfy support could enable it on the hosted service. A paying
+customer read that as a switch support could flip for their account, and
+emailed support on 2026-10-18 asking for it. There is no such switch: the flag
+is server-wide, so turning it on for one customer turns it on for every
+customer, and the owner decision of 2026-10-14 on #1594 ruled that out. So the
+hosted case now says direct API access is off for every account and
+cannot be turned on for one account. The self-hosted case still names the
+operator, for the reasons above. Both texts also point at
+``TALLYFY_API_GUIDE_URL``, where a user who needs raw REST access can call the
+Tallyfy API with their own personal access token.
 
 **Why the tools stay listed when the flag is off, and why the refusal names
 tools (#1594).** The owner decided on 2026-10-14 to keep both tools registered
@@ -66,7 +78,8 @@ category against ``routes/capabilities.py::CATEGORY_DESCRIPTIONS``, so renaming 
 turns that test red rather than leaving the refusal pointing at nothing.
 
 Issues: #171 (original), #651 (the split), #981 (the leaked setting), #1594
-(keep them listed, say where to go instead).
+(keep them listed, say where to go instead, and say the hosted setting cannot be
+turned on for one account).
 PR #985 carries the follow-up above: the wording that replaced the setting name
 asserted an exclusivity that is false on a self-hosted deployment.
 Plan: §VIII / §V.4
@@ -275,6 +288,15 @@ WriteMethod = Literal["POST", "PUT", "PATCH", "DELETE"]
 # that accepts caller-built endpoint paths to name or link its target API.
 TALLYFY_API_DOCS_URL = "https://api.tallyfy.com/docs/index"
 
+# The public guide to calling the Tallyfy API yourself with a personal access
+# token. The refusal and the AVAILABILITY rule point here, because on Tallyfy's
+# hosted service this escape hatch is off for every account and cannot be
+# turned on for one account (#1594). It answered 200 on 2026-10-19.
+TALLYFY_API_GUIDE_URL = (
+    "https://tallyfy.com/products/pro/integrations/open-api/"
+    "how-to-integrate-with-tallyfy-using-api/"
+)
+
 
 ApiCallPath = Annotated[str, Field(
     description=(
@@ -387,9 +409,12 @@ async def _execute(
             "launch_process. If your client shows only some of your tools, search "
             "them by category name, such as Task Management, Process Management or "
             "Template Management. If none covers it, tell the user that direct API "
-            "access is off on this deployment and that only whoever runs the deployment can "
-            "enable it: Tallyfy support on Tallyfy's hosted service, or the "
-            "operator of the server if it is self-hosted."
+            "access is off on this deployment. On Tallyfy's hosted service it is "
+            "off for every account and cannot be turned on for one account. On a "
+            "self-hosted server, the operator of that server controls it. For raw "
+            "REST access, the user can call the Tallyfy API directly with their "
+            "own personal access token, following the guide at "
+            f"{TALLYFY_API_GUIDE_URL}"
         )
 
     api_key, org_id = get_authenticated_credentials()
@@ -433,8 +458,10 @@ async def _execute(
     # used to assert a single universal value for the flag. There is no such
     # value: it is a PER-DEPLOYMENT setting, it differs between deployments, and
     # at the time of writing it is on in at least one real deployment. Whoever
-    # runs the deployment decides: Tallyfy support on Tallyfy's hosted service,
-    # or the operator of the server if it is self-hosted. Nothing in this
+    # runs the deployment decides. On Tallyfy's hosted service it is off for
+    # every account and cannot be turned on for one account, because the flag
+    # is server-wide (#1594); on a self-hosted server the operator of that
+    # server decides. Nothing in this
     # repository can tell you what a given environment is set to -- the deploy
     # excludes the env files on purpose -- so read it there with
     # ``docker exec <container> printenv MCP_ENABLE_API_FALLBACK``, or from the
@@ -499,13 +526,13 @@ async def _execute(
 
 
 _SHARED_RULES = (
-    "AVAILABILITY: this escape hatch is a server-side setting and is OFF in "
-    "Tallyfy's hosted service, so it will usually refuse. Treat that refusal as "
-    "FINAL: nothing was sent, nothing changed, and retrying cannot help. Only "
-    "whoever runs this server can enable it: Tallyfy support on the hosted "
-    "service, or the operator if it is self-hosted. Reach for a first-class tool "
-    "first, and if none fits, say direct API access is off here and who can turn "
-    "it on.\n\n"
+    "AVAILABILITY: a server-side setting, OFF in Tallyfy's hosted service for "
+    "every account, and it cannot be turned on for one account. A refusal is "
+    "FINAL: nothing was sent or changed, and retrying cannot help. On a "
+    "self-hosted server, the operator of that server controls it. Prefer a "
+    "first-class tool. If none fits, say direct API access is off here and that "
+    "the user can call the Tallyfy API with their own personal access token "
+    f"({TALLYFY_API_GUIDE_URL}).\n\n"
     "Paths under /support, /auth, /oauth, /metrics, /health, /ready and "
     "/debug are BLOCKED and return an error. This is a PATH-PREFIX block "
     "list and nothing more: it does NOT restrict administrative actions, "
