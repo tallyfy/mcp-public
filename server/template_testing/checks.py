@@ -236,7 +236,7 @@ def check_inert_rule(
             else:
                 title = f"Automation {label} can never fire"
                 detail = (
-                    f"Automation {label}'s conditions are never all satisfied together, on "
+                    f"The conditions of automation {label} are never all satisfied together, on "
                     f"any answer anybody could give. It has no effect on this template."
                 )
             findings.append(

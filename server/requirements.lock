@@ -31,7 +31,7 @@ cachetools==7.2.3
     # via py-key-value-aio
 caio==0.12.9
     # via aiofile
-certifi==2026.10.18
+certifi==2026.10.19
     # via
     #   httpcore
     #   httpx
