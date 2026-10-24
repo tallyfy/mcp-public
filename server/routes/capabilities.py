@@ -108,7 +108,7 @@ def category_tools() -> list:
     """Return [(label, [(tool_name, summary)], description)], read from the code.
 
     Memoized — the tool set is static for the life of the process
-    (``ToolsCapability(listChanged=False)``). Tests that plant a tool must reset
+    (``ToolsCapability(list_changed=False)``). Tests that plant a tool must reset
     ``_breakdown_cache`` first, which is what proves the page is derived rather
     than baked in at import.
     """
@@ -137,8 +137,8 @@ def register_capabilities(mcp):
     async def get_server_capabilities() -> str:
         """Get explicit declaration of server capabilities for standards compliance"""
         capabilities = ServerCapabilities(
-            tools=ToolsCapability(listChanged=False),
-            resources=ResourcesCapability(listChanged=False),
+            tools=ToolsCapability(list_changed=False),
+            resources=ResourcesCapability(list_changed=False),
             prompts=None,
             logging=None,
             completions=None,
@@ -215,14 +215,18 @@ def format_capabilities(capabilities: ServerCapabilities) -> str:
 
     if capabilities.tools:
         lines.append("### Tools: SUPPORTED")
-        if capabilities.tools.listChanged is False:
+        # MCP SDK 2 names the field `list_changed`; `listChanged` is only the
+        # wire alias, and reading it raised AttributeError, so every read of
+        # tallyfy://capabilities failed from #1246 until #1650. fastmcp's
+        # camelCase bridge does not cover the capability models.
+        if capabilities.tools.list_changed is False:
             lines.append("  - List changes: No (static tool set)")
         else:
             lines.append("  - List changes: Yes (tools may be added/removed)")
 
     if capabilities.resources:
         lines.append("### Resources: SUPPORTED")
-        if capabilities.resources.listChanged is False:
+        if capabilities.resources.list_changed is False:
             lines.append("  - List changes: No (static resource set)")
         else:
             lines.append("  - List changes: Yes (resources may be added/removed)")

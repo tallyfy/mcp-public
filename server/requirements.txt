@@ -1,6 +1,7 @@
 tallyfy==3.0.4
 dateparser==1.2.1
-fastmcp==4.0.3
+# 4.1.2, not 4.0.3, for GHSA-7xgj-8392-5q4r and GHSA-vqqp-x5qm-5qp4 (both published 2026-10-23).
+fastmcp==4.1.2
 
 # The MCP Python SDK, pinned as a RANGE rather than an exact version on purpose.
 # It arrives transitively through fastmcp, which itself asks for
@@ -46,10 +47,13 @@ tzdata==2026.4
 
 # OpenTelemetry distributed tracing (Phase 12.3, closes #173).
 # Packages stay inert unless OTEL_EXPORTER_OTLP_ENDPOINT is set.
-opentelemetry-api==1.41.0
-opentelemetry-sdk==1.41.0
-opentelemetry-exporter-otlp-proto-grpc==1.41.0
-opentelemetry-semantic-conventions==0.62b0
+# 1.41.0 to 1.45.1 on 2026-10-22 for GHSA-xcq7-p3pf-p88h in opentelemetry-api,
+# fixed in 1.45.1. The four move together: sdk 1.45.1 pins api 1.45.1 and
+# semantic-conventions 0.66b1 exactly.
+opentelemetry-api==1.45.1
+opentelemetry-sdk==1.45.1
+opentelemetry-exporter-otlp-proto-grpc==1.45.1
+opentelemetry-semantic-conventions==0.66b1
 
 # Org memory store on Cloudflare R2 via the S3-compatible API (#1036).
 # Lazily imported; the server runs fine without R2 configured.
