@@ -237,6 +237,82 @@ def _largest_prefix_that_fits(count: int, build: Callable[[int], Any]) -> int:
     return lo
 
 
+def paging_marker(
+    item_label: str, offset: int, count: int, total: int, offset_param: str
+) -> Dict[str, str]:
+    """The marker on one part of a paged read: ``_truncated`` or ``_page``.
+
+    ``_truncated`` while items remain, naming the exact offset to call again
+    with; ``_page`` on the last part, so the final call says it is final rather
+    than leaving the caller to infer it from a missing key. The one wording
+    behind every paged read in this server (``page_list_by_bytes``,
+    ``page_by_bytes`` and ``utils.template_outline.outline_template``), so a
+    model that learns it once can follow any of them.
+    """
+    first, last = offset + 1, offset + count
+    if last < total:
+        return {
+            "_truncated": (
+                f"Showing {item_label} {first} to {last} of {total}. The rest are "
+                f"NOT in this response. Call again with {offset_param}={last} "
+                f"for the next part."
+            )
+        }
+    return {
+        "_page": (
+            f"Showing {item_label} {first} to {last} of {total}. "
+            "This is the LAST part."
+        )
+    }
+
+
+def page_by_bytes(
+    total: int,
+    offset: int,
+    build_page: Callable[[int, int], Dict[str, Any]],
+    *,
+    item_label: str,
+    offset_param: str,
+) -> Dict[str, Any]:
+    """The part of a dict-shaped read that starts at ``offset``, as large as fits.
+
+    ``build_page(start, count)`` returns a NEW dict, the whole result for items
+    ``[start, start + count)`` with no paging marker; whatever else a part
+    carries (a step map for its rules, the groups its rules head) is the
+    caller's to decide. This adds the marker, measures every trial WITH it, and
+    finds the size with ``_largest_prefix_that_fits``, the one search behind
+    every trim here (rule 16 in the repo CLAUDE.md). It exists so an outline
+    stage that pages a list (#1668) does not write its own search.
+
+    Shapes: every remaining item fits, so no ``_truncated`` (and ``_page`` when
+    ``offset`` is above 0, saying it is the last part); or ``_truncated`` naming
+    the next ``offset_param``. ``total`` 0 returns ``build_page(0, 0)`` as it
+    is. KNOWN BOUNDARY, as for every caller of the search: a part always holds
+    at least one item, so one item that is over the ceiling with what rides
+    beside it is returned over it, still marked.
+    """
+    if offset < 0 or (total and offset >= total) or (not total and offset):
+        raise ValueError(f"{offset_param} {offset} is outside 0..{max(total - 1, 0)}")
+    if total == 0:
+        return build_page(0, 0)
+
+    def build(n: int) -> Dict[str, Any]:
+        part = build_page(offset, n)
+        if offset + n < total or offset:
+            part.update(paging_marker(item_label, offset, n, total, offset_param))
+        return part
+
+    rest = total - offset
+    whole = build(rest)
+    if _encoded_len(whole) <= MAX_RESULT_BYTES:
+        return whole
+    kept = _largest_prefix_that_fits(rest, build)
+    logger.info(
+        "Paged %s: returned %d to %d of %d", item_label, offset + 1, offset + kept, total
+    )
+    return build(kept)
+
+
 def page_list_by_bytes(
     items: List[Any],
     offset: int,
@@ -274,22 +350,9 @@ def page_list_by_bytes(
     rest = items[offset:]
 
     def build(n: int) -> Dict[str, Any]:
-        first, last = offset + 1, offset + n
-        if last < total:
-            return {
-                "data": rest[:n],
-                "_truncated": (
-                    f"Showing {item_label} {first} to {last} of {total}. The rest are "
-                    f"NOT in this response. Call again with {offset_param}={last} "
-                    f"for the next part."
-                ),
-            }
         return {
             "data": rest[:n],
-            "_page": (
-                f"Showing {item_label} {first} to {last} of {total}. "
-                "This is the LAST part."
-            ),
+            **paging_marker(item_label, offset, n, total, offset_param),
         }
 
     kept = _largest_prefix_that_fits(len(rest), build)
@@ -331,6 +394,11 @@ def compact_dict_list_field(
     fit. ``utils.template_outline.outline_template`` is the one outline; it
     pages with ``_largest_prefix_that_fits``, the same search used here. A
     result that already fits at ``offset`` 0 is still returned unchanged.
+    Since #1668 two other large-template reads pass their own outline from
+    that module: ``outline_automation_read`` (``analyze_template_automations``,
+    paged by ``rule_offset``) and ``outline_kickoff_suggestion``
+    (``suggest_kickoff_fields``, paged by ``step_offset``). Both page through
+    ``page_by_bytes``.
 
     This is the ONE implementation. It exists because the same binary search was
     written a third time inline in ``tools/task_management.py``; see rule 16 in

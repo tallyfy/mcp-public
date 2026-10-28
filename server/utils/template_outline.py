@@ -44,6 +44,14 @@ and this module does the shaping.
 ``template_testing.document`` (``parse_template``), the same model
 ``test_template`` walks, so the outline and the template tester cannot
 disagree about which steps start hidden.
+
+**Two more reads (#1668).** ``outline_automation_read`` pages the rules of
+``analyze_template_automations`` with ``rule_offset`` and cuts its step map
+to the steps each part's rules name; ``outline_kickoff_suggestion`` pages
+the steps of ``suggest_kickoff_fields`` with ``step_offset`` and outlines its
+kickoff fields. Both page through ``utils.sdk_serializer.page_by_bytes``,
+which calls the same search, and are reached through
+``compact_dict_list_field(..., outline=...)`` like the whole-template outline.
 """
 
 from __future__ import annotations
@@ -63,6 +71,9 @@ from utils.sdk_serializer import (
     MAX_RESULT_BYTES,
     _encoded_len,
     _largest_prefix_that_fits,
+    page_by_bytes,
+    paging_marker,
+    serialize_dataclass,
 )
 
 logger = logging.getLogger(__name__)
@@ -453,18 +464,8 @@ def outline_template(
 
     def build(n: int, rule_count: Optional[int] = None) -> Dict[str, Any]:
         page = shaped.page(offset, n, rule_count=rule_count)
-        first, last = offset + 1, offset + n
-        if last < total:
-            page["_truncated"] = (
-                f"Showing {item_label} {first} to {last} of {total}. The rest are "
-                f"NOT in this response. Call again with {offset_param}={last} "
-                "for the next part."
-            )
-        elif offset:
-            page["_page"] = (
-                f"Showing {item_label} {first} to {last} of {total}. "
-                "This is the LAST part."
-            )
+        if offset + n < total or offset:
+            page.update(paging_marker(item_label, offset, n, total, offset_param))
         return page
 
     rest = total - offset
@@ -485,3 +486,178 @@ def outline_template(
         "Outlined %s: returned %d to %d of %d", item_label, offset + 1, offset + kept, total
     )
     return build(kept, rule_count)
+
+
+# ---------------------------------------------------------------------------
+# Two more reads of a large template (#1668): the automation read and the
+# kickoff-field suggestion read. Each is an outline stage handed to
+# ``compact_dict_list_field(..., outline=...)``, and each pages with
+# ``page_by_bytes``, so neither writes its own search.
+# ---------------------------------------------------------------------------
+
+STEP_LOOKUP_NOTE_KEY = "_step_lookup"
+KICKOFF_FIELDS_KEY = "existing_kickoff_fields"
+
+
+def _automation_note(shown: int, total_steps: Any, has_groups: bool) -> str:
+    note = (
+        f"Too large for one response, so step_lookup holds only the {shown} "
+        f"step{'' if shown == 1 else 's'} the rules in this response name, of "
+        f"{total_steps} in the template. A step "
+        "id one of these rules names (an action target, or a Step condition) that "
+        "is not in step_lookup is not in the template. The rules themselves are whole."
+    )
+    if has_groups:
+        note += (
+            " Each redundant group is in the part holding its first rule; its "
+            "rule_ids can name rules in other parts."
+        )
+    return note
+
+
+def outline_automation_read(
+    result: Dict[str, Any],
+    *,
+    list_key: str = "automations",
+    item_label: str = "automation rules",
+    offset: int = 0,
+    offset_param: str = "rule_offset",
+) -> Dict[str, Any]:
+    """Page an oversize ``analyze_template_automations`` result by rule (#1668).
+
+    **Why.** On the 247-step, 69-rule fixture the read sent a map of every
+    step title (15,248 bytes) beside the rules, so only 11 of 69 rules fitted
+    under the ceiling, and the other 58 could not be reached at all.
+
+    **What a part holds.** The rules ``[offset, offset + n)``, whole, as the
+    tool serialised them; a ``step_lookup`` cut to the steps those rules name
+    (``rule_step_ids``, the same reading of a rule the template outline uses);
+    each redundant group in the part that holds its first rule, so a full read
+    sees every group once; and every other key (the template's id and title,
+    the true totals) unchanged. A step id a part's rules name that is not in
+    its ``step_lookup`` is therefore not in the template, which keeps the
+    orphan check the tool description teaches working on every part.
+
+    Measured on the fixture: 69 full rules alone are about 53 KB, so no single
+    response can hold them; they arrive in parts, each under the ceiling.
+    """
+    rules = _as_list(result.get(list_key))
+    lookup_in = result.get("step_lookup")
+    step_lookup: Dict[str, Any] = lookup_in if isinstance(lookup_in, dict) else {}
+    groups = _as_list(result.get("redundant_groups"))
+
+    index_of: Dict[Any, int] = {}
+    for i, rule in enumerate(rules):
+        if isinstance(rule, dict) and rule.get("id") and rule["id"] not in index_of:
+            index_of[rule["id"]] = i
+    named = [set(rule_step_ids(r)) if isinstance(r, dict) else set() for r in rules]
+    home = [
+        min((index_of[i] for i in (g.get("rule_ids") or []) if i in index_of), default=0)
+        if isinstance(g, dict) else 0
+        for g in groups
+    ]
+    total_steps = result.get("total_steps", len(step_lookup))
+
+    def build_page(start: int, count: int) -> Dict[str, Any]:
+        end = start + count
+        wanted = set().union(*named[start:end])
+        lookup = {sid: title for sid, title in step_lookup.items() if sid in wanted}
+        page: Dict[str, Any] = {}
+        for key, value in result.items():
+            if key == list_key:
+                page[key] = rules[start:end]
+            elif key == "step_lookup":
+                page[key] = lookup
+            elif key == "redundant_groups":
+                page[key] = [g for g, h in zip(groups, home) if start <= h < end]
+            else:
+                page[key] = value
+        page[STEP_LOOKUP_NOTE_KEY] = _automation_note(
+            len(lookup), total_steps, "redundant_groups" in result
+        )
+        return page
+
+    return page_by_bytes(
+        len(rules), offset, build_page, item_label=item_label, offset_param=offset_param
+    )
+
+
+def _kickoff_suggestion_note(offset_param: str, first: bool) -> str:
+    note = (
+        "This template was too large to return whole, so it is an OUTLINE: steps "
+        "in position order, each with id, position, title and summary (a summary "
+        "over 500 characters is cut and says so), and each existing kickoff field "
+        "as id, label, alias, type and required. Read every part before suggesting "
+        "fields. Read full values with get_kickoff_fields or "
+        "get_template_steps(step_id=..., full_text=True)."
+    )
+    if not first:
+        note += (
+            " This is a later part: template_summary and existing_kickoff_fields "
+            f"are in the first part ({offset_param}=0)."
+        )
+    return note
+
+
+def outline_kickoff_suggestion(
+    result: Dict[str, Any],
+    *,
+    list_key: str = "steps",
+    item_label: str = "steps",
+    offset: int = 0,
+    offset_param: str = "step_offset",
+    positions: Optional[Dict[Any, Any]] = None,
+) -> Dict[str, Any]:
+    """Page an oversize ``suggest_kickoff_fields`` result by step (#1668).
+
+    **Why.** On the 247-step fixture the read was 68,287 bytes with no size
+    control at all, so a client that cuts long results lost the end of it
+    with nothing saying so.
+
+    **What a part holds.** Steps in position order (``positions`` maps step id
+    to position, because the tool's small result carries none and stays as it
+    was), each as id, position, title and summary, the summary cut at the
+    server's 500-character cap with its marker. The first part also holds
+    ``template_summary`` and the existing kickoff fields as
+    ``outline_kickoff_field`` outlines; the SDK model keeps a kickoff field's
+    ``label`` under ``extra``, so it is read from there when it is not at the
+    top level.
+    """
+    positions = positions or {}
+    raw_steps = []
+    for step in _as_list(result.get(list_key)):
+        if not isinstance(step, dict):
+            continue
+        raw_steps.append({
+            "id": step.get("id"),
+            "position": positions.get(step.get("id"), step.get("position")),
+            "title": step.get("title"),
+            "summary": step.get("summary"),
+        })
+    steps = [
+        serialize_dataclass(s, _sanitize=False) for s in steps_in_position_order(raw_steps)
+    ]
+    fields = [
+        outline_kickoff_field({**(f.get("extra") or {}), **f})
+        for f in _as_list(result.get(KICKOFF_FIELDS_KEY))
+        if isinstance(f, dict)
+    ]
+    first_part_only = ("template_summary", KICKOFF_FIELDS_KEY)
+
+    def build_page(start: int, count: int) -> Dict[str, Any]:
+        first = start == 0
+        page: Dict[str, Any] = {}
+        for key, value in result.items():
+            if key == list_key:
+                page[key] = steps[start:start + count]
+            elif key in first_part_only:
+                if first:
+                    page[key] = fields if key == KICKOFF_FIELDS_KEY else value
+            else:
+                page[key] = value
+        page[OUTLINE_KEY] = _kickoff_suggestion_note(offset_param, first)
+        return page
+
+    return page_by_bytes(
+        len(steps), offset, build_page, item_label=item_label, offset_param=offset_param
+    )

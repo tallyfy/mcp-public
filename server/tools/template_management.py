@@ -52,6 +52,7 @@ from utils.template_outline import (
     MISSING_STEPS_KEY,
     OUTLINE_KEY,
     UNKNOWN_STEPS_KEY,
+    outline_kickoff_suggestion,
     outline_template,
 )
 from utils.pagination import fetch_single_page
@@ -564,6 +565,31 @@ _WHOLE_TEMPLATE_SIZE_NOTE = (
     "the real value. Never write an outline or a cut value back to Tallyfy: re-read it "
     "first with get_template_steps(step_id=..., full_text=True)."
 )
+
+
+def _bounded_kickoff_suggestion(
+    result: Dict[str, Any], positions: Dict[Any, Any], step_offset: int
+) -> Dict[str, Any]:
+    """Keep ``suggest_kickoff_fields`` under the response ceiling (#1668).
+
+    It had no size control: on the 247-step fixture it answered 68,287 bytes
+    with no marker. A result that fits comes back unchanged. Otherwise the
+    shared trimmer hands it to ``outline_kickoff_suggestion``, which pages the
+    steps in position order with ``step_offset`` and outlines the kickoff
+    fields on the first part. ``positions`` maps step id to position, because
+    the small result carries none and stays as it was.
+
+    Module level on purpose, like ``tools.automation._bounded_automation_read``:
+    a tool body that names ``compact_dict_list_field`` joins the whole-template
+    sweep in ``test_tool_descriptions.py``, whose required tokens (rules,
+    ``_missing_steps``) this read does not have. Its own guard is
+    ``TestSuggestKickoffFieldsOnTheIncidentShape``.
+    """
+    return compact_dict_list_field(
+        result, "steps", item_label="steps",
+        outline=partial(outline_kickoff_suggestion, positions=positions),
+        offset=step_offset, offset_param="step_offset",
+    )
 
 
 def _check_step_offset(step_offset: int, template: Dict[str, Any] | None = None) -> None:
@@ -1641,7 +1667,7 @@ step_data keys:
 
     @mcp.tool(
         name="suggest_kickoff_fields",
-        description="""Retrieve template data with existing kickoff fields and step context to recommend new kickoff fields.
+        description=f"""Retrieve template data with existing kickoff fields and step context to recommend new kickoff fields.
 
 Returns the template title, summary, existing prerun/kickoff fields, and step titles/summaries.
 
@@ -1652,7 +1678,15 @@ Use this data to suggest kickoff fields that would help initialize the workflow 
 - Field types: text, textarea, date, dropdown, multiselect, radio, file, table, assignees_form
   (there is NO `number` and NO `checkbox` field type; add_kickoff_field rejects both)
 
-REQUIRED: 'template_id'.""",
+SIZE: a template too big for one response comes back as an OUTLINE marked "{OUTLINE_KEY}",
+in parts: steps in position order with id, position, title and summary, and the existing
+kickoff fields as id, label, alias, type and required, in the first part only.
+"_truncated" means more steps remain: call again with the step_offset it names until a
+part says "This is the LAST part." Read every part before suggesting. Text CONTAINING
+"{TRUNCATION_MARKER_PREFIX}" is only part of the real value; read it whole with
+get_template_steps(step_id=..., full_text=True) or get_kickoff_fields.
+
+REQUIRED: 'template_id'. OPTIONAL: 'step_offset', only as a "_truncated" marker names it.""",
         tags=["templates", "workflow", "analysis", "kickoff", "read-only"],
         annotations=ToolAnnotations(
             title="Suggest kickoff fields",
@@ -1665,16 +1699,21 @@ REQUIRED: 'template_id'.""",
     )
     @track_tool_execution("suggest_kickoff_fields")
     @handle_tallyfy_errors("suggest kickoff fields")
-    def suggest_kickoff_fields(template_id: TemplateId) -> GenericDict:
+    def suggest_kickoff_fields(template_id: TemplateId, step_offset: int = 0) -> GenericDict:
         """
         Retrieve template data with existing kickoff fields for field suggestions.
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
+            step_offset: Steps already received, taken from the "_truncated"
+                marker on the previous part of a large template (#1668).
 
         Returns:
-            Dictionary with template metadata, existing prerun fields, and step summaries
+            Dictionary with template metadata, existing prerun fields, and step
+            summaries; an outline in parts by step_offset when it exceeds the
+            result ceiling
         """
+        _check_step_offset(step_offset)
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             template = sdk.templates.get_template(org_id, template_id=template_id)
@@ -1690,15 +1729,23 @@ REQUIRED: 'template_id'.""",
                         'title': s.title,
                         'summary': s.summary,
                     })
+            _check_step_offset(step_offset, {"steps": steps_summary})
+            positions = {s.id: s.position for s in (template.steps or [])}
 
+            # It had no size control at all (#1668). Through the one shared
+            # trimmer with its own outline stage; see _bounded_kickoff_suggestion.
             return ToolResult(
-                content={
-                    'template_id': template_id,
-                    'template_title': template.title,
-                    'template_summary': template.summary,
-                    'existing_kickoff_fields': existing_prerun,
-                    'steps': steps_summary,
-                },
+                content=_bounded_kickoff_suggestion(
+                    {
+                        'template_id': template_id,
+                        'template_title': template.title,
+                        'template_summary': template.summary,
+                        'existing_kickoff_fields': existing_prerun,
+                        'steps': steps_summary,
+                    },
+                    positions,
+                    step_offset,
+                ),
                 structured_content=None
             )
 

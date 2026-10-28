@@ -22,7 +22,8 @@ from utils.authoring_payloads import (
     AutomationRuleUpdateData,
     documented_payload,
 )
-from utils.sdk_serializer import MAX_RESULT_BYTES, compact_dict_list_field, serialize_dataclass
+from utils.sdk_serializer import compact_dict_list_field, serialize_dataclass
+from utils.template_outline import outline_automation_read
 from template_testing.references import orphaned_reference_ids
 from template_testing.checks import PLAN_STATE_ACTIVE, PLAN_STATE_INACTIVE
 from template_testing.document import NotATemplateDocument
@@ -46,32 +47,35 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def _bounded_automation_read(result, list_key: str, item_label: str, secondary=None):
+def _bounded_automation_read(
+    result, list_key: str, item_label: str, *, outline=None, offset: int = 0,
+    offset_param: str = "offset",
+):
     """Keep an automation read under the response ceiling, and say when it does not fit.
 
     ``analyze_template_automations`` and ``suggest_automation_consolidation``
     returned their lists with no size control, so a template with enough rules
     went over the ceiling and the client cut it with nothing saying so
     (tallyfy/mcp#986, reproduced on staging: 60 rules answered 42,551 bytes).
-    The shared trimmer adds ``_truncated: "Showing N of M <item_label>"`` only
-    when it actually trims, and leaves every other key alone, so the totals
-    beside the list stay true.
+    A result that fits comes back unchanged and unmarked.
 
-    ``secondary`` is an optional ``(key, label)`` for a second list that can
-    still hold the result over the ceiling after the first is trimmed. On
-    analyze that is ``redundant_groups``: every group names each of its rules
-    with an alias, so a template of 120 identical rules is still about 28 KB
-    with its ``automations`` cut. The primary list is trimmed first, because
-    the groups are what tell the model those rules are duplicates. The first
-    marker rides in a placeholder key while the second list is measured, so the
-    final, combined marker is shorter than what was measured and the result
-    cannot land over the ceiling.
+    **analyze pages (#1668).** It passes ``outline=outline_automation_read``
+    and ``offset_param="rule_offset"``. Cutting its rule list was a dead end:
+    on the 247-step, 69-rule fixture the map of every step title took 15,248
+    bytes, 11 rules fitted beside it, and the other 58 could not be reached.
+    Now each part holds as many whole rules as fit, a step map cut to the
+    steps those rules name, and the redundant groups those rules head, and
+    ``_truncated`` names the next ``rule_offset``. This replaced the
+    ``secondary`` second trim of ``redundant_groups``: a group now rides with
+    its first rule, so no part carries every group. KNOWN BOUNDARY, the one
+    every caller of the shared search has: a part holds at least one rule, so
+    ONE rule whose groups are over the ceiling on their own (well over a
+    hundred identical rules with long aliases) comes back over it, still
+    marked, and the next part is still reachable.
 
-    KNOWN BOUNDARY, the same one every caller of the shared trimmer has: it
-    never returns fewer than one item, so ONE group that is itself over the
-    ceiling (well over a hundred identical rules with long aliases) still comes
-    back over it. The ``automations`` note is still there; no false note is
-    added for the group.
+    **suggest trims.** It passes no outline, so the shared trimmer cuts the
+    priority-sorted ``suggestions`` with ``_truncated: "Showing N of M
+    suggestions"`` and leaves the summary's true totals alone.
 
     This sits at module level on purpose. A tool body that names
     ``compact_dict_list_field`` joins the template-read sweep in
@@ -79,28 +83,10 @@ def _bounded_automation_read(result, list_key: str, item_label: str, secondary=N
     steps. These reads carry their own guard,
     ``TestAutomationReadsAreBounded``.
     """
-    bounded = compact_dict_list_field(result, list_key, item_label=item_label)
-    encoded = len(json.dumps(bounded, separators=(",", ":"), default=str))
-    if secondary is None or encoded <= MAX_RESULT_BYTES:
-        return bounded
-
-    key, label = secondary
-    before = bounded.get(key)
-    first = bounded.pop("_truncated", None)
-    if first is not None:
-        bounded["_truncated_primary"] = first
-    bounded = compact_dict_list_field(bounded, key, item_label=label)
-    first = bounded.pop("_truncated_primary", None)
-    second = bounded.pop("_truncated", None)
-    # The shared trimmer never keeps fewer than one item, so a single group
-    # over the ceiling comes back whole with "Showing 1 of 1". That note would
-    # be false, so it is dropped and only a real cut is reported.
-    if isinstance(before, list) and len(bounded.get(key) or []) == len(before):
-        second = None
-    notes = [note for note in (first, second) if note]
-    if notes:
-        bounded["_truncated"] = "; ".join(notes)
-    return bounded
+    return compact_dict_list_field(
+        result, list_key, item_label=item_label,
+        outline=outline, offset=offset, offset_param=offset_param,
+    )
 
 
 def register_automation_tools(mcp):
@@ -1128,33 +1114,32 @@ To keep a condition or action UNCHANGED, resend it verbatim including its `id`."
 
 This is the ONLY tool that reads automation rules - there is no separate
 list_automation_rules and no get_automations. Use it whenever the user asks to
-see, list, review, audit, export or explain a template's automations, not only
-when they ask for analysis.
+see, list, review, audit, export or explain a template's automations.
 
 RETURNS: template_id, template_title, automations (every rule in full: its
 conditions, its then_actions, their targets and ids), step_lookup (step id ->
-title), redundant_groups (pre-computed duplicates and merge candidates),
-total_automations, total_steps. Over the size limit, automations (then
-redundant_groups) are cut and `_truncated` says "Showing N of M"; totals stay true.
+title), redundant_groups (duplicates and merge candidates), total_automations,
+total_steps (true totals).
+
+SIZE: a large template comes back in parts. `_truncated` means more rules
+remain: call again with the rule_offset it names until a part says "This is the
+LAST part." Read every part before judging. A part's step_lookup holds only the
+steps its rules name, and each group is in the part holding its first rule.
 
 HIDDEN AT LAUNCH: a step targeted by a "visibility"/"show" action starts HIDDEN
-in every process launched from this template, revealed when the rule fires. That
-is how "hidden by default" is expressed - there is no per-step flag, so these
-rules are the only record of it.
+in every process launched from this template, revealed when the rule fires.
+There is no per-step flag; these rules are the only record of it.
 
 Use this data to:
-- Review redundant_groups for exact duplicates (same trigger AND actions) and same-trigger rules (mergeable actions)
-- Find conflicting rules (same conditions but contradictory actions, e.g. show vs hide the same step)
+- Review redundant_groups: exact duplicates (same trigger AND actions) and same-trigger rules (mergeable actions)
+- Find conflicting rules (same conditions, contradictory actions, e.g. show vs hide the same step)
 - Spot orphaned rules: a then-action `target_step_id` not in step_lookup, or a condition whose `conditionable_type` is "Step" and whose `conditionable_id` is not in step_lookup. A `conditionable_type` of "Capture" (form field) or "Prerun" (kickoff field) is a valid trigger whose id is NOT a step id, so its absence from step_lookup is normal, NOT an orphan.
-- Assess automation complexity and suggest simplification
 
-IMPORTANT: Two rules with the same structure (e.g. both have 1 condition and 1 action) are NOT redundant
-if they reference different steps. Always compare conditionable_id AND target_step_id values.
+Rules with the same shape are NOT redundant if they name different steps:
+compare conditionable_id AND target_step_id. To consolidate,
+update_automation_rule merges actions and delete_automation_rule removes duplicates.
 
-To consolidate: review redundant_groups, then use update_automation_rule to merge actions and
-delete_automation_rule to remove duplicates.
-
-REQUIRED: 'template_id'.""",
+REQUIRED: 'template_id'. OPTIONAL: 'rule_offset', only as a "_truncated" marker names it.""",
         tags=["automation", "automations", "rules", "list", "read", "analysis",
               "optimization", "read-only"],
         annotations=ToolAnnotations(
@@ -1168,17 +1153,22 @@ REQUIRED: 'template_id'.""",
     )
     @track_tool_execution("analyze_template_automations")
     @handle_tallyfy_errors("analyze template automations")
-    def analyze_template_automations(template_id: TemplateId) -> GenericDict:
+    def analyze_template_automations(template_id: TemplateId, rule_offset: int = 0) -> GenericDict:
         """
         Retrieve and analyze all automation rules for a template.
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
+            rule_offset: Rules already received, taken from the "_truncated"
+                marker on the previous part of a large template (#1668).
 
         Returns:
             Dictionary with automations (raw rules), step_lookup (id-to-title map),
-            redundant_groups (pre-computed duplicates/merge candidates), and template metadata
+            redundant_groups (pre-computed duplicates/merge candidates), and template
+            metadata; in parts by rule_offset when it exceeds the result ceiling
         """
+        if rule_offset < 0:
+            raise ToolError(f"rule_offset must be 0 or more, got {rule_offset}.")
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             template = sdk.templates.get_template(org_id, template_id=template_id)
@@ -1189,7 +1179,16 @@ REQUIRED: 'template_id'.""",
             automations = [serialize_dataclass(a) for a in template.automated_actions] if template.automated_actions else []
             step_lookup = {s['id']: s.get('title', 'Unknown') for s in steps if 'id' in s}
             redundant_groups = _detect_redundant_groups(automations)
+            if rule_offset and rule_offset >= len(automations):
+                raise ToolError(
+                    f"rule_offset={rule_offset} is past the end: this template has "
+                    f"{len(automations)} automation rules, so the largest valid "
+                    f"rule_offset is {max(len(automations) - 1, 0)}."
+                )
 
+            # Over the ceiling, the rules come in parts by rule_offset, each with
+            # a step map cut to the steps its rules name (#1668). See
+            # _bounded_automation_read and utils.template_outline.outline_automation_read.
             return ToolResult(
                 content=_bounded_automation_read(
                     {
@@ -1203,7 +1202,9 @@ REQUIRED: 'template_id'.""",
                     },
                     'automations',
                     'automation rules',
-                    secondary=('redundant_groups', 'redundant groups'),
+                    outline=outline_automation_read,
+                    offset=rule_offset,
+                    offset_param='rule_offset',
                 ),
                 structured_content=None
             )
