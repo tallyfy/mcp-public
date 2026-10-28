@@ -20,11 +20,12 @@ Environment Support:
 - Individual endpoint overrides available via environment variables
 """
 
+import base64
 import json
 import logging
 import re
-from typing import Any, Dict, Optional
-from urllib.parse import parse_qs
+from typing import Any, Dict, Optional, Tuple
+from urllib.parse import parse_qs, unquote_plus, urlencode
 
 import httpx
 
@@ -246,6 +247,75 @@ def _requested_grant_type(body: bytes, content_type: str) -> str:
         return values[0] if values else ""
     except Exception:  # pragma: no cover - defensive, must never break the proxy
         return ""
+
+
+def _basic_client_credentials(authorization: str) -> Optional[Tuple[str, str]]:
+    """Decode client credentials from an ``Authorization: Basic`` header.
+
+    RFC 6749 section 2.3.1: the client id and secret are each
+    form-urlencoded, joined with a colon and base64 encoded, so both halves
+    are url-decoded here (``+`` is a space), as api-v2 does with urldecode().
+
+    Returns ``(client_id, client_secret)``, or None when the header is not
+    Basic or does not decode to ``id:secret`` with a non-empty id. None means
+    "do not guess": the caller forwards the request unchanged and the
+    authorization server answers it.
+    """
+    scheme, _, token = (authorization or "").strip().partition(" ")
+    if scheme.lower() != "basic":
+        return None
+    try:
+        decoded = base64.b64decode(token.strip(), validate=True).decode("utf-8")
+    except ValueError:  # binascii.Error and UnicodeDecodeError are both ValueErrors
+        return None
+    raw_id, colon, raw_secret = decoded.partition(":")
+    if not colon:
+        return None
+    client_id = unquote_plus(raw_id)
+    if not client_id:
+        return None
+    return client_id, unquote_plus(raw_secret)
+
+
+def _with_client_credentials(
+    body: bytes, content_type: str, client_id: str, client_secret: str
+) -> bytes:
+    """Add ``client_id``, and ``client_secret`` when absent, to a token request body.
+
+    Issue #1661: api-v2 validates ``client_id`` in the body before it reads
+    any Basic header, so a client that authenticates with
+    ``client_secret_basic`` (which discovery advertises) and sends no body
+    ``client_id`` was refused with a 422. The header itself is still
+    forwarded, because api-v2 reads it for ``client_secret_basic`` clients.
+
+    A body that already names ``client_id`` is returned unchanged, secret
+    included. A form body is extended by appending, so the caller's own
+    bytes are forwarded as they were. A body this cannot read (not UTF-8,
+    not a JSON object, or another content type) is returned unchanged.
+    """
+    content_type = (content_type or "").lower()
+    if "json" in content_type:
+        payload = _decode_json_object(body)
+        if payload is None or "client_id" in payload:
+            return body
+        payload["client_id"] = client_id
+        if client_secret and "client_secret" not in payload:
+            payload["client_secret"] = client_secret
+        return json.dumps(payload).encode("utf-8")
+
+    if "application/x-www-form-urlencoded" not in content_type:
+        return body
+    try:
+        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        return body
+    if "client_id" in fields:
+        return body
+    extra = {"client_id": client_id}
+    if client_secret and "client_secret" not in fields:
+        extra["client_secret"] = client_secret
+    separator = b"&" if body and not body.endswith(b"&") else b""
+    return body + separator + urlencode(extra).encode("ascii")
 
 
 def _normalize_token_error(status_code: int, content: bytes, grant_type: str) -> JSONResponse:
@@ -864,10 +934,25 @@ def register_oauth_routes(mcp):
             if "Authorization" in request.headers:
                 headers["Authorization"] = request.headers["Authorization"]
 
+            # A client using client_secret_basic may send its id only in the
+            # header, and api-v2 requires it in the body (issue #1661). Copy
+            # it across. Log the id, which is public, and never the secret.
+            forwarded_body = body
+            credentials = _basic_client_credentials(request.headers.get("Authorization", ""))
+            if credentials is not None:
+                forwarded_body = _with_client_credentials(
+                    body, request_content_type, credentials[0], credentials[1]
+                )
+                if forwarded_body != body:
+                    logger.info(
+                        "Token request: client_id %r taken from the Basic Authorization header",
+                        credentials[0],
+                    )
+
             async with httpx.AsyncClient(timeout=OAUTH_PROXY_TIMEOUT) as client:
                 response = await client.post(
                     upstream_url,
-                    content=body,
+                    content=forwarded_body,
                     headers=headers,
                     follow_redirects=False,
                 )

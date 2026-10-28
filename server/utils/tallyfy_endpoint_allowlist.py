@@ -141,6 +141,28 @@ _WRITE_SCOPE_RULES: Tuple[Tuple[re.Pattern, str], ...] = (
 
 _WRITE_METHODS: FrozenSet[str] = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
+# POST routes that only read (#1660): api-v2's table query engine,
+# ``POST organizations/{org}/{checklists|runs|tasks}/query`` and its distinct
+# values route ``.../query/values``. api-v2's ``EnforceMcpTokenScopes`` treats
+# any POST route with a ``query`` segment as a read (``READ_ONLY_POST_SEGMENTS``,
+# api-v2 #10589), so a token holding only ``mcp.tasks.read`` may call
+# ``tasks/query`` there, and this gate must not demand ``mcp.tasks.write`` for
+# the same call. Deliberately narrower than api-v2's rule: ``query/export``
+# starts an export job, so it stays a write here, and so does every other
+# dataset until a tool needs it. Anchored at both ends, so a POST to a resource
+# that merely has ``query`` somewhere in its path is still a write.
+_READ_ONLY_POST_RULES: Tuple[re.Pattern, ...] = (
+    re.compile(r"^/organizations/[^/]+/(checklists|runs|tasks)/query(/values)?$"),
+)
+
+
+def is_read_only_post(method: str, path: str) -> bool:
+    """True for a POST to a route that only reads (see ``_READ_ONLY_POST_RULES``)."""
+    if method.upper() != "POST":
+        return False
+    norm = _normalize_path(path)
+    return any(rx.match(norm) for rx in _READ_ONLY_POST_RULES)
+
 
 @dataclass(frozen=True)
 class AllowlistResult:
@@ -207,7 +229,9 @@ def check(
             acquiring the opposite behaviour.
     """
     method_u = method.upper()
-    is_destructive = method_u in _WRITE_METHODS
+    read_only_post = is_read_only_post(method_u, path)
+    # A POST that only reads is neither destructive nor write-scope gated (#1660).
+    is_destructive = method_u in _WRITE_METHODS and not read_only_post
     # An absent claim is not an empty grant. See the module docstring.
     is_scoped_token = mcp_scopes is not None
 
@@ -242,6 +266,6 @@ def check(
     return AllowlistResult(
         allowed=True,
         is_destructive=is_destructive,
-        required_scope=required_write_scope(path),
+        required_scope=None if read_only_post else required_write_scope(path),
         scope_gated=is_scoped_token,
     )

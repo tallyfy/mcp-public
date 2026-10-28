@@ -81,8 +81,33 @@ def fetch_single_page(
         # would always return 1 for large lists fetched in 20-item chunks.
         total_pages = max(1, math.ceil(api_total / per_page)) if api_total else 1
 
-    serialized = serialize_dataclass(page_items)
+    return shape_page(
+        serialize_dataclass(page_items),
+        total=api_total,
+        total_pages=total_pages,
+        page=page,
+        page_offset=page_offset,
+        compact_fields=compact_fields,
+    )
 
+
+def shape_page(
+    serialized: List[Any],
+    *,
+    total: int,
+    total_pages: int,
+    page: int,
+    page_offset: int = 0,
+    compact_fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Build a listing tool's result from one page of already serialized rows.
+
+    This is the second half of ``fetch_single_page``, split out so a listing
+    that reads its rows somewhere other than an SDK list method (the api-v2
+    table query engine, #1660) returns exactly the same shape: the same
+    ``meta`` keys, the same ``page_offset`` rule and the same byte cap with
+    its ``_truncated`` marker.
+    """
     if compact_fields:
         for record in serialized:
             if isinstance(record, dict):
@@ -98,7 +123,7 @@ def fetch_single_page(
     rows = serialized[page_offset:] if page_offset else serialized
 
     meta: Dict[str, Any] = {
-        "total": api_total,
+        "total": total,
         "returned": len(rows),
         "truncated": False,
         "page": page,

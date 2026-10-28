@@ -5,6 +5,7 @@ Tools for managing processes and runs
 
 import re
 from datetime import datetime, timezone
+from functools import partial
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from fastmcp.exceptions import ToolError
@@ -36,6 +37,8 @@ from utils.kickoff_encoding import normalize_keyed_payload
 from utils.pagination import fetch_single_page
 from utils import scheduled_jobs as sj
 from metrics import track_tool_execution
+from constants import DEFAULT_PAGE_SIZE
+from utils import query_engine
 
 
 def _is_tallyfy_id(value: str) -> bool:
@@ -117,6 +120,11 @@ RUN TYPE VALUES: "procedure", "form", "document"
 FOLDER: Pass folder ID or folder name (name is auto-resolved to ID).
 OWNERS: Pass numeric user IDs. Filters by collaborator presence (run owner OR task assignee), NOT by strict process creator/started_by. Use owners= to find runs the user is involved in, not runs they personally launched.
 
+ROWS: each process carries at least id, name, checklist_id, checklist_title, status, progress
+(complete, total, percent), started_by, owner_id, starred, started_at, last_updated, due_date
+and extra.type. For everything about one process, call get_process. with_data or
+form_fields_values returns the full records with what they name.
+
 PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. to retrieve subsequent pages.
 meta.total_pages shows how many pages exist. meta.total shows the real count.""",
         tags={"processes", "workflow", "runs", "read-only"},
@@ -189,26 +197,59 @@ meta.total_pages shows how many pages exist. meta.total shows the real count."""
             if folder and not _is_tallyfy_id(folder):
                 folder = _resolve_folder_name_to_id(sdk, org_id, folder)
 
+            # Read through the table query engine when the call translates
+            # exactly, and answer from GET runs otherwise or when the engine
+            # cannot answer (#1660, utils/query_engine.py).
+            plan = query_engine.runs_query(
+                with_data=with_data,
+                form_fields_values=form_fields_values,
+                owners=owners,
+                task_status=task_status,
+                groups=groups,
+                status=status,
+                folder=folder,
+                checklist_id=checklist_id,
+                starred=starred,
+                run_type=run_type,
+                tag=tag,
+                sort=sort,
+                archived=archived,
+                page=page,
+                per_page=DEFAULT_PAGE_SIZE,
+            )
+            engine = None if plan is None else partial(
+                query_engine.engine_listing,
+                sdk, org_id, "runs",
+                columns=query_engine.RUN_COLUMNS,
+                sort=plan["sort"],
+                filter_tree=plan["filter_tree"],
+                row_mapper=query_engine.run_row,
+                page=plan["page"], per_page=DEFAULT_PAGE_SIZE,
+                page_offset=page_offset or 0,
+                compact_fields=["prerun"],
+            )
+            classic = partial(
+                fetch_single_page,
+                sdk.tasks.get_organization_runs,
+                org_id,
+                page=page, page_offset=page_offset or 0,
+                compact_fields=["prerun"],
+                with_data=with_data,
+                form_fields_values=form_fields_values,
+                owners=owners,
+                task_status=task_status,
+                groups=groups,
+                status=status,
+                folder=folder,
+                checklist_id=checklist_id,
+                starred=starred,
+                run_type=run_type,
+                tag=tag,
+                sort=sort,
+                archived=archived,
+            )
             return ToolResult(
-                content=fetch_single_page(
-                    sdk.tasks.get_organization_runs,
-                    org_id,
-                    page=page, page_offset=page_offset or 0,
-                    compact_fields=["prerun"],
-                    with_data=with_data,
-                    form_fields_values=form_fields_values,
-                    owners=owners,
-                    task_status=task_status,
-                    groups=groups,
-                    status=status,
-                    folder=folder,
-                    checklist_id=checklist_id,
-                    starred=starred,
-                    run_type=run_type,
-                    tag=tag,
-                    sort=sort,
-                    archived=archived,
-                ),
+                content=query_engine.engine_or_classic("get_organization_runs", engine, classic),
                 structured_content=None
             )
 

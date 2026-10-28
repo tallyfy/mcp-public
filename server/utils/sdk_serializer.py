@@ -304,6 +304,9 @@ def compact_dict_list_field(
     list_key: str,
     *,
     item_label: str = "items",
+    outline: Optional[Callable[..., Dict[str, Any]]] = None,
+    offset: int = 0,
+    offset_param: str = "offset",
 ) -> Dict[str, Any]:
     """
     Trim ``result[list_key]`` until the whole dict encodes under MAX_RESULT_BYTES.
@@ -318,6 +321,17 @@ def compact_dict_list_field(
     verbatim, which is what lets a caller keep a true total (e.g. the fan-out's
     ``task_count``) alongside a trimmed list.
 
+    **Whole-template reads pass ``outline`` (#1659).** Cutting only the list is
+    wrong for a whole template: its rules and kickoff fields stay full size, so
+    on a 247-step template with 69 rules the steps fell to ONE while every rule
+    pointing at the other 246 was still sent. With ``outline`` given, a result
+    that does not fit (or any ``offset`` above 0) is handed to it instead, and
+    it shrinks every step, rule and kickoff field to a short outline first and
+    pages the steps with ``offset_param`` only when the outlines still do not
+    fit. ``utils.template_outline.outline_template`` is the one outline; it
+    pages with ``_largest_prefix_that_fits``, the same search used here. A
+    result that already fits at ``offset`` 0 is still returned unchanged.
+
     This is the ONE implementation. It exists because the same binary search was
     written a third time inline in ``tools/task_management.py``; see rule 16 in
     the repo CLAUDE.md, where four copies of an option normalizer drifted apart
@@ -325,6 +339,19 @@ def compact_dict_list_field(
     """
     if not isinstance(result, dict):
         return result
+
+    if outline is not None:
+        if offset == 0 and _encoded_len(result) <= MAX_RESULT_BYTES:
+            return result
+        return outline(
+            result,
+            list_key=list_key,
+            item_label=item_label,
+            offset=offset,
+            offset_param=offset_param,
+        )
+    if offset:
+        raise ValueError("offset pages an outline; pass outline= to use it")
 
     items = result.get(list_key)
     if not isinstance(items, list) or not items:

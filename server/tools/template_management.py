@@ -4,6 +4,7 @@ Tools for managing templates, steps, and template health
 """
 
 import logging
+from functools import partial
 import re
 from typing import Annotated, Any, Dict
 
@@ -46,8 +47,17 @@ from utils.sdk_serializer import (
     MAX_RESULT_BYTES,
     TRUNCATION_MARKER_PREFIX,
 )
+from utils.template_health_facts import compute_health_facts
+from utils.template_outline import (
+    MISSING_STEPS_KEY,
+    OUTLINE_KEY,
+    UNKNOWN_STEPS_KEY,
+    outline_template,
+)
 from utils.pagination import fetch_single_page
 from metrics import track_tool_execution
+from constants import DEFAULT_PAGE_SIZE
+from utils import query_engine
 
 
 def _is_tallyfy_id(value: str) -> bool:
@@ -441,11 +451,12 @@ def _resolve_template_name(sdk, org_id: str, template_name: str) -> str:
 # and api-v2 honours all four.
 #
 # The two do NOT have to stay in step, and it would be wrong to add a guard
-# saying they must: `get_template` no longer calls the SDK method, so this
-# constant is the authority for what goes on the wire and the SDK's copy governs
-# nothing on this path. `assess_template_health` still uses the SDK method and
-# therefore still gets the SDK's list, which is fine because it reads a
-# template's shape rather than its tags.
+# saying they must: neither whole-template read calls the SDK method any more,
+# so this constant is the authority for what goes on the wire and the SDK's copy
+# governs nothing on this path. `assess_template_health` moved onto this read
+# in #1659, because its health facts need step keys the SDK's `Step` model does
+# not declare (`stage_id`, `owner_id`, `ai_assigned`) and kickoff `label`,
+# which `PrerunField` does not declare either.
 _TEMPLATE_INCLUDES = "steps,automated_actions,prerun,tags"
 
 
@@ -489,14 +500,29 @@ def _get_template_raw(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
     every include the same way; `steps` in particular must stay a plain list or
     `compact_dict_list_field` cannot trim an oversize template.
     """
+    return _serialize_template_body(_read_template_body(sdk, org_id, template_id))
+
+
+def _read_template_body(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
+    """The unwrapped template body exactly as api-v2 sent it, NOT serialised.
+
+    Split out of `_get_template_raw` for #1659: `assess_template_health`
+    computes its health facts from this, before the 500-character string cap
+    and before any trim, so a kickoff alias mentioned late in a long step
+    summary still counts as used. `{}` when nothing came back.
+    """
     response = sdk._make_request(
         "GET",
         f"organizations/{org_id}/checklists/{template_id}",
         params={"with": _TEMPLATE_INCLUDES},
     )
-    raw = unwrap_fractal(
+    return unwrap_fractal(
         response, ("steps", "tags", "automated_actions", "prerun")
     )
+
+
+def _serialize_template_body(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialise a body from `_read_template_body` the way `get_template` returns it."""
     if not raw:
         return {}
 
@@ -518,6 +544,46 @@ def _get_template_raw(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
         # what it looks like when the answer is no.
         content["tags"] = tags
     return content
+
+
+# What a whole-template read says about its size, shared by get_template and
+# assess_template_health so the two cannot describe the outline differently.
+_WHOLE_TEMPLATE_SIZE_NOTE = (
+    'a template too big for one response comes back as an OUTLINE marked "'
+    + OUTLINE_KEY
+    + '": each step, rule and kickoff field cut to a short summary, steps in position '
+    'order. "_truncated" means only some steps are in this part: call again with the '
+    "step_offset it names. The first part also holds the template's own fields and its "
+    "kickoff fields; each rule is in the part holding the first step it names. A rule's \""
+    + MISSING_STEPS_KEY
+    + '" lists its steps in other parts; "'
+    + UNKNOWN_STEPS_KEY
+    + '" lists step ids this template does not have. "_truncated_rules" means some rules '
+    "were left out; analyze_template_automations returns them all. No marker means every "
+    "step is here. Text CONTAINING \"" + TRUNCATION_MARKER_PREFIX + "\" is only part of "
+    "the real value. Never write an outline or a cut value back to Tallyfy: re-read it "
+    "first with get_template_steps(step_id=..., full_text=True)."
+)
+
+
+def _check_step_offset(step_offset: int, template: Dict[str, Any] | None = None) -> None:
+    """Refuse a step_offset no page starts at, before or after the read.
+
+    Called once with no template, so a negative value is refused before any
+    API call, and once with the read template, so a value past the last step
+    names the largest valid one rather than failing inside the outline.
+    """
+    if step_offset < 0:
+        raise ToolError(f"step_offset must be 0 or more, got {step_offset}.")
+    if template is None or not step_offset:
+        return
+    steps = template.get("steps")
+    count = len(steps) if isinstance(steps, list) else 0
+    if step_offset >= count:
+        raise ToolError(
+            f"step_offset={step_offset} is past the end: this template has {count} "
+            f"steps, so the largest valid step_offset is {max(count - 1, 0)}."
+        )
 
 
 def _normalize_step_payload(step_data: dict, valid_keys, rejected_keys) -> dict:
@@ -766,17 +832,12 @@ WRONG usage (will fail):
 If you don't have a template_id or name, use search_for_templates(query="...") first to find templates, or use get_all_templates() to list all templates.
 
 PREFER A NARROWER TOOL when you know what you want. This returns the whole template in one
-payload, so it hits the size ceiling soonest and is the most likely to come back trimmed:
+payload, so it hits the size ceiling soonest and is the most likely to come back as an outline:
 - steps, or a step's id: get_template_steps
 - automation rules: analyze_template_automations
 - kick-off (prerun) fields: get_kickoff_fields
 
-SIZE: if the response carries "_truncated", later steps were dropped and are NOT in it. If it
-carries "_withheld", a named field was removed whole and is NOT in it either. The trim
-reaches the step list only, so no marker is not a promise of completeness.
-If any text CONTAINS "{TRUNCATION_MARKER_PREFIX}", that string is only part of the real value.
-Never write a value carrying that marker back to Tallyfy; re-read it first with
-get_template_steps(step_id=..., full_text=True).""",
+SIZE: {_WHOLE_TEMPLATE_SIZE_NOTE}""",
         tags=["templates", "blueprints", "read-only"],
         annotations=ToolAnnotations(
             title="Get template",
@@ -792,6 +853,7 @@ get_template_steps(step_id=..., full_text=True).""",
     def get_template(
         template_id: OptionalString = "",
         template_name: OptionalString = "",
+        step_offset: int = 0,
     ) -> GenericDict:
         """
         Get a template (checklist) by its ID or name with full details.
@@ -799,9 +861,11 @@ get_template_steps(step_id=..., full_text=True).""",
         Args:
             template_id: Template (checklist) ID (provide this OR template_name, not both)
             template_name: Template (checklist) name (provide this OR template_id, not both)
+            step_offset: Steps already received, taken from the "_truncated"
+                marker on the previous part of an outlined template (#1659).
 
         Returns:
-            Template object, with its step list trimmed when the payload
+            Template object, or an outline of it in parts when the payload
             exceeds the result ceiling
         """
         if not template_id.strip() and not template_name.strip():
@@ -809,6 +873,7 @@ get_template_steps(step_id=..., full_text=True).""",
 
         if template_id.strip() and template_name.strip():
             raise ToolError("Only one of template_id or template_name should be provided")
+        _check_step_offset(step_offset)
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
@@ -819,20 +884,24 @@ get_template_steps(step_id=..., full_text=True).""",
             template = _get_template_raw(sdk, org_id, resolved_id)
             if not template:
                 return ToolResult(content={}, structured_content=None)
+            _check_step_offset(step_offset, template)
             # Whole-template reads have no size control of their own: compact_result
-            # only trims list-shaped results. Route through the ONE shared trimmer so
-            # an oversize template loses steps visibly, with a _truncated marker,
-            # instead of being handed over the 25KB ceiling silently.
+            # only trims list-shaped results. Route through the ONE shared trimmer
+            # with the template outline (#1659), so an oversize template shrinks
+            # every step, rule and kickoff field before any step is cut, and a cut
+            # is a page the caller can ask for, never a silent drop.
             return ToolResult(
                 content=compact_dict_list_field(
-                    template, "steps", item_label="steps"
+                    template, "steps", item_label="steps",
+                    outline=outline_template, offset=step_offset,
+                    offset_param="step_offset",
                 ),
                 structured_content=None
             )
 
     @mcp.tool(
         name="get_all_templates",
-        description="Get templates (checklists) with full details including prerun fields, automated actions, linked tasks, and metadata. Returns 20 per page. Use page=2, page=3, etc. for more. meta.total_pages shows total page count. Optional: filter by folder name or folder ID.",
+        description="List templates (checklists), pinned first, then the most recently changed. Each row carries at least id, title, type, starred, is_pinned, started_processes, created_at, created_by, last_updated, last_updated_by, and extra.status, extra.folder_id and extra.steps_count. For a template's kickoff fields, steps or automations, call get_template or get_kickoff_fields with its id; do not rely on these rows for them. Returns 20 per page. Use page=2, page=3, etc. for more. meta.total_pages shows total page count. Optional: filter by folder name or folder ID.",
         tags=["templates", "blueprints", "read-only", "management"],
         annotations=ToolAnnotations(
             title="Get all templates",
@@ -847,7 +916,12 @@ get_template_steps(step_id=..., full_text=True).""",
     @handle_tallyfy_errors("get all templates")
     def get_all_templates(page: PageNumber = 1, page_offset: PageOffset = 0, folder: OptionalString = None) -> GenericDict:
         """
-        Get templates (checklists) with full details.
+        List templates (checklists), 20 a page.
+
+        Reads POST checklists/query when the call translates exactly, and
+        GET checklists otherwise or when that route cannot answer (#1660). The
+        rows carry the keys listed in ``query_engine.template_row``; a row from
+        GET checklists carries those and more.
 
         Args:
             page: Page number to fetch (default: 1)
@@ -863,13 +937,31 @@ get_template_steps(step_id=..., full_text=True).""",
                 if not _is_tallyfy_id(folder):
                     folder = _resolve_template_folder_name_to_id(sdk, org_id, folder)
                 kwargs["folder"] = folder
+
+            # Read through the table query engine when the call translates
+            # exactly, and answer from GET checklists otherwise or when the
+            # engine cannot answer (#1660, utils/query_engine.py).
+            plan = query_engine.templates_query(kwargs.get("folder"), page, DEFAULT_PAGE_SIZE)
+            engine = None if plan is None else partial(
+                query_engine.engine_listing,
+                sdk, org_id, "checklists",
+                columns=query_engine.TEMPLATE_COLUMNS,
+                sort=plan["sort"],
+                filter_tree=plan["filter_tree"],
+                row_mapper=query_engine.template_row,
+                page=plan["page"], per_page=DEFAULT_PAGE_SIZE,
+                page_offset=page_offset or 0,
+                compact_fields=["guidance"],
+            )
+            classic = partial(
+                fetch_single_page,
+                sdk.templates.get_all_templates, org_id,
+                page=page, page_offset=page_offset or 0,
+                compact_fields=["guidance"],
+                **kwargs,
+            )
             return ToolResult(
-                content=fetch_single_page(
-                    sdk.templates.get_all_templates, org_id,
-                    page=page, page_offset=page_offset or 0,
-                    compact_fields=["guidance"],
-                    **kwargs,
-                ),
+                content=query_engine.engine_or_classic("get_all_templates", engine, classic),
                 structured_content=None
             )
 
@@ -1815,28 +1907,23 @@ DO NOT call get_template just to read its steps. Use this tool instead.""",
 
     @mcp.tool(
         name="assess_template_health",
-        description=f"""Retrieve a template's data for a full health assessment.
+        description=f"""Read a template for a health assessment: facts worked out in code, plus the template.
 
-Use this data to evaluate template health across these dimensions:
-- Metadata quality: Does it have a clear title, summary, and guidance?
-- Step clarity: Do steps have descriptive titles and summaries? Are any too vague?
-- Form completeness: Do steps that need data collection have appropriate form fields?
-- Automation efficiency: Are automation rules well-structured? Any conflicts or redundancies?
-- Deadline configuration: Do time-sensitive steps have reasonable deadlines?
-- Workflow structure: Is the step count manageable? Is the flow logical?
+health_facts covers the WHOLE template, even when the template comes back as an outline in
+parts: counts (steps, stages, kickoff fields, step fields, rules); steps with no assignee,
+summary or deadline; rules naming step or field ids the template lacks; rules with no actions
+or no conditions, which never run; duplicate step titles; steps hidden at launch that no rule
+can show; required kickoff fields nothing uses. Lists show 10 beside the true count. Trust
+these over your own count.
 
-Provide an overall health rating (excellent/good/fair/poor/critical) with specific recommendations.
+Then judge what code cannot: clear titles and summaries, form fields where data is collected,
+sensible deadlines, logical flow, rule design. Return a health_rating (excellent, good, fair,
+poor or critical) and a recommendations list of specific fixes.
 
-RETURNS: the template payload, trimmed when large. Top-level keys include `id`, `title`, `summary`, `steps[]`, `automated_actions[]`, `prerun[]` (kickoff fields), and metadata. Synthesize this into a `health_rating` (one of: excellent, good, fair, poor, critical) plus a `recommendations` list (string array of specific improvements someone can act on). The tool returns RAW data. The LLM is responsible for the rating + recommendations synthesis.
+SIZE: {_WHOLE_TEMPLATE_SIZE_NOTE} health_facts is in the first part only. Say the step
+review is partial until you have read every part.
 
-SIZE: if the response carries "_truncated", later steps were dropped and are NOT in it; if it
-carries "_withheld", a named field was removed whole. The trim reaches the step list only, so
-no marker is not a promise of completeness. Rate only what arrived, and say the assessment is
-partial whenever a marker is present. If any text CONTAINS "{TRUNCATION_MARKER_PREFIX}", that
-string is only part of the real value: never write it back, re-read that one step first with
-get_template_steps(step_id=..., full_text=True).
-
-REQUIRED: 'template_id'.""",
+REQUIRED: 'template_id'. OPTIONAL: 'step_offset', only as a "_truncated" marker names it.""",
         tags=["templates", "workflow", "analysis", "health", "read-only", "optimization"],
         annotations=ToolAnnotations(
             title="Assess template health",
@@ -1849,28 +1936,44 @@ REQUIRED: 'template_id'.""",
     )
     @track_tool_execution("assess_template_health")
     @handle_tallyfy_errors("assess template health")
-    def assess_template_health(template_id: TemplateId) -> GenericDict:
+    def assess_template_health(template_id: TemplateId, step_offset: int = 0) -> GenericDict:
         """
         Retrieve a template's data for health assessment.
 
         Args:
             template_id: Template ID to assess (REQUIRED - 32-character hex string)
+            step_offset: Steps already received, taken from the "_truncated"
+                marker on the previous part of an outlined template (#1659).
 
         Returns:
-            Dictionary with the template data for comprehensive analysis, trimmed
-            through compact_dict_list_field when it exceeds the result ceiling
+            Dictionary with health_facts (computed over the whole template) and
+            the template, outlined and paged through compact_dict_list_field
+            when it exceeds the result ceiling
         """
+        _check_step_offset(step_offset)
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            template = sdk.templates.get_template(org_id, template_id=template_id)
-            if not template:
+            # The raw read get_template uses, not sdk.templates.get_template:
+            # the facts need stage_id, owner_id, ai_assigned and kickoff labels,
+            # none of which the SDK models declare (#1659).
+            raw = _read_template_body(sdk, org_id, template_id)
+            if not raw:
                 raise ToolError("Template not found")
+            template = _serialize_template_body(raw)
+            _check_step_offset(step_offset, template)
 
-            # Same size control as get_template: one shared trimmer, not a third
-            # binary search. See compact_dict_list_field's docstring.
+            # Facts first, from the raw body: before the 500-character string
+            # cap and before any outline or page, so they cover every step.
+            content = {"health_facts": compute_health_facts(raw), **template}
+
+            # Same size control as get_template: one shared trimmer with the
+            # template outline, not a third binary search. See
+            # compact_dict_list_field's docstring.
             return ToolResult(
                 content=compact_dict_list_field(
-                    serialize_dataclass(template), "steps", item_label="steps"
+                    content, "steps", item_label="steps",
+                    outline=outline_template, offset=step_offset,
+                    offset_param="step_offset",
                 ),
                 structured_content=None
             )
