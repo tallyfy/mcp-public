@@ -13,7 +13,12 @@ from fastmcp.tools import ToolResult
 from pydantic import Field
 from tallyfy import TallyfySDK, TallyfyError
 from mcp.types import ToolAnnotations
-from utils.fastmcp_errors import handle_tallyfy_errors
+from utils.fastmcp_errors import (
+    _extract_api_message,
+    classify_upstream_status,
+    handle_tallyfy_errors,
+    tag_error_class,
+)
 from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 from utils.fastmcp_types import (
     TemplateId,
@@ -680,6 +685,17 @@ ScheduledJobId = Annotated[int, Field(
     examples=[168],
 )]
 
+# api-v2#11639 takes {"user_id": <int>}. An email is resolved to that id here, so
+# the model can pass whichever it holds. Union, not str: a bare number arrives as
+# an int, and a string of digits is read as an id too (scheduled_jobs.parse_new_owner).
+ScheduledJobNewOwner = Annotated[Union[int, str], Field(
+    description=(
+        "The person the job should run as: their email, or their numeric user ID "
+        "from get_organization_users. A member of this organization, not a guest."
+    ),
+    examples=["jane@example.com", 27425],
+)]
+
 _HISTORY_SHOWN = 20
 _JOBS_PER_PAGE = 25
 
@@ -795,6 +811,85 @@ def _put_status(sdk, org_id: str, job: Dict[str, Any], status: str) -> Dict[str,
     return saved
 
 
+def _read_job_to_change(sdk, org_id: str, job_id: int) -> Dict[str, Any]:
+    """Read a job before changing it, answering a missing one in plain words."""
+    try:
+        return _read_job(sdk, org_id, job_id)
+    except TallyfyError as exc:
+        if getattr(exc, "status_code", None) == 404:
+            raise tag_error_class(
+                ToolError(
+                    f"Scheduled job {job_id} was not found, or this account cannot see it, "
+                    "so nothing was changed. get_scheduled_jobs lists the jobs it can see."
+                ),
+                classify_upstream_status(404),
+            ) from exc
+        raise
+
+
+def _member_by_email(sdk, org_id: str, email: str) -> Dict[str, Any]:
+    """The organization member with this email, as ``{id, full_name, email}``.
+
+    The same SDK call resolve_user_ids in task_management.py makes. A guest is
+    never in this list, and a guest cannot own a scheduled job, so an email that
+    matches no member is refused here, before anything is sent.
+    """
+    users = getattr(sdk.users.get_organization_users_list(org_id), "data", None) or []
+    wanted = email.strip().lower()
+    for user in users:
+        if (getattr(user, "email", None) or "").strip().lower() == wanted:
+            full_name = getattr(user, "full_name", None) or " ".join(
+                part for part in (getattr(user, "first_name", None), getattr(user, "last_name", None)) if part
+            )
+            return {"id": user.id, "full_name": full_name or None, "email": user.email}
+    raise ToolError(
+        f"No member of this organization has the email {email!r}, so nothing was changed. "
+        "A scheduled job's owner must be a member, not a guest. get_organization_users "
+        "lists the members."
+    )
+
+
+def _owner_change_refusal(exc: TallyfyError, job_id: int, new_owner: str, current: str) -> BaseException:
+    """What to raise when api-v2 refuses PUT recurring-jobs/{id}/owner.
+
+    403, 422 and the two 404s get their own words. Anything else, a 401
+    included, goes back to handle_tallyfy_errors as it came, so the
+    re-authentication path still runs.
+    """
+    status = getattr(exc, "status_code", None)
+    if status == 403:
+        message = sj.OWNER_ADMIN_ONLY
+        reason = _extract_api_message(exc)
+        if reason:
+            message += f" Tallyfy said: {reason}"
+        return tag_error_class(ToolError(message), classify_upstream_status(status))
+    if status == 422:
+        return tag_error_class(
+            ToolError(
+                f"Tallyfy refused {new_owner} as the owner of scheduled job {job_id}, so "
+                f"nothing was changed: {_extract_api_message(exc)}"
+            ),
+            classify_upstream_status(status),
+        )
+    if status == 404:
+        which = sj.owner_route_answer(getattr(exc, "response_data", None))
+        if which == sj.OWNER_404_ROUTE:
+            return tag_error_class(
+                ToolError(f"{sj.OWNER_ROUTE_MISSING} Scheduled job {job_id} still runs as {current}."),
+                classify_upstream_status(status),
+            )
+        if which == sj.OWNER_404_JOB:
+            return tag_error_class(
+                ToolError(
+                    f"Scheduled job {job_id} was not found when the owner was changed, so "
+                    "nothing was changed. It may have just been deleted: read it with "
+                    "get_scheduled_jobs."
+                ),
+                classify_upstream_status(status),
+            )
+    return exc
+
+
 def _register_scheduled_job_tools(mcp):
     """Register the scheduled launch tools (tallyfy/mcp#1603) with the server.
 
@@ -864,6 +959,8 @@ A member sees only the jobs they created and the launch jobs for templates they 
 
 Each job says which zone its start_date and schedule.start_time are read in (times_are_read_in) and, where Tallyfy reports it, its next run in UTC and local time. For a launch job, data.checklist_id is the template and data.name the name each launched process gets.
 
+owner is the person the job runs as: id, full_name and email, or only the id where Tallyfy sends no name. change_scheduled_job_owner changes it.
+
 PAGINATION: 25 jobs per page. Use page=2, page=3 and so on; meta.total_pages says how many pages exist.""",
         tags={"processes", "scheduled-jobs", "read-only"},
         annotations=ToolAnnotations(
@@ -916,7 +1013,9 @@ PAGINATION: 25 jobs per page. Use page=2, page=3 and so on; meta.total_pages say
         name="get_scheduled_job",
         description="""Read one scheduled job with its run history. REQUIRED: 'job_id' (a whole number, from get_scheduled_jobs).
 
-Returns the job (status, schedule, the zone its times are read in, its next run where Tallyfy reports it) and its newest 20 runs, newest first, each with success, message and when it ran. A failed run's message says why. A one-time job whose run failed is left paused.
+Returns the job (status, owner, schedule, the zone its times are read in, its next run where Tallyfy reports it) and its newest 20 runs, newest first, each with success, message and when it ran. A failed run's message says why. A one-time job whose run failed is left paused.
+
+owner is the person the job runs as: id, full_name and email, or only the id where Tallyfy sends no name.
 
 A job the caller may not see answers not found, the same as a job that does not exist.""",
         tags={"processes", "scheduled-jobs", "read-only"},
@@ -1266,6 +1365,116 @@ Returns the job as Tallyfy stored it, with its next run where Tallyfy reports it
         described = sj.describe_job(job, tz_name=zone, job_keys=keys)
         if not changed:
             described["notes"] = ["The job was already active, so nothing was changed."]
+        return ToolResult(content=described, structured_content=None)
+
+    @mcp.tool(
+        name="change_scheduled_job_owner",
+        description="""Change who a scheduled job runs as. REQUIRED: 'job_id' (from get_scheduled_jobs) and 'new_owner' (the person's email, or their numeric user ID).
+
+A scheduled job runs as its owner, at first the person who made it, and every launch happens as that person. Use this when the owner leaves or hands the job over. Only an organization admin can change an owner. The new owner must be an active member, not a guest, allowed to do what the job does, such as launch its template.
+
+Confirm the job and the new owner with the user before calling it.
+
+Only the owner changes. The schedule, the status and the run history stay as they are, so a paused job stays paused. Afterwards the previous owner can see and manage the job only if they are an admin or, for a launch job, may launch its template. The reply reads the job back from Tallyfy and names the new owner and the previous one. Giving the current owner again changes nothing.
+
+When Tallyfy refuses, the reply says why and nothing changes: only admins may do this, or the person cannot own this job. A Tallyfy server that cannot change owners yet says so.""",
+        tags={"processes", "scheduled-jobs", "write"},
+        annotations=ToolAnnotations(
+            title="Change a scheduled job's owner",
+            readOnlyHint=False,
+            # Destructive under rule 4 of test_annotation_policy.py: it replaces
+            # data.created_by, the person every later run acts as, and the previous
+            # owner loses the access owning the job gave them.
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("change_scheduled_job_owner")
+    @handle_tallyfy_errors("change scheduled job owner")
+    def change_scheduled_job_owner(job_id: ScheduledJobId, new_owner: ScheduledJobNewOwner) -> GenericDict:
+        """
+        Change who a scheduled job runs as, through api-v2#11639's
+        PUT recurring-jobs/{id}/owner, then read the job back.
+
+        Args:
+            job_id: Scheduled job ID (a whole number).
+            new_owner: The new owner's email, or their numeric user ID. An email
+                is looked up among the organization's members first.
+
+        Returns:
+            The stored job with "owner" and "previous_owner" ({id, full_name, email})
+            and a note naming both.
+        """
+        try:
+            user_id, email = sj.parse_new_owner(new_owner)
+        except sj.ScheduleInputError as exc:
+            raise ToolError(str(exc)) from exc
+
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            job = _read_job_to_change(sdk, org_id, job_id)
+            previous = sj.job_owner(job)
+            # Every read the reply needs is made before the write, so a failure
+            # in one of them can still truthfully say nothing was changed.
+            keys = _job_keys_by_id(_job_types(sdk, org_id))
+            zone = _org_timezone(sdk, org_id)
+            member: Optional[Dict[str, Any]] = None
+            if email is not None:
+                member = _member_by_email(sdk, org_id, email)
+                user_id = member["id"]
+            wanted = sj.owner_label(member) if member else f"user {user_id}"
+
+            try:
+                _scheduled_job_request(
+                    sdk, "PUT", _jobs_path(org_id, job_id, "/owner"), data={"user_id": user_id}
+                )
+            except TallyfyError as exc:
+                refusal = _owner_change_refusal(exc, job_id, wanted, sj.owner_label(previous))
+                if refusal is exc:
+                    raise
+                raise refusal from exc
+
+            # Round trip: the owner is reported from a fresh read, never from the
+            # PUT's own answer (root CLAUDE.md, rule 12).
+            try:
+                saved = _unwrap_data(_scheduled_job_request(sdk, "GET", _jobs_path(org_id, job_id)))
+            except TallyfyError as exc:
+                raise ToolError(
+                    f"Tallyfy answered the owner change, but reading scheduled job {job_id} "
+                    f"back failed, so the new owner is not confirmed: {_extract_api_message(exc)}"
+                ) from exc
+            if not isinstance(saved, dict) or "id" not in saved:
+                raise ToolError(
+                    f"Tallyfy answered the owner change, but scheduled job {job_id} did not read "
+                    "back as a job, so the new owner is not confirmed. Read it with get_scheduled_job."
+                )
+
+        owner = sj.job_owner(saved)
+        if owner is None or not sj.same_user(owner.get("id"), user_id):
+            raise ToolError(
+                f"Tallyfy answered the owner change, but scheduled job {job_id} reads back "
+                f"owned by {sj.owner_label(owner)}, not {wanted}. Read it with get_scheduled_job."
+            )
+        if member is not None and not owner.get("full_name") and not owner.get("email"):
+            # An api-v2 that sends no owner object still told us who this is.
+            owner = dict(member)
+
+        described = sj.describe_job(saved, tz_name=zone, job_keys=keys)
+        described["owner"] = owner
+        described["previous_owner"] = previous
+        if previous is not None and sj.same_user(previous.get("id"), user_id):
+            note = f"Scheduled job {job_id} already ran as {sj.owner_label(owner)}, so nothing changed."
+        elif previous is not None:
+            note = (
+                f"Scheduled job {job_id} now runs as {sj.owner_label(owner)}. It ran as "
+                f"{sj.owner_label(previous)} before. Tallyfy refuses to move it back if that "
+                "person can no longer own the job."
+            )
+        else:
+            note = f"Scheduled job {job_id} now runs as {sj.owner_label(owner)}."
+        described["notes"] = [note]
         return ToolResult(content=described, structured_content=None)
 
     @mcp.tool(

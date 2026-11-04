@@ -32,6 +32,13 @@ that way would move when api-v2#8974 reaches production. So on the UTC reading
 converts a time. Listing, reading, pausing, resuming and deleting work on both
 readings, and pause and resume send the stored times back unchanged. Creation on
 production comes back once #8974 is promoted there (tallyfy/work-queue#4020).
+
+A job runs as its owner, kept in ``data.created_by``. api-v2#11639 adds
+``PUT recurring-jobs/{id}/owner`` (admins only) and a top-level ``owner`` object,
+``{id, full_name, email}``, on every job it returns (tallyfy/mcp#1720). An older
+api-v2 sends only ``data.created_by``, so ``job_owner`` reads the object when it
+is there and the id otherwise, and ``owner_route_answer`` tells a 404 for the
+missing route from a 404 for a missing job by the ``code`` in api-v2's body.
 """
 
 from __future__ import annotations
@@ -39,7 +46,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone as _dt_timezone, tzinfo
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from utils.date_utils import resolve_zone
 
@@ -107,7 +114,30 @@ UTC_CREATE_REFUSAL = (
     "deleting scheduled jobs still work."
 )
 
+# change_scheduled_job_owner (tallyfy/mcp#1720). The route and the 403 are
+# api-v2#11639's contract: only an organization admin may change an owner.
+OWNER_ADMIN_ONLY = (
+    "Only an organization admin can change a scheduled job's owner, so nothing was changed."
+)
+OWNER_ROUTE_MISSING = (
+    "This Tallyfy server does not support changing a scheduled job's owner yet, so "
+    "nothing was changed."
+)
+OWNER_KEYS = ("id", "full_name", "email")
+
+# What api-v2's Handler::render puts in a 404 body (app/Exceptions/Handler.php on
+# production and master, read 2026-11-03). A route that does not exist throws
+# NotFoundHttpException; a job that does not exist, or that the caller may not
+# see (RecurringJobPolicy::authorizeRead), throws ModelNotFoundException. Measured
+# on staging the same day: PUT recurring-jobs/999999999/owner answered
+# ENDPOINT_NOT_FOUND, and GET recurring-jobs/999999999 answered RESOURCE_NOT_FOUND.
+ROUTE_NOT_FOUND_CODE = "ENDPOINT_NOT_FOUND"
+JOB_NOT_FOUND_CODE = "RESOURCE_NOT_FOUND"
+OWNER_404_ROUTE = "route"
+OWNER_404_JOB = "job"
+
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _CLOCK_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 _API_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})(?::\d{2})?$")
 
@@ -440,6 +470,89 @@ def same_minute(instant: Any, expected: datetime) -> Optional[bool]:
     )
 
 
+def _user_id(value: Any) -> Optional[int]:
+    """A user id as an int, from an int or a string of digits. None otherwise."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    text = value.strip() if isinstance(value, str) else ""
+    # isascii first: str.isdigit() is also true for a superscript two, which int() refuses.
+    if text.isascii() and text.isdigit():
+        number = int(text)
+        return number if number >= 1 else None
+    return None
+
+
+def job_owner(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Who a job runs as: api-v2#11639's ``owner`` object, else ``data.created_by``.
+
+    The object is cut to ``id``, ``full_name`` and ``email``. Without it only the
+    id is known, so only the id is returned. None when the job names neither.
+    """
+    owner = job.get("owner")
+    if isinstance(owner, dict) and owner.get("id") is not None:
+        return {key: owner.get(key) for key in OWNER_KEYS}
+    data = job.get("data")
+    created_by = data.get("created_by") if isinstance(data, dict) else None
+    if created_by is not None:
+        return {"id": created_by}
+    return None
+
+
+def same_user(left: Any, right: Any) -> bool:
+    """Whether two user ids name the same person, whichever of int or string each is."""
+    a, b = _user_id(left), _user_id(right)
+    return a is not None and a == b
+
+
+def owner_label(owner: Optional[Dict[str, Any]]) -> str:
+    """An owner in words: ``Jane Doe (jane@example.com)``, or ``user 27425``."""
+    if not owner:
+        return "an unknown person"
+    name = owner.get("full_name")
+    email = owner.get("email")
+    if name and email:
+        return f"{name} ({email})"
+    if name or email:
+        return str(name or email)
+    return f"user {owner.get('id')}"
+
+
+def parse_new_owner(value: Any) -> Tuple[Optional[int], Optional[str]]:
+    """``new_owner`` as ``(user_id, None)`` or ``(None, email)``.
+
+    A whole number, or a string of digits, is a user id. A string with one ``@``
+    and a dot after it is an email. Anything else is refused before any call.
+    """
+    user_id = _user_id(value)
+    if user_id is not None:
+        return user_id, None
+    text = value.strip() if isinstance(value, str) else ""
+    if _EMAIL_RE.match(text):
+        return None, text
+    raise ScheduleInputError(
+        "new_owner takes the new owner's email or numeric user id, such as "
+        f"jane@example.com or 27425. Got {value!r}. get_organization_users lists "
+        "members with both."
+    )
+
+
+def owner_route_answer(response_data: Any) -> Optional[str]:
+    """Which 404 the owner route got, from api-v2's body.
+
+    ``OWNER_404_ROUTE`` when the API has no such route, ``OWNER_404_JOB`` when the
+    job is missing or hidden from the caller, None when the body says neither,
+    so a caller can pass Tallyfy's own answer on rather than guess.
+    """
+    code = response_data.get("code") if isinstance(response_data, dict) else None
+    if code == ROUTE_NOT_FOUND_CODE:
+        return OWNER_404_ROUTE
+    if code == JOB_NOT_FOUND_CODE:
+        return OWNER_404_JOB
+    return None
+
+
 def describe_job(
     job: Dict[str, Any],
     *,
@@ -467,6 +580,7 @@ def describe_job(
         "name": job.get("name"),
         "status": job.get("status"),
         "job_type": job_type or type_id,
+        "owner": job_owner(job),
         "data": data,
         "start_date": job["start_date"][:10] if isinstance(job.get("start_date"), str) else job.get("start_date"),
         "end_date": job["end_date"][:10] if isinstance(job.get("end_date"), str) else job.get("end_date"),

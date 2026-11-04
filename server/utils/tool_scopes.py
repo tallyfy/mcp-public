@@ -272,6 +272,9 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "pause_scheduled_job": _PROC_W,
     "resume_scheduled_job": _PROC_W,
     "delete_scheduled_job": _PROC_W,
+    # api-v2#11639's PUT recurring-jobs/{id}/owner (tallyfy/mcp#1720). The API
+    # also requires an org admin; this gate only asks for the write scope.
+    "change_scheduled_job_owner": _PROC_W,
     # -- templates (blueprints/checklists) ----------------------------------
     "assess_template_health": _TMPL_R,
     "get_all_templates": _TMPL_R,
