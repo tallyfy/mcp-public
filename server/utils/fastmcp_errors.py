@@ -282,6 +282,43 @@ def read_error_class(error: BaseException) -> Optional[str]:
     return value if value in TOOL_ERROR_CLASSES else None
 
 
+def step_not_in_template(
+    error: BaseException, template_id: str, step_id: str
+) -> Optional[ToolError]:
+    """The SDK's verdict that a step is not in a template, as a ToolError, else None.
+
+    The SDK's ``get_step_dependencies`` and ``get_step_visibility_conditions``
+    read the template and, when ``step_id`` is not among its steps, raise a bare
+    ``TallyfyError`` with no status (``template_management/analysis.py`` in
+    ``tallyfy==3.0.4``). With no status, ``handle_tallyfy_errors`` logged it at
+    ERROR as if Tallyfy were unreachable, so a model passing a step id from
+    another template paged us: Sentry MCP-SERVER-68, a Cursor client on
+    2026-09-27.
+
+    The match is EQUALITY with the exact sentence the SDK builds from the two
+    ids this server passed, and only when there is no status. A transport
+    failure also has no status and must keep logging at ERROR (see
+    EXPECTED_UPSTREAM_STATUSES), and no message of that kind can equal this
+    sentence, so nothing else is reclassified.
+    """
+    if not isinstance(error, TallyfyError):
+        return None
+    if getattr(error, "status_code", None) is not None:
+        return None
+    if str(error) != f"Step {step_id} not found in template {template_id}":
+        return None
+    logger.warning(f"Step {step_id} is not in template {template_id}")
+    return tag_error_class(
+        ToolError(
+            f"Step {step_id} is not a step of template {template_id}. "
+            f"Read this template's step ids with get_template_steps("
+            f"template_id='{template_id}'), and check the step id came from this "
+            f"template rather than from another template or a process."
+        ),
+        ERROR_CLASS_NOT_FOUND,
+    )
+
+
 # ===========================================================================
 # Which upstream answers are EXPECTED, and therefore log at WARNING
 # ===========================================================================
@@ -335,7 +372,10 @@ def read_error_class(error: BaseException) -> Optional[str]:
 # Those are NOT fixed here, because widening this set cannot tell the two
 # apart. They are fixed where they belong, by refusing the bad shape at the
 # tool boundary so the SDK is never reached with it. See issue #1080 and
-# `tools/template_management.py::_validate_step_participants`.
+# `tools/template_management.py::_validate_step_participants`. The SDK's
+# "Step X not found in template Y" from its step analysis is the same shape,
+# and `step_not_in_template` below recognises that one sentence exactly
+# (Sentry MCP-SERVER-68, 2026-11-04).
 #
 # The membership is pinned as an EXACT set by
 # tests/unit/server/utils/test_fastmcp_errors_status_split.py. Exact rather

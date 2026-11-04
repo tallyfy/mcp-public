@@ -13,9 +13,9 @@ from pydantic import Field
 from email_validator import validate_email, EmailNotValidError
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
-from tallyfy import TallyfySDK
+from tallyfy import TallyfyError, TallyfySDK
 from mcp.types import ToolAnnotations
-from utils.fastmcp_errors import handle_tallyfy_errors
+from utils.fastmcp_errors import handle_tallyfy_errors, step_not_in_template
 from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 from utils.fastmcp_types import (
     TemplateId,
@@ -1031,7 +1031,13 @@ REQUIRED: 'template_id' AND 'step_id' (both 32-char hex). Never call without bot
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.templates.get_step_dependencies(org_id, template_id, step_id)
+            try:
+                result = sdk.templates.get_step_dependencies(org_id, template_id, step_id)
+            except TallyfyError as e:
+                refusal = step_not_in_template(e, template_id, step_id)
+                if refusal is not None:
+                    raise refusal from e
+                raise
             payload = serialize_dataclass(result) if result else {}
             if not isinstance(payload, dict):
                 return ToolResult(content=payload, structured_content=None)

@@ -4,10 +4,10 @@ Tools for managing template automation rules and analysis
 """
 
 from fastmcp.tools import ToolResult
-from tallyfy import TallyfySDK
+from tallyfy import TallyfyError, TallyfySDK
 from mcp.types import ToolAnnotations
 from fastmcp.exceptions import ToolError
-from utils.fastmcp_errors import handle_tallyfy_errors
+from utils.fastmcp_errors import handle_tallyfy_errors, step_not_in_template
 from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 import json
 from utils.fastmcp_types import (
@@ -1493,7 +1493,13 @@ REQUIRED: 'template_id'. Never call without it.""",
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            result = sdk.templates.get_step_visibility_conditions(org_id, template_id, step_id)
+            try:
+                result = sdk.templates.get_step_visibility_conditions(org_id, template_id, step_id)
+            except TallyfyError as e:
+                refusal = step_not_in_template(e, template_id, step_id)
+                if refusal is not None:
+                    raise refusal from e
+                raise
             return ToolResult(content=serialize_dataclass(result) if result else {}, structured_content=None)
 
     # -----------------------------------------------------------------------
