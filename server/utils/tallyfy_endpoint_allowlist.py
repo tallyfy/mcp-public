@@ -109,10 +109,16 @@ from typing import FrozenSet, Iterable, Optional, Tuple
 _BLOCKED_PREFIXES: Tuple[re.Pattern, ...] = (
     # NOTE (#622 item 9): this pattern currently matches NOTHING. api-v2 has no
     # prefix('admin') route group — its admin surface is org-scoped and gated by
-    # `Route::middleware('admin')` on ordinary paths (users/{id}/role, /disable,
-    # /delete, /approve, /reject, tag delete, organization-roles). It is kept as a
-    # forward guard in case such a prefix is ever added, NOT as a live restraint,
-    # and the tool descriptions must not advertise it as one.
+    # `Route::middleware('admin')` on ordinary paths: users/{id}/role, /disable,
+    # /delete, /approve, /reject, and renaming or deleting a job title (PUT and
+    # DELETE organization-roles/{role}, since tallyfy/api-v2#11741). Creating and
+    # listing job titles (POST and GET organization-roles) stay open to members,
+    # and putting one on a step or task (organization-roles/add-object,
+    # roles-object/{id}) needs access to that step or task. Tag delete is not
+    # admin only: api-v2 lets an admin or the tag's creator delete a tag, checked
+    # in its controller (#1746). The pattern is kept as a forward guard in case
+    # such a prefix is ever added, NOT as a live restraint, and the tool
+    # descriptions must not advertise it as one.
     re.compile(r"^/admin(/|$)"),
     re.compile(r"^/support(/|$)"),
     re.compile(r"^/webhooks/internal(/|$)"),
