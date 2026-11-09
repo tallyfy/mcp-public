@@ -27,27 +27,30 @@ Environment Support:
 - Individual overrides available via TALLYFY_ISSUER environment variable (for OAuth metadata)
 """
 
-import os
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
+from typing import FrozenSet, Iterable, Optional, Union
 from urllib.parse import urlparse
+
 import jwt
-from typing import FrozenSet, Iterable, Optional, Dict, List, Union
-from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.server.auth import TokenVerifier
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 from mcp.server.auth.provider import AccessToken
+
 from constants import (
     ACCEPTED_MCP_RESOURCES,
+    ENFORCE_AUDIENCE,
     MCP_JWT_AUDIENCE,
     MCP_RESOURCE_URL,
     TALLYFY_ENVIRONMENT,
     TALLYFY_ISSUER,
     TALLYFY_JWKS_BASE,
-    ENFORCE_AUDIENCE,
 )
-from metrics import record_jwt_validation, record_jwt_audience_class
+from metrics import record_jwt_audience_class, record_jwt_validation
+
 logger = logging.getLogger(__name__)
 
 # Bounded LRU + TTL cache of {user_id -> org_id} for session-resume convenience.
@@ -669,8 +672,8 @@ def _assert_pem_public_key(public_key: str) -> None:
     behaviour this check has had since it was introduced.
     """
     try:
-        from cryptography.hazmat.primitives import serialization
         from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
     except ImportError:
         logger.warning(
             "cryptography library not available; skipping public key format validation"

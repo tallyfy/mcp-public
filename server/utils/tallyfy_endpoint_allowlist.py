@@ -102,7 +102,6 @@ import re
 from dataclasses import dataclass
 from typing import FrozenSet, Iterable, Optional, Tuple
 
-
 # Absolute block-list — path prefixes that MUST NOT be reachable via the
 # fallback tool. Patterns are matched against the normalized path (no
 # trailing slash, no query string).

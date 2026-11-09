@@ -98,6 +98,7 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from constants import TALLYFY_API_BASE_URL
+from metrics import track_tool_execution
 from utils.auth_context import (
     get_authenticated_credentials,
     get_mcp_scopes,
@@ -106,8 +107,6 @@ from utils.auth_context import (
 from utils.fastmcp_errors import handle_tallyfy_errors
 from utils.tallyfy_endpoint_allowlist import check as allowlist_check
 from utils.tallyfy_spec_cache import SPEC_CACHE
-from metrics import track_tool_execution
-
 
 logger = logging.getLogger(__name__)
 _audit_logger = logging.getLogger("tallyfy_api_call_audit")

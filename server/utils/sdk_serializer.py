@@ -17,8 +17,8 @@ for tool chaining.
 
 import json
 import logging
-from typing import Any, Callable, Dict, Iterable, List, Optional
 from dataclasses import fields, is_dataclass
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from utils.response_sanitizer import sanitize_for_user_text
 

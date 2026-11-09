@@ -1,11 +1,20 @@
 """Sentry configuration for MCP Server component."""
 
-import sys
 import logging
+import sys
+
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.starlette import StarletteIntegration
-from constants import SENTRY_ENABLED, SENTRY_DSN, SENTRY_ENVIRONMENT, SENTRY_RELEASE, SENTRY_TRACES_SAMPLE_RATE, SENTRY_PROFILES_SAMPLE_RATE
+
+from constants import (
+    SENTRY_DSN,
+    SENTRY_ENABLED,
+    SENTRY_ENVIRONMENT,
+    SENTRY_PROFILES_SAMPLE_RATE,
+    SENTRY_RELEASE,
+    SENTRY_TRACES_SAMPLE_RATE,
+)
 
 logger = logging.getLogger(__name__)
 

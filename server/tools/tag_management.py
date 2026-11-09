@@ -4,27 +4,27 @@ Tools for discovering and managing organization tags
 """
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
-from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
+from tallyfy import TallyfySDK
+
+from metrics import track_tool_execution
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.fastmcp_errors import handle_tallyfy_errors
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 from utils.fastmcp_types import (
-    TagId,
-    TagTitle,
-    TagColor,
-    TagType,
-    TemplateId,
-    ProcessId,
-    OptionalString,
-    OptionalBool,
     GenericDict,
     GenericList,
+    OptionalBool,
+    OptionalString,
     PageNumber,
     PageSize,
+    ProcessId,
+    TagColor,
+    TagId,
+    TagTitle,
+    TagType,
+    TemplateId,
 )
-from utils.sdk_serializer import serialize_dataclass, compact_result
-from metrics import track_tool_execution
-
+from utils.sdk_serializer import compact_result, serialize_dataclass
 
 # api-v2 resolves `status` by NAME, not against a list:
 # `$method = ucfirst($status); if (method_exists($this, 'scope'.$method)) { ... }`

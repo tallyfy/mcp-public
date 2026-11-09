@@ -4,10 +4,10 @@ Provides detailed request/response logging with configurable verbosity.
 Adapted from proxy/logging_utils.py for the consolidated MCP server.
 """
 
-import logging
 import json
-import os
-from typing import Dict, Any, Optional
+import logging
+from typing import Any, Dict, Optional
+
 from constants import LOG_VERBOSITY
 
 logger = logging.getLogger(__name__)

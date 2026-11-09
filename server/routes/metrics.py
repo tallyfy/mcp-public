@@ -4,16 +4,15 @@ Prometheus Metrics Route
 Provides metrics endpoint for monitoring with security (IP whitelist + Basic Auth).
 """
 
-import os
-import logging
 import base64
+import logging
 import secrets
 from ipaddress import ip_address, ip_network
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.responses import JSONResponse, Response
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-from constants import METRICS_ALLOWED_IPS, METRICS_USERNAME, METRICS_PASSWORD
 
+from constants import METRICS_ALLOWED_IPS, METRICS_PASSWORD, METRICS_USERNAME
 
 # The IP-resolution logic below was written here for #219 (the /metrics
 # allowlist was a no-op because request.client.host is loopback behind the
@@ -26,9 +25,9 @@ from constants import METRICS_ALLOWED_IPS, METRICS_USERNAME, METRICS_PASSWORD
 # module by name. That test IS #219's regression coverage; keeping the aliases
 # means the promotion cannot quietly drop it.
 from utils.client_ip import (  # noqa: F401
+    _TRUSTED_PROXY_NETWORKS,
     is_trusted_proxy as _is_trusted_proxy,
     resolve_client_ip as _resolve_client_ip,
-    _TRUSTED_PROXY_NETWORKS,
 )
 
 

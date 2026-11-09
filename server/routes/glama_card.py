@@ -16,7 +16,6 @@ References:
 
 from starlette.responses import JSONResponse
 
-
 _GLAMA_CARD = {
     "$schema": "https://glama.ai/mcp/schemas/connector.json",
     "maintainers": [

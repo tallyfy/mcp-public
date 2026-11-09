@@ -6,35 +6,34 @@ Tools for managing organization users
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastmcp.tools import ToolResult
 from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
+from mcp.types import ToolAnnotations
 from tallyfy import TallyfySDK
 from tallyfy.models import Guest
-from mcp.types import ToolAnnotations
 
+from metrics import track_tool_execution
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
+from utils.fastmcp_errors import handle_tallyfy_errors
 from utils.fastmcp_types import (
-    UserEmail,
-    UserName,
-    GuestName,
-    OptionalGuestName,
-    UserRole,
-    UserId,
+    GenericDict,
     InvitationMessage,
-    OptionalString,
     OptionalBool,
+    OptionalGuestName,
+    OptionalString,
     PageNumber,
     PageOffset,
-    GenericDict
+    UserEmail,
+    UserId,
+    UserName,
+    UserRole,
 )
-from utils.fastmcp_errors import handle_tallyfy_errors
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
+from utils.pagination import fetch_single_page
 from utils.sdk_serializer import (
     serialize_dataclass,
     serialize_paginated_response,
     unwrap_fractal,
 )
-from utils.pagination import fetch_single_page
-from metrics import track_tool_execution
 
 logger = logging.getLogger(__name__)
 

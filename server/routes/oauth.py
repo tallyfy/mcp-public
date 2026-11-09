@@ -28,21 +28,21 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote_plus, urlencode
 
 import httpx
-
 from starlette.responses import JSONResponse, RedirectResponse, Response
-from utils.client_ip import resolve_forwardable_client_ip
+
 from constants import (
+    MCP_ALLOWED_HOSTS,
+    MCP_DOCS_URL,
     MCP_PROXY_SHARED_SECRET,
     MCP_RESOURCE_URL,
-    MCP_ALLOWED_HOSTS,
-    TALLYFY_ENVIRONMENT,
+    OAUTH_PROXY_TIMEOUT,
     TALLYFY_AUTH_SERVER,
+    TALLYFY_ENVIRONMENT,
     TALLYFY_ISSUER,
     TALLYFY_JWKS_BASE,
     TALLYFY_PUBLIC_KEY,
-    MCP_DOCS_URL,
-    OAUTH_PROXY_TIMEOUT,
 )
+from utils.client_ip import resolve_forwardable_client_ip
 
 logger = logging.getLogger(__name__)
 

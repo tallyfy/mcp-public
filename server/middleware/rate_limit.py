@@ -16,8 +16,9 @@ from collections import defaultdict
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
-from utils.client_ip import resolve_client_ip
+
 from constants import RATE_LIMIT_MAX_REQUESTS, RATE_LIMIT_WINDOW_SECONDS
+from utils.client_ip import resolve_client_ip
 
 logger = logging.getLogger(__name__)
 

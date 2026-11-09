@@ -8,16 +8,18 @@ ChatGPT and other MCP clients to properly trigger OAuth flows.
 References: RFC 6750 (Bearer Token Usage), RFC 9728 (Protected Resource Metadata)
 """
 
-import os
 import json
 import logging
+
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response, JSONResponse
+from starlette.responses import JSONResponse, Response
+
 from utils.org_id_middleware import (
     build_www_authenticate_header,
     protected_resource_metadata_url,
 )
+
 logger = logging.getLogger(__name__)
 
 # Wording for a 401 on a request that carried no bearer credentials at all.

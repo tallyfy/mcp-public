@@ -79,15 +79,14 @@ import re
 from typing import Annotated, Any, Dict, Optional
 
 import httpx
-from pydantic import Field
-
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
+from pydantic import Field
 from tallyfy import TallyfyError
 
 from metrics import track_tool_execution
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.fastmcp_errors import _sanitize_api_error, handle_tallyfy_errors
 from utils.sdk_serializer import MAX_RESULT_BYTES
 

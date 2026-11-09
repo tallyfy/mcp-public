@@ -5,22 +5,24 @@ This module defines and manages Prometheus metrics for the MCP server,
 including request counters, latency histograms, and error tracking.
 """
 
-from prometheus_client import Counter, Histogram, Gauge, Info
-import time
 import inspect
-from functools import wraps
-from typing import Callable, Any, Iterable
 import logging
+import time
+from functools import wraps
+from typing import Any, Callable, Iterable
+
+from prometheus_client import Counter, Gauge, Histogram, Info
+
 from constants import (
-    SENSITIVE_KEYS,
-    LogColors,
-    REQUEST_DURATION_BUCKETS,
     API_DURATION_BUCKETS,
-    SERVER_VERSION,
     FASTMCP_VERSION,
     PYTHON_VERSION,
+    REQUEST_DURATION_BUCKETS,
+    SENSITIVE_KEYS,
+    SERVER_VERSION,
     TOOL_ERROR_CLASS_ATTR,
     TOOL_ERROR_CLASSES,
+    LogColors,
 )
 
 logger = logging.getLogger(__name__)

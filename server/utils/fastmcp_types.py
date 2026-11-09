@@ -5,9 +5,14 @@ This module provides reusable, validated parameter types for all MCP tools
 following FastMCP best practices with Pydantic validation.
 """
 
-from typing import Annotated, List, Literal, Optional, Dict, Any, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+
 from pydantic import Field
-from constants import TALLYFY_AUTH_SERVER, TOOL_SECURITY_METADATA, MCPScopes
+
+from constants import (
+    TOOL_SECURITY_METADATA,  # noqa: F401 - re-exported: tests/unit/server/test_fastmcp_types.py imports it from here
+    MCPScopes,
+)
 
 # Core authentication types
 TallyfyApiKey = Annotated[str, Field(

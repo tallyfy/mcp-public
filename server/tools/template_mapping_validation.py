@@ -64,10 +64,10 @@ from typing import Any, Dict
 
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from utils.fastmcp_types import GenericDict
+
+from metrics import track_tool_execution
 from utils.authoring_payloads import TemplateMappingData, documented_payload
 from utils.fastmcp_errors import handle_tallyfy_errors
-from metrics import track_tool_execution
 
 logger = logging.getLogger(__name__)
 

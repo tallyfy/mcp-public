@@ -4,17 +4,17 @@ Routes module for MCP Server
 Organizes HTTP routes and MCP resources into separate modules.
 """
 
-from routes.oauth import register_oauth_routes
-from routes.health import register_health_routes
-from routes.metrics import register_metrics_routes
-from routes.resources import register_resources
-from routes.privacy import register_privacy_routes
 from routes.capabilities import register_capabilities
-from routes.landing import register_landing_routes
-from routes.openai_apps_challenge import register_openai_apps_challenge_routes
-from routes.server_card import register_server_card_routes
-from routes.glama_card import register_glama_card_routes
 from routes.favicon import register_favicon_routes
+from routes.glama_card import register_glama_card_routes
+from routes.health import register_health_routes
+from routes.landing import register_landing_routes
+from routes.metrics import register_metrics_routes
+from routes.oauth import register_oauth_routes
+from routes.openai_apps_challenge import register_openai_apps_challenge_routes
+from routes.privacy import register_privacy_routes
+from routes.resources import register_resources
+from routes.server_card import register_server_card_routes
 
 
 def register_all_routes(mcp):

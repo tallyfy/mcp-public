@@ -21,9 +21,11 @@ results used to carry were removed in #1241: nothing in the host or the client
 read them.
 """
 
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List
+
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
+
 from metrics import track_tool_execution
 
 #: Sent with every result of the three tools. An MCP client that does not draw

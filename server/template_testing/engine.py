@@ -9,8 +9,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from template_testing.checks import (
-    PLAN_CAVEAT,
-    plan_sentence,
     ComponentEvidence,
     ConflictObservation,
     check_always_true_condition,
@@ -25,6 +23,7 @@ from template_testing.checks import (
     check_stale_condition_value,
     check_unassigned_visible_step,
     check_unreachable_step,
+    plan_sentence,
 )
 from template_testing.document import TemplateDoc, parse_template
 from template_testing.domains import FieldOutcome, Variable
@@ -40,7 +39,6 @@ from template_testing.walk import (
     Component,
     assignment_from_row,
     build_components,
-    domain_product,
     enumerate_assignments,
     simulate,
 )

@@ -3,24 +3,24 @@ Folder Management Tools
 Tools for discovering and managing organization folders
 """
 
-from fastmcp.tools import ToolResult
 from fastmcp.exceptions import ToolError
-from tallyfy import TallyfySDK
+from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
+from tallyfy import TallyfySDK
+
+from metrics import track_tool_execution
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.fastmcp_errors import handle_tallyfy_errors
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 from utils.fastmcp_types import (
     FolderId,
     FolderName,
     FolderObjectId,
     FolderType,
-    OptionalString,
     GenericDict,
     GenericList,
+    OptionalString,
 )
-from utils.sdk_serializer import serialize_dataclass, compact_result
-from metrics import track_tool_execution
-
+from utils.sdk_serializer import compact_result, serialize_dataclass
 
 # Folders are typed at creation time and the type is immutable afterwards.
 # api-v2's FolderService::normalizeFolderTypeToClass (app/Services/FolderService.php:18-21)

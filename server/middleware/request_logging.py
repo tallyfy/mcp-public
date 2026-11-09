@@ -19,18 +19,15 @@ else would mean re-parsing the request body and re-peeking the response.
 
 import json
 import logging
-import os
 import time
 
 import jwt
-
 import sentry_sdk
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response, StreamingResponse
 
 import metrics
-from utils.org_id_middleware import ORG_ID_HEADERS, get_jwt_claims, get_org_id
 from constants import MCP_SESSION_TIMEOUT
 from durable_event_log import (
     EVENT_AUTH_FAILURE,
@@ -44,7 +41,6 @@ from durable_event_log import (
     ORG_SOURCE_TOKEN_CLAIM,
     ORG_SOURCE_TOOL_ARGUMENT,
     ORG_SOURCE_VERIFIED_TOKEN,
-    safe_org_label,
     SYNTHETIC_HEADER,
     SYNTHETIC_TRUTHY,
     TRANSPORT_DIRECT,
@@ -52,7 +48,9 @@ from durable_event_log import (
     TRANSPORT_OAUTH,
     TRANSPORT_UNKNOWN,
     get_event_log,
+    safe_org_label,
 )
+from utils.org_id_middleware import ORG_ID_HEADERS, get_jwt_claims, get_org_id
 
 # The org_id header spellings OrgIdMiddleware accepts, as lowercase str (it
 # holds them as bytes). Imported rather than re-listed so a spelling added there

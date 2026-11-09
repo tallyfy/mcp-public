@@ -3,28 +3,15 @@ Automation Tools
 Tools for managing template automation rules and analysis
 """
 
-from fastmcp.tools import ToolResult
-from tallyfy import TallyfyError, TallyfySDK
-from mcp.types import ToolAnnotations
-from fastmcp.exceptions import ToolError
-from utils.fastmcp_errors import handle_tallyfy_errors, step_not_in_template
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 import json
-from utils.fastmcp_types import (
-    TemplateId,
-    StepId,
-    AutomationId,
-    GenericDict,
-    GenericList,
-)
-from utils.authoring_payloads import (
-    AutomationRuleCreateData,
-    AutomationRuleUpdateData,
-    documented_payload,
-)
-from utils.sdk_serializer import compact_dict_list_field, serialize_dataclass
-from utils.template_outline import outline_automation_read
-from template_testing.references import orphaned_reference_ids
+import logging
+
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
+from mcp.types import ToolAnnotations
+from tallyfy import TallyfyError, TallyfySDK
+
+from metrics import track_tool_execution
 from template_testing.checks import PLAN_STATE_ACTIVE, PLAN_STATE_INACTIVE
 from template_testing.document import NotATemplateDocument
 from template_testing.engine import (
@@ -33,16 +20,29 @@ from template_testing.engine import (
     test_template_document,
 )
 from template_testing.mermaid import render_mermaid
+from template_testing.references import orphaned_reference_ids
 from template_testing.walk import DEFAULT_MAX_ASSIGNMENTS
 from tools.template_mapping_validation import (
-    _has_assignees,
     ACTIONABLE_ID_ALIASES,
     ACTIONABLE_TYPE_MAP,
     ASSIGNMENT_ACTIONABLE_TYPES,
+    _has_assignees,
 )
-from metrics import track_tool_execution
-import logging
-
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
+from utils.authoring_payloads import (
+    AutomationRuleCreateData,
+    AutomationRuleUpdateData,
+    documented_payload,
+)
+from utils.fastmcp_errors import handle_tallyfy_errors, step_not_in_template
+from utils.fastmcp_types import (
+    AutomationId,
+    GenericDict,
+    StepId,
+    TemplateId,
+)
+from utils.sdk_serializer import compact_dict_list_field, serialize_dataclass
+from utils.template_outline import outline_automation_read
 
 logger = logging.getLogger(__name__)
 

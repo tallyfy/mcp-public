@@ -7,20 +7,11 @@ from typing import List, Union
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
-from tallyfy import TallyfySDK
 from mcp.types import ToolAnnotations
-from utils.fastmcp_errors import handle_tallyfy_errors
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
-from utils.fastmcp_types import (
-    TemplateId,
-    StepId,
-    FieldId,
-    FieldIdList,
-    FieldOrderList,
-    GenericDict,
-    GenericList,
-    FieldPosition,
-)
+from tallyfy import TallyfySDK
+
+from metrics import track_tool_execution
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.authoring_payloads import (
     KickoffFieldCreateData,
     KickoffFieldUpdateData,
@@ -28,10 +19,19 @@ from utils.authoring_payloads import (
     StepFormFieldUpdateData,
     documented_payload,
 )
-from utils.sdk_serializer import serialize_dataclass
+from utils.fastmcp_errors import handle_tallyfy_errors
+from utils.fastmcp_types import (
+    FieldId,
+    FieldIdList,
+    FieldOrderList,
+    FieldPosition,
+    GenericDict,
+    GenericList,
+    StepId,
+    TemplateId,
+)
 from utils.field_value_encoding import option_pairs
-from metrics import track_tool_execution
-
+from utils.sdk_serializer import serialize_dataclass
 
 # The field types this server will CREATE. api-v2's `BaseCapture::$field_types`
 # accepts ten, including `email`; `email` is deliberately excluded here because the

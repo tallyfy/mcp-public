@@ -8,13 +8,13 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fastmcp.exceptions import ToolError
 
+from constants import DEFAULT_PAGE_SIZE
 from utils.sdk_serializer import (
     MAX_RESULT_BYTES,
     _encoded_len,
     _largest_prefix_that_fits,
     serialize_dataclass,
 )
-from constants import DEFAULT_PAGE_SIZE
 
 
 def fetch_single_page(

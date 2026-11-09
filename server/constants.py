@@ -6,10 +6,10 @@ used across the MCP server, including authentication, pagination, metrics,
 logging, and date parsing.
 """
 
+import importlib.metadata
 import os
 import sys
-import importlib.metadata
-from typing import Dict, Set, FrozenSet
+from typing import Dict, FrozenSet
 
 # ============================================================================
 # Environment & Authentication

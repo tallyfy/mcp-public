@@ -9,9 +9,11 @@ requires on a 401.
 """
 
 import logging
-import jwt
-from typing import Callable, MutableMapping, Any, Awaitable
 from contextvars import ContextVar
+from typing import Any, Awaitable, Callable, MutableMapping
+
+import jwt
+
 from constants import MCP_RESOURCE_URL
 
 logger = logging.getLogger(__name__)

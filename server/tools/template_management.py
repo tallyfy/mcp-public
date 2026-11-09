@@ -4,48 +4,51 @@ Tools for managing templates, steps, and template health
 """
 
 import logging
-from functools import partial
 import re
+from functools import partial
 from typing import Annotated, Any, Dict
 
-from pydantic import Field
-
-from email_validator import validate_email, EmailNotValidError
+from email_validator import EmailNotValidError, validate_email
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
-from tallyfy import TallyfyError, TallyfySDK
 from mcp.types import ToolAnnotations
-from utils.fastmcp_errors import handle_tallyfy_errors, step_not_in_template
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
-from utils.fastmcp_types import (
-    TemplateId,
-    TemplateTitle,
-    StepId,
-    FieldId,
-    StepDescription,
-    StepPosition,
-    OptionalString,
-    OptionalBool,
-    PageNumber,
-    PageOffset,
-    GenericDict,
-    GenericList,
-)
+from pydantic import Field
+from tallyfy import TallyfyError, TallyfySDK
+
+from constants import DEFAULT_PAGE_SIZE
+from metrics import track_tool_execution
+from utils import query_engine
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.authoring_payloads import (
     StepCreateData,
     StepUpdateData,
     TemplateUpdateData,
     documented_payload,
 )
+from utils.fastmcp_errors import handle_tallyfy_errors, step_not_in_template
+from utils.fastmcp_types import (
+    GenericDict,
+    GenericList,
+    OptionalBool,
+    OptionalString,
+    PageNumber,
+    PageOffset,
+    StepDescription,
+    StepId,
+    StepPosition,
+    TemplateId,
+    TemplateTitle,
+)
+from utils.pagination import fetch_single_page
 from utils.sdk_serializer import (
-    serialize_dataclass,
-    unwrap_fractal,
-    compact_result,
-    compact_dict_list_field,
-    window_longest_text,
-    page_list_by_bytes,
     MAX_RESULT_BYTES,
     TRUNCATION_MARKER_PREFIX,
+    compact_dict_list_field,
+    compact_result,
+    page_list_by_bytes,
+    serialize_dataclass,
+    unwrap_fractal,
+    window_longest_text,
 )
 from utils.template_health_facts import compute_health_facts
 from utils.template_outline import (
@@ -55,10 +58,6 @@ from utils.template_outline import (
     outline_kickoff_suggestion,
     outline_template,
 )
-from utils.pagination import fetch_single_page
-from metrics import track_tool_execution
-from constants import DEFAULT_PAGE_SIZE
-from utils import query_engine
 
 
 def _is_tallyfy_id(value: str) -> bool:

@@ -23,6 +23,7 @@ from typing import Any, Dict
 from starlette.responses import JSONResponse
 
 from constants import MCP_RESOURCE_URL, SERVER_VERSION
+
 # _get_base_url is imported, not re-implemented, and that is the whole point of
 # issue #1139. The OAuth discovery document resolves its `issuer` through this
 # exact function, so routing the card through the same call is what makes the

@@ -11,12 +11,13 @@ from unittest.mock import MagicMock
 
 from mcp.types import (
     LATEST_PROTOCOL_VERSION,
+    ResourcesCapability,
     ServerCapabilities,
     ToolsCapability,
-    ResourcesCapability,
 )
 
 from constants import MCP_RESOURCE_URL
+
 # Imported, not re-listed: this is the exact array the live
 # /.well-known/oauth-authorization-server document publishes, and clients
 # believe that document. A hand-copied list here previously advertised the

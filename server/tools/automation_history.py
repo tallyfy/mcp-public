@@ -70,12 +70,18 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfySDK, TallyfyError
+from tallyfy import TallyfyError, TallyfySDK
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.fastmcp_errors import handle_tallyfy_errors
-from utils.fastmcp_types import GenericDict, OptionalTaskId, ProcessId, StepId, TemplateId
+from utils.fastmcp_types import (
+    GenericDict,
+    OptionalTaskId,
+    ProcessId,
+    StepId,
+    TemplateId,
+)
 from utils.response_sanitizer import sanitize_for_user_text
 from utils.sdk_serializer import _largest_prefix_that_fits, compact_dict_list_field
 

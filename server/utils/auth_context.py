@@ -3,11 +3,13 @@ Authentication Context Utilities
 Extract authenticated user credentials from MCP auth context
 """
 
+import logging
 import os
 import time
-import logging
-import jwt
 from typing import Optional, Tuple
+
+import jwt
+
 # 🔴 READ THIS BEFORE "TIDYING" THE IMPORT BELOW.
 #
 # There are TWO functions called ``get_access_token`` and they answer different
@@ -49,10 +51,14 @@ from typing import Optional, Tuple
 # test churn. That is also precisely why this comment is here -- those 26 tests
 # pass just as happily against the reverted import, so they cannot protect this
 # line. ``tests/regression/test_forwarded_token_source.py`` is what does.
-from fastmcp.server.dependencies import get_http_headers, get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_headers
 from tallyfy import TallyfyError
-from utils.org_id_middleware import ORG_ID_HEADERS, get_org_id, get_jwt_claims
-from constants import TALLYFY_API_BASE_URL
+
+from constants import (
+    TALLYFY_API_BASE_URL,  # noqa: F401 - re-exported: 13 tools/*.py modules import it from here
+)
+from utils.org_id_middleware import ORG_ID_HEADERS, get_jwt_claims, get_org_id
+
 logger = logging.getLogger(__name__)
 
 # The header spellings OrgIdMiddleware accepts, as lowercase str (it holds them
@@ -144,6 +150,7 @@ def _record_freshness(forwarded_token: str) -> None:
         from mcp.server.auth.middleware.auth_context import (
             get_access_token as _sdk_get_access_token,
         )
+
         from metrics import record_forwarded_token_freshness
 
         try:

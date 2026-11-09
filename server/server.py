@@ -3,41 +3,65 @@ Tallyfy MCP Server
 Exposes Tallyfy SDK functions as MCP tools for use with LLM applications
 """
 
-import os
-import logging
-import secrets
 import asyncio
 import concurrent.futures
+import logging
+import os
+import secrets
 from contextlib import asynccontextmanager
+
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette.routing import Route
-from sentry_config import init_sentry_server
-from utils.tallyfy_auth_provider import build_auth_provider
-from middleware import RequestLoggingMiddleware, AuthErrorMiddleware, RateLimitMiddleware, DownstreamAuthChallengeMiddleware, ToolScopeEnforcementMiddleware, RemovedToolHintsMiddleware, DiscoverWithoutAuth
+
+from constants import (
+    ACCEPTED_MCP_RESOURCES,
+    DEFAULT_LOG_LEVEL,
+    ENFORCE_AUDIENCE,
+    FASTMCP_SETTINGS,
+    INSTRUCTIONS_TEMPLATE,
+    INTERNAL_API_KEY,
+    MCP_JWT_AUDIENCE,
+    MCP_RESOURCE_URL,
+    SERVER_VERSION,
+    SUPPRESSED_LOGGERS,
+    TALLYFY_ISSUER,
+    TALLYFY_JWKS_URI,
+    TALLYFY_PUBLIC_KEY,
+)
+from middleware import (
+    AuthErrorMiddleware,
+    DiscoverWithoutAuth,
+    DownstreamAuthChallengeMiddleware,
+    RateLimitMiddleware,
+    RemovedToolHintsMiddleware,
+    RequestLoggingMiddleware,
+    ToolScopeEnforcementMiddleware,
+)
 from middleware.request_logging import mark_unrouted
 from routes import register_all_routes
-from tools.user_management import register_user_management_tools
-from tools.task_management import register_task_management_tools
+from sentry_config import init_sentry_server
+from tools.api_fallback import register_api_fallback_tool, report_fallback_flag_state
+from tools.automation import register_automation_tools
+from tools.automation_history import register_automation_history_tools
+from tools.comment_management import register_comment_management_tools
+from tools.file_management import register_file_management_tools
+from tools.folder_management import register_folder_management_tools
+from tools.form_fields import register_form_fields_tools
+from tools.group_management import register_group_management_tools
+from tools.org_context import register_org_context_tools
 from tools.process_management import register_process_management_tools
 from tools.search import register_search_tools
-from tools.template_management import register_template_management_tools
-from tools.form_fields import register_form_fields_tools
-from tools.automation import register_automation_tools
-from tools.group_management import register_group_management_tools
-from tools.comment_management import register_comment_management_tools
 from tools.tag_management import register_tag_management_tools
-from tools.folder_management import register_folder_management_tools
-from tools.user_interaction import register_user_interaction_tools
-from tools.api_fallback import register_api_fallback_tool, report_fallback_flag_state
+from tools.task_management import register_task_management_tools
+from tools.template_management import register_template_management_tools
 from tools.template_mapping_validation import register_template_mapping_validation_tools
-from tools.org_context import register_org_context_tools
-from tools.file_management import register_file_management_tools
-from tools.automation_history import register_automation_history_tools
+from tools.user_interaction import register_user_interaction_tools
+from tools.user_management import register_user_management_tools
 from utils.org_id_middleware import OrgIdMiddleware
+from utils.tallyfy_auth_provider import build_auth_provider
 from utils.tallyfy_spec_cache import SPEC_CACHE
-from constants import FASTMCP_SETTINGS, SUPPRESSED_LOGGERS, DEFAULT_LOG_LEVEL, TALLYFY_ISSUER, INTERNAL_API_KEY, TALLYFY_PUBLIC_KEY, TALLYFY_JWKS_URI, MCP_RESOURCE_URL, MCP_JWT_AUDIENCE, ACCEPTED_MCP_RESOURCES, ENFORCE_AUDIENCE, SERVER_VERSION, INSTRUCTIONS_TEMPLATE
 
 # Load environment variables from .env file
 load_dotenv()
@@ -49,11 +73,13 @@ init_sentry_server()
 # Initialize OpenTelemetry tracing if OTEL_EXPORTER_OTLP_ENDPOINT is set;
 # silently no-ops otherwise (Phase 12.3 — closes #173).
 from utils.otel_init import init_tracing as _init_otel  # noqa: E402
+
 _init_otel(service_name="mcp-server")
 
 # Instrument TallyfySDK._make_request so every Tallyfy API call is tracked
 # by the tallyfy_api_* Prometheus metrics (Phase 5b — closes dead-metric gap).
 from utils.sdk_metrics_patch import patch_tallyfy_sdk  # noqa: E402
+
 patch_tallyfy_sdk()
 
 # Stop exporting the `*_created` series (#1353). prometheus_client adds one per
@@ -64,6 +90,7 @@ patch_tallyfy_sdk()
 # production servers cannot drift apart on it. It is process-wide by design,
 # which is why tests/conftest.py restores the library default around every test.
 from prometheus_client import disable_created_metrics  # noqa: E402
+
 disable_created_metrics()
 
 # Configure FastMCP production settings via environment variables
@@ -347,7 +374,10 @@ app.routes.insert(0, Route("/api/tool-names", tool_display_names, methods=["GET"
 # Accept: text/event-stream) pass through untouched to the MCP transport.
 # Keeping the landing page here instead of the 2026-07-28 spec's 405 is a
 # recorded decision (#1240): see server/CLAUDE.md "Modern request headers".
-from routes.landing import _LANDING_HTML, _render_landing_for_host  # noqa: E402 - deliberately late: the comment above explains that this middleware is installed after the app and its routes exist
+# The import below is deliberately late, because this middleware is installed
+# after the app and its routes exist.
+from routes.landing import _render_landing_for_host  # noqa: E402
+
 
 class RootLandingMiddleware:
     def __init__(self, app):

@@ -14,9 +14,9 @@ tallyfy-mcp root disk filling (#1342). It also put customer org ids and guest em
 addresses into metric labels, which Prometheus keeps for its whole retention
 window.
 """
+import logging
 import re
 import time
-import logging
 from functools import wraps
 
 logger = logging.getLogger(__name__)

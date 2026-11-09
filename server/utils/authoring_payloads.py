@@ -56,7 +56,7 @@ Two rules when you do:
   The docstring stays the source of each parameter's prose.
 """
 
-from typing import Annotated, Any, Dict, List, Optional, Type, Union
+from typing import Annotated, Any, Dict, List, Type, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 

@@ -10,13 +10,12 @@ Every function here is pure: it reads accumulated evidence and returns findings.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 from template_testing.document import (
     CONDITIONABLE_CAPTURE,
     CONDITIONABLE_PRERUN,
     CONDITIONABLE_STEP,
-    DEADLINE_ANCHOR_START_RUN,
     DEFAULT_START_DATE,
     OPTION_FIELD_TYPES,
     AutomationDef,

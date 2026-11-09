@@ -30,22 +30,21 @@ for free, and fails closed when it cannot get an answer.
 
 import logging
 import re
+from typing import Annotated
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from typing import Annotated
 from pydantic import Field
-
-from tallyfy import TallyfySDK, TallyfyError
+from tallyfy import TallyfyError, TallyfySDK
 
 from constants import TALLYFY_API_BASE_URL
+from metrics import track_tool_execution
+from utils import org_context_store
 from utils.auth_context import (
     get_authenticated_credentials,
     get_verified_org_claim,
 )
-from utils import org_context_store
-from metrics import track_tool_execution
 
 logger = logging.getLogger(__name__)
 

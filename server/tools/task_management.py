@@ -4,17 +4,27 @@ Tools for managing tasks and task assignments
 """
 
 import logging
-from typing import List, Dict, Any, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
-from tallyfy import TallyfySDK, TaskOwners
+
 # `tallyfy.models.Task` is deliberately NOT imported. Every task response in this
 # module is now serialized from the raw api-v2 body through
 # `_serialize_task_response`, because `Task.from_dict` drops any field the
 # dataclass does not enumerate (#784, root cause tallyfy/sdk#33). Re-adding the
 # import is the first step of reintroducing that loss.
 from mcp.types import ToolAnnotations
+from tallyfy import TallyfySDK, TaskOwners
+
+from metrics import track_tool_execution
+from tools.form_fields import (
+    ALLOWED_FIELD_TYPES,
+    FIELD_TYPE_ALIASES,
+    _normalize_column_dicts,
+    _normalize_option_dicts,
+)
+from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.date_utils import (
     API_DATETIME_FORMAT,
     DeadlineFormatError,
@@ -24,40 +34,31 @@ from utils.date_utils import (
     utc_to_local_string,
 )
 from utils.fastmcp_errors import handle_tallyfy_errors
-from utils.field_value_encoding import coerce_field_values_safely
-from utils.guest_assignment import normalize_guest_emails
-from utils.auth_context import get_authenticated_credentials, TALLYFY_API_BASE_URL
 from utils.fastmcp_types import (
-    OptionalUserId,
+    LocalDeadline,
+    OptionalBool,
     OptionalGuestId,
+    OptionalInt,
+    OptionalLocalDeadline,
     OptionalProcessId,
+    OptionalString,
+    OptionalUserId,
+    PageNumber,
+    PageOffset,
     ProcessId,
     TaskId,
     TaskTitle,
-    LocalDeadline,
-    OptionalLocalDeadline,
-    OptionalString,
-    OptionalInt,
-    OptionalBool,
     TopSecretFlag,
-    PageNumber,
-    PageOffset,
 )
+from utils.field_value_encoding import coerce_field_values_safely
+from utils.guest_assignment import normalize_guest_emails
+from utils.pagination import fetch_single_page
 from utils.sdk_serializer import (
+    compact_dict_list_field,
     serialize_dataclass,
     serialize_task,
-    compact_dict_list_field,
     unwrap_fractal,
 )
-from utils.pagination import fetch_single_page
-from tools.form_fields import (
-    ALLOWED_FIELD_TYPES,
-    FIELD_TYPE_ALIASES,
-    _normalize_option_dicts,
-    _normalize_column_dicts,
-)
-from metrics import track_tool_execution
-
 
 _OWNER_BUCKETS = ("users", "guests", "groups")
 

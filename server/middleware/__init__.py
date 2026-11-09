@@ -20,13 +20,13 @@ Available middleware:
   sends every other request through RequireAuthMiddleware unchanged (#1317).
 """
 
-from middleware.request_logging import RequestLoggingMiddleware
 from middleware.auth_error import AuthErrorMiddleware
-from middleware.rate_limit import RateLimitMiddleware
-from middleware.downstream_auth_challenge import DownstreamAuthChallengeMiddleware
-from middleware.tool_scope_enforcement import ToolScopeEnforcementMiddleware
-from middleware.removed_tool_hints import RemovedToolHintsMiddleware
 from middleware.discover_without_auth import DiscoverWithoutAuth
+from middleware.downstream_auth_challenge import DownstreamAuthChallengeMiddleware
+from middleware.rate_limit import RateLimitMiddleware
+from middleware.removed_tool_hints import RemovedToolHintsMiddleware
+from middleware.request_logging import RequestLoggingMiddleware
+from middleware.tool_scope_enforcement import ToolScopeEnforcementMiddleware
 
 __all__ = [
     "RequestLoggingMiddleware",
