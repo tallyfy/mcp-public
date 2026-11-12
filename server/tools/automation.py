@@ -9,7 +9,7 @@ import logging
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfyError, TallyfySDK
+from tallyfy import TallyfyError
 
 from metrics import track_tool_execution
 from template_testing.checks import PLAN_STATE_ACTIVE, PLAN_STATE_INACTIVE
@@ -27,6 +27,8 @@ from tools.template_mapping_validation import (
     ACTIONABLE_TYPE_MAP,
     ASSIGNMENT_ACTIONABLE_TYPES,
     _has_assignees,
+    escalation_problems,
+    is_member_id,
 )
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.authoring_payloads import (
@@ -41,7 +43,15 @@ from utils.fastmcp_types import (
     StepId,
     TemplateId,
 )
-from utils.sdk_serializer import compact_dict_list_field, serialize_dataclass
+from utils.sdk_client import TallyfySDK
+from utils.sdk_reads import required_list
+from utils.sdk_serializer import (
+    MAX_RESULT_BYTES,
+    _encoded_len,
+    compact_dict_list_field,
+    model_document,
+    serialize_dataclass,
+)
 from utils.template_outline import outline_automation_read
 
 logger = logging.getLogger(__name__)
@@ -189,7 +199,10 @@ def register_automation_tools(mcp):
 
     # Map LLM-guessed action_type to API-expected values.
     # API validates: 'required|in:visibility,deadline,assignment,status,webhook'
+    # plus 'escalation' once tallyfy/api-v2#11737 ships (tallyfy/mcp#1740).
     _ACTION_TYPE_MAP = {
+        "escalate": "escalation",
+        "raise_escalation": "escalation",
         "assign": "assignment",
         "assignee": "assignment",
         "assign_user": "assignment",
@@ -225,8 +238,11 @@ def register_automation_tools(mcp):
 
     # Map LLM-guessed action_verb to API-expected values.
     # API validates: 'required|in:show,hide,deadline,assign,assign_only,
-    #   clear_assignees,unassign,reopen,emit_webhook'
+    #   clear_assignees,unassign,reopen,emit_webhook' plus 'raise_escalation'
+    #   once tallyfy/api-v2#11737 ships (tallyfy/mcp#1740).
     _ACTION_VERB_MAP = {
+        "escalate": "raise_escalation",
+        "escalation": "raise_escalation",
         "add_assignee": "assign",
         "add_assignees": "assign",
         "reassign": "assign",
@@ -249,6 +265,7 @@ def register_automation_tools(mcp):
         "status": ["reopen"],
         "assignment": ["assign", "assign_only", "clear_assignees", "unassign"],
         "webhook": ["emit_webhook"],
+        "escalation": ["raise_escalation"],
     }
 
     # Types with exactly one legal verb — safe to infer when the caller omits it.
@@ -345,6 +362,32 @@ def register_automation_tools(mcp):
                 f'"guests" for an email address, "groups" for a group id.'
             )
 
+    def _as_recipient_id(value) -> int:
+        """Coerce one member id in an escalation's `assignees.users`.
+
+        The same int() fold as _as_user_id, because an escalation keeps its
+        recipients in the assignment action's storage (tallyfy/api-v2#11737).
+        Which values pass is is_member_id, shared with validate_template_mapping
+        so the two refuse the same entries. The hints differ from an
+        assignment's: an escalation cannot read people from a field and cannot
+        go to a guest, and a group id is 32-hex too, so that is the likely
+        mix-up when a 32-hex id lands here.
+        """
+        if is_member_id(value):
+            return int(value)
+        hint = (
+            'A group id goes in "groups"; a member id is an integer from '
+            "get_organization_users. An escalation cannot go to a guest."
+        )
+        if _is_object_id(value):
+            raise ToolError(
+                f"assignees.users carries {value!r}, which is a 32-character "
+                f"Tallyfy object id, not a member id. {hint}"
+            )
+        raise ToolError(
+            f"assignees.users must hold integer member ids - got {value!r}. {hint}"
+        )
+
     def _normalize_actionable(act: dict) -> None:
         """Resolve the field-reference pair, and refuse a half-written one."""
         for alias in _ACTIONABLE_ID_ALIASES:
@@ -419,6 +462,23 @@ def register_automation_tools(mcp):
             '"groups": ["<id>"]} with at least one entry, or a field reference '
             f"- {_FIELD_REF_HINT}"
         )
+
+    def _validate_escalation(act: dict) -> None:
+        """An escalation needs members or groups, no guests, and its comment text.
+
+        api-v2 answers each gap with a 422 (tallyfy/api-v2#11737, AC 7). The
+        check is escalation_problems, shared with validate_template_mapping so
+        the validator and this build tool cannot disagree (tallyfy/mcp#1740).
+        """
+        if act.get("action_type") != "escalation":
+            return
+        problems = escalation_problems(act)
+        if problems:
+            raise ToolError(
+                "an escalation action " + "; it ".join(problems) + ". Send "
+                '"assignees": {"users": [<member id>], "groups": ["<group id>"]} '
+                'with at least one entry, and "comment_content": "<the text>".'
+            )
 
     def _validate_action_pair(act: dict) -> None:
         """Reject an action_type/action_verb pair the API would refuse."""
@@ -551,11 +611,18 @@ def register_automation_tools(mcp):
                         buckets[key] = [
                             _as_user_id(u, f"assignees.{key}") for u in supplied
                         ]
+            elif act.get("action_type") == "escalation" and isinstance(buckets, dict):
+                # Same storage as an assignment's people (tallyfy/api-v2#11737),
+                # so the same int() coercion, with a hint that fits a recipient.
+                supplied = buckets.get("users")
+                if isinstance(supplied, list):
+                    buckets["users"] = [_as_recipient_id(u) for u in supplied]
 
             # Only after normalisation can the pair be judged.
             _validate_action_pair(act)
             _validate_deadline(act)
             _validate_assignment(act)
+            _validate_escalation(act)
 
         return actions
 
@@ -628,54 +695,40 @@ def register_automation_tools(mcp):
     )
 
     def _stored_automation_rule(sdk, org_id: str, template_id: str, automation_id: str):
-        """Re-read one automation rule, or return None when it cannot be established.
+        """Re-read one automation rule as the SDK's AutomatedAction. Fails CLOSED.
 
-        Deliberately the SAME request the SDK issues moments later inside
-        `update_automation_rule` (a template GET with `?with=automated_actions`)
+        Deliberately the SAME read the SDK makes moments later inside
+        `update_automation_rule` (a template read with `with=automated_actions`)
         rather than a narrower endpoint, so the guard and the read-merge can
         never disagree about what "stored" means.
-        """
-        try:
-            resp = sdk._make_request(
-                "GET",
-                f"organizations/{org_id}/checklists/{template_id}",
-                params={"with": "automated_actions"},
-            )
-        # Deliberately broad: ANY failure to read means we cannot judge whether
-        # the submission is short, and the guard fails open by design. See
-        # _guard_shorter_list's docstring for why open rather than closed.
-        except Exception as exc:
-            logger.warning(
-                "could not re-read automation rule %s on template %s to check for a "
-                "destructive replace: %s", automation_id, template_id, exc
-            )
-            return None
 
-        data = resp.get("data", {}) if isinstance(resp, dict) else {}
-        # A FLAT list is the correct shape here, and the sibling key is the
-        # opposite: ChecklistTransformer builds `automated_actions` with
-        # $this->map() (flat array) and `steps` with $this->collection() (a
-        # Fractal include, {"data": [...]}). Same-looking code, opposite right
-        # answers -- PR #995 read `steps` as flat on this assumption.
-        automations = data.get("automated_actions") if isinstance(data, dict) else None
-        if not isinstance(automations, list):
-            logger.warning(
-                "template %s did not return a list of automated_actions, so "
-                "automation rule %s could not be re-read to check for a "
-                "destructive replace; the guard is failing open. Got %s",
-                template_id, automation_id, type(automations).__name__
-            )
-            return None
-        for rule in automations:
-            if isinstance(rule, dict) and str(rule.get("id")) == str(automation_id):
-                return rule
-        logger.warning(
-            "automation rule %s was not among the %d rule(s) stored on template "
-            "%s, so it could not be re-read to check for a destructive replace; "
-            "the guard is failing open",
-            automation_id, len(automations), template_id
+        Nothing is sent when the rule cannot be established, which is the
+        contract SDK 4.0's `update_automation_rule` keeps for the same read
+        (TallyfyUnexpectedResponseError for an unreadable automated_actions,
+        TallyfyNotFoundError for a rule not on the template). A failed read
+        raises as it came; None (not read) refuses as upstream_error;
+        an unknown rule id is TallyfyNotFoundError (404).
+        """
+        from tallyfy import TallyfyNotFoundError
+
+        template = sdk.templates.get_template(
+            org_id, template_id=template_id, with_="automated_actions"
         )
-        return None
+        # ChecklistTransformer always sends `automated_actions`
+        # (ChecklistTransformer.php:61), so None (SDK 4.0: not read) is a read
+        # nothing can be judged from, not a template with no rules.
+        automations = required_list(
+            template.automated_actions,
+            f"the automation rules of template {template_id}",
+        )
+        for rule in automations:
+            if str(rule.id) == str(automation_id):
+                return rule
+        raise TallyfyNotFoundError(
+            f"Automation rule {automation_id} is not on template {template_id}. "
+            f"Nothing was sent. Read the template's rules with "
+            f"analyze_template_automations to find the right id."
+        )
 
     def _submitted_list(automation_data: dict, caller_keys):
         """Return the caller's list for one replaceable slot, or None if untouched.
@@ -706,14 +759,15 @@ def register_automation_tools(mcp):
         and pass-through is not the safe default here. This is the only place in
         the round trip where the loss is visible before it happens.
 
-        ⚠️ **FAILS OPEN when the stored rule cannot be read**, and that is a
-        deliberate trade rather than an oversight. Blocking on an unreadable
-        re-read would turn a transient network fault into a hard refusal whose
-        only escape is `confirm_replace=True` — which would teach every caller to
-        pass it always, and a guard everybody bypasses guards nothing. The
-        unreadable case is logged at WARNING so it is observable rather than
-        silent. Consequence worth stating plainly: a green call is NOT proof the
-        guard ran.
+        ⚠️ **FAILS CLOSED when the stored rule cannot be read** (since
+        tallyfy/mcp#1545). It used to fail open, so that a transient fault on
+        this read did not become a refusal whose only escape was
+        `confirm_replace=True`. SDK 4.0's `update_automation_rule` now refuses,
+        sending nothing, whenever its own identical read cannot establish the
+        rule, so failing open here bought nothing but the one window where this
+        read failed and the SDK's succeeded, and in that window a short list
+        went through unguarded. Now an unreadable read refuses, retryably, and
+        the refusal never names `confirm_replace`, which is not the fix for it.
 
         It compares COUNTS, not id sets. A submission of the same length that
         swaps one row for another is a deliberate edit and is allowed through;
@@ -729,12 +783,16 @@ def register_automation_tools(mcp):
             return
 
         rule = _stored_automation_rule(sdk, org_id, template_id, automation_id)
-        if rule is None:
-            return
 
         for stored_key, submitted in wanted:
-            stored = rule.get(stored_key)
-            if not isinstance(stored, list) or len(submitted) >= len(stored):
+            # AutomatedAction.conditions / .then_actions. AutomatedActionTransformer
+            # always sends both lists (formatRules, formatDoableActions), so None
+            # is a read that did not carry them: refuse rather than guess.
+            stored = required_list(
+                getattr(rule, stored_key),
+                f"the stored {stored_key} of automation rule {automation_id}",
+            )
+            if len(submitted) >= len(stored):
                 continue
             raise ToolError(
                 f"Refusing to update: you sent {len(submitted)} {stored_key} where "
@@ -816,13 +874,13 @@ A conditional SECTION ("C only if amount > 5000") is ONE show rule: a show actio
 hides its step at launch until the condition is met; no hide rule is needed.
 Automations need a Pro plan or trial.
 
-REQUIRED: 'template_id' + 'automation_data' (dict with `conditions`+`actions`).
+REQUIRED: 'template_id' + 'automation_data' (`conditions`+`actions`).
 
 action_type CONSTRAINS action_verb:
-  visibility -> show | hide    deadline -> deadline    status -> reopen
-  webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
+  visibility -> show|hide  deadline -> deadline  status -> reopen
+  webhook -> emit_webhook  escalation -> raise_escalation
+  assignment -> assign|assign_only|unassign|clear_assignees
 
-conditionable_type: step | field | kickoff (auto-resolved)
 Step ops: completed, reopened, approved, rejected, acknowledged, expired, not_assigned
 Field/kickoff ops: contains, not_contains, equals, not_equals, equals_any,
 greater_than, less_than, is_empty, is_not_empty
@@ -830,20 +888,20 @@ greater_than, less_than, is_empty, is_not_empty
 EVERY condition needs a `statement` key (null for step ops). AND/OR is per-condition
 as `logic`:"and"|"or", never top-level.
 
-EXAMPLE (ids: 32-char hex, no hyphens) - SHOW a step when a kickoff field
-= "Yes" (hide: use "hide"):
-{"conditions":[{"conditionable_id":"<ko_field_id>","conditionable_type":"kickoff","operation":"equals","statement":"Yes","logic":"and"}],"actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
+EXAMPLE (ids: 32-char hex, no hyphens) - SHOW a step when a kickoff field = "Yes":
+{"conditions":[{"conditionable_id":"<ko_field_id>","conditionable_type":"kickoff","operation":"equals","statement":"Yes"}],"actions":[{"action_type":"visibility","action_verb":"show","target_step_id":"<step_id>"}]}
 
 Same envelope, other "actions":
   deadline: {..,"action_type":"deadline","deadline":{"value":3,"unit":"days","option":"from"}}
-  assign:   {..,"action_type":"assignment","action_verb":"assign","assignees":{"users":[12345]}}
+  assign: {..,"action_type":"assignment","action_verb":"assign","assignees":{"users":[12345]}}
   from a field: same, with "actionable_id":"<field_id>","actionable_type":"kickoff"|"field"
-  INSTEAD of assignees - assigns whoever was picked in that field. It must be an
-  assignee-picker, or text validated as an email.
+  INSTEAD of assignees: whoever was picked there (assignee-picker or email text).
+  escalation: {..,"action_type":"escalation","assignees":{"groups":["<id>"]},"comment_content":"Late"}
 
 Every action needs `target_step_id`. deadline needs ALL of value/unit/option
 (unit minutes|hours|days|weeks|months, option before|from). webhook needs webhook_url+alias_name.
-Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name), filled in if omitted.""",
+escalation needs users or groups (no guests) and comment_content.
+Use "actions" (NOT "then_actions"). "alias" (rule name) is filled in if omitted.""",
         tags=["automation", "rules", "conditional", "write"],
         annotations=ToolAnnotations(
             title="Create automation rule",
@@ -897,7 +955,7 @@ Use "actions" (NOT "then_actions"). Tallyfy requires "alias" (a short rule name)
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             result = sdk.templates.create_automation_rule(org_id, template_id, automation_data)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -910,27 +968,29 @@ analyze_template_automations first and send back EVERY condition and action you
 want to keep: a shorter list force-deletes the rest, HTTP 200, no warning.
 Omitting 'conditions' or 'actions' is a 422.
 
-REQUIRED (all three): 'template_id', 'automation_id', 'automation_data' (dict).
+REQUIRED: 'template_id', 'automation_id', 'automation_data'.
 
-Use "actions" (NOT "then_actions"). Use "alias" (NOT "automated_alias"). Use "step"/"field"/"kickoff" for conditionable_type (auto-resolved).
+Use "actions" (NOT "then_actions") and "alias" (NOT "automated_alias"). conditionable_type: step|field|kickoff.
 
-  STEP operations:    completed, reopened, approved, rejected, acknowledged, expired, not_assigned
-  FIELD/KICKOFF ops:  contains, not_contains, equals, not_equals, equals_any, greater_than, less_than, is_empty, is_not_empty
+  STEP operations: completed, reopened, approved, rejected, acknowledged, expired, not_assigned
+  FIELD/KICKOFF ops: contains, not_contains, equals, not_equals, equals_any, greater_than, less_than, is_empty, is_not_empty
 
 action_type constrains action_verb:
-  visibility -> show | hide    deadline -> deadline    status -> reopen
-  webhook -> emit_webhook      assignment -> assign | assign_only | unassign | clear_assignees
+  visibility -> show|hide  deadline -> deadline  status -> reopen
+  webhook -> emit_webhook  escalation -> raise_escalation
+  assignment -> assign|assign_only|unassign|clear_assignees
 
-CONDITIONS: every entry needs a `statement` key (null for step ops). AND/OR is set
-PER CONDITION as `logic`:"and"|"or"; there is no top-level condition_logic field.
+CONDITIONS: every entry needs a `statement` key (null for step ops). AND/OR is
+PER CONDITION as `logic`:"and"|"or"; there is no top-level condition_logic.
 
 ACTION-SPECIFIC REQUIRED FIELDS (all actions need `target_step_id`):
   - assignment -> `assignees: {users:[...], guests:[...], groups:[...]}`, OR
     `actionable_id`+`actionable_type` ("kickoff"|"field") to assign from that field
   - deadline -> COMPLETE `deadline: {value:int, unit:minutes|hours|days|weeks|months, option:before|from}`
   - emit_webhook -> `webhook_url` AND `alias_name`
+  - escalation -> `assignees: {users, groups}` (no guests) AND `comment_content`
 
-INCOMPATIBLE COMBOS (produce 422 errors):
+INCOMPATIBLE COMBOS (each is a 422):
   - an action_verb outside its action_type's list (see matrix above)
   - assignment with neither `assignees` nor `actionable_id`; a partial `deadline`
   - webhook without `webhook_url` + `alias_name`
@@ -993,12 +1053,12 @@ To keep a condition or action UNCHANGED, resend it verbatim including its `id`."
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             # BEFORE the write: api-v2 accepts a short list, deletes the remainder
             # and answers 200, so this is the last point at which the loss is
-            # visible. See _guard_shorter_list, including why it fails open.
+            # visible. See _guard_shorter_list, including why it fails closed.
             _guard_shorter_list(sdk, org_id, template_id, automation_id,
                                 automation_data, confirm_replace)
             result = sdk.templates.update_automation_rule(org_id, template_id, automation_id, automation_data)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -1045,20 +1105,104 @@ To keep a condition or action UNCHANGED, resend it verbatim including its `id`."
             ))
         return tuple(sorted(normalized))
 
+    def _action_value(action, key):
+        """One key of a serialized action, read where it is typed: the top level.
+
+        serialize_dataclass never emits a model's `extra` (tallyfy/mcp#1545),
+        so a key the SDK's AutomationAction does not type is not in the action
+        at all. SDK 4.0 types `webhook_url`, `alias_name` and `comment_content`
+        (the escalation text, api-v2 a6b4cefcf, AutomatedActionTransformer::
+        formatDoableActions; on api-v2 master and not an ancestor of its
+        production branch, read 2026-11-12), so all three are read here where
+        api-v2 sends them, and two escalations differing only in text are not
+        duplicates (tallyfy/mcp#1740). An empty string reads as absent, like a
+        missing key.
+        """
+        value = action.get(key)
+        return value if value not in (None, "") else None
+
     def _fingerprint_action(action):
-        """Create a hashable fingerprint from a single action."""
+        """Create a hashable fingerprint from a single action.
+
+        Two actions match only when everything that changes what they do
+        matches. The escalation action (tallyfy/mcp#1740) adds its comment text;
+        its recipients sit in `assignees`, which was already compared. The field
+        or step an action reads (`actionable_id`, `actionable_type`) is compared
+        too, so assigning from two different fields is not a duplicate.
+        """
+        def _comparable(key):
+            # A string as it is, anything else as sorted JSON, so the tuple
+            # stays hashable whatever shape api-v2 sends.
+            value = _action_value(action, key)
+            if not value:
+                return ""
+            return value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+
         return (
             action.get("action_type", ""),
             action.get("action_verb", ""),
             action.get("target_step_id", ""),
-            json.dumps(action.get("assignees"), sort_keys=True) if action.get("assignees") else "",
-            json.dumps(action.get("deadline"), sort_keys=True) if action.get("deadline") else "",
-            action.get("webhook_url", ""),
+            _comparable("assignees"),
+            _comparable("deadline"),
+            _comparable("webhook_url"),
+            _comparable("comment_content"),
+            _comparable("actionable_id"),
+            _comparable("actionable_type"),
         )
 
     def _fingerprint_actions(actions):
         """Create a hashable fingerprint from a list of actions."""
         return tuple(sorted(_fingerprint_action(a) for a in actions))
+
+    def _rules_compared_whole(template):
+        """A template's rules serialized with no string cap, for comparing.
+
+        Never return these as they are: a long text is whole here, and the reply
+        has to stay under the response ceiling. The capped copy is the one a tool
+        returns; _escalation_text_whole puts back only an escalation's text, and
+        only where its rule still fits.
+        """
+        rules = required_list(
+            template.automated_actions, f"the automation rules of template {template.id}"
+        )
+        return [serialize_dataclass(a, max_string_length=None) for a in rules]
+
+    # The most one rule may take once its escalation text is whole. analyze
+    # pages by rule and a part always holds at least one, so a rule near
+    # MAX_RESULT_BYTES would make a part the client cuts with no marker. Three
+    # fifths leaves the rest for the step map, the groups and the part's note.
+    _WHOLE_TEXT_RULE_BYTES = MAX_RESULT_BYTES * 3 // 5
+
+    def _escalation_text_whole(capped_rules, whole_rules):
+        """Return each escalation's comment_content whole where its rule fits.
+
+        serialize_dataclass cuts every string at 500 characters and marks the
+        cut. An escalation's text is the one string a caller has to send back
+        unchanged to update the rule, and a cut copy written back would become
+        every later email (review of tallyfy/mcp#1741). So the text goes back
+        whole whenever the rule then encodes in _WHOLE_TEXT_RULE_BYTES. A longer
+        one keeps the cut and its marker, and escalation_problems refuses a text
+        carrying the marker, so it cannot be written back by mistake.
+        """
+        for capped, whole in zip(capped_rules, whole_rules):
+            if not isinstance(capped, dict) or not isinstance(whole, dict):
+                continue
+            capped_actions = capped.get("then_actions")
+            whole_actions = whole.get("then_actions")
+            if not isinstance(capped_actions, list) or not isinstance(whole_actions, list):
+                continue
+            for capped_act, whole_act in zip(capped_actions, whole_actions):
+                if not isinstance(capped_act, dict) or not isinstance(whole_act, dict):
+                    continue
+                if capped_act.get("action_type") != "escalation":
+                    continue
+                text = _action_value(whole_act, "comment_content")
+                cut = _action_value(capped_act, "comment_content")
+                if not isinstance(text, str) or text == cut:
+                    continue
+                capped_act["comment_content"] = text
+                if _encoded_len(capped) > _WHOLE_TEXT_RULE_BYTES:
+                    capped_act["comment_content"] = cut
 
     def _detect_redundant_groups(automations):
         """Detect redundant automation rule groups from a list of serialized rules.
@@ -1172,13 +1316,29 @@ REQUIRED: 'template_id'. OPTIONAL: 'rule_offset', only as a "_truncated" marker 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             template = sdk.templates.get_template(org_id, template_id=template_id)
-            if not template:
-                raise ToolError("Template not found")
 
-            steps = [serialize_dataclass(s) for s in template.steps] if template.steps else []
-            automations = [serialize_dataclass(a) for a in template.automated_actions] if template.automated_actions else []
+            # None is "not read" (SDK 4.0), so it refuses rather than report a
+            # template with no rules or no steps (#1545).
+            steps = [
+                serialize_dataclass(s)
+                for s in required_list(template.steps, f"the steps of template {template_id}")
+            ]
+            automations = [
+                serialize_dataclass(a)
+                for a in required_list(
+                    template.automated_actions, f"the automation rules of template {template_id}"
+                )
+            ]
             step_lookup = {s['id']: s.get('title', 'Unknown') for s in steps if 'id' in s}
-            redundant_groups = _detect_redundant_groups(automations)
+            # Compared whole, returned capped. serialize_dataclass cuts every
+            # string at 500 characters, and an escalation's comment_content may
+            # run to 30000, so two escalations that differ only after the cut
+            # would otherwise be called duplicates (tallyfy/mcp#1740). The one
+            # exception to "returned capped" is an escalation's text, which
+            # goes back whole where its rule still fits.
+            whole_rules = _rules_compared_whole(template)
+            _escalation_text_whole(automations, whole_rules)
+            redundant_groups = _detect_redundant_groups(whole_rules)
             if rule_offset and rule_offset >= len(automations):
                 raise ToolError(
                     f"rule_offset={rule_offset} is past the end: this template has "
@@ -1404,11 +1564,18 @@ REQUIRED: 'template_id'. Never call without it.""",
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             template = sdk.templates.get_template(org_id, template_id=template_id)
-            if not template:
-                raise ToolError("Template not found")
 
-            steps = [serialize_dataclass(s) for s in template.steps] if template.steps else []
-            automations = [serialize_dataclass(a) for a in template.automated_actions] if template.automated_actions else []
+            # An unread `steps` would flag every step-triggered rule as pointing
+            # at a missing step, and an unread step `captures` every rule on one
+            # of its fields, so None refuses for both (#1545). The serializer
+            # drops [] and None alike, so this is checked on the model.
+            template_steps = required_list(template.steps, f"the steps of template {template_id}")
+            for model_step in template_steps:
+                required_list(model_step.captures, f"the form fields of step {model_step.id}")
+            steps = [serialize_dataclass(s) for s in template_steps]
+            # Only compared, never returned, so read whole: the 500-character
+            # cap would make two long escalation texts look alike (tallyfy/mcp#1740).
+            automations = _rules_compared_whole(template)
             step_lookup = {s['id']: s.get('title', 'Unknown') for s in steps if 'id' in s}
 
             # Form-field (Capture) ids live inside each step's `captures`; kickoff
@@ -1433,12 +1600,14 @@ REQUIRED: 'template_id'. Never call without it.""",
                 for c in (s.get('captures') or [])
                 if isinstance(c, dict) and c.get('id')
             }
-            prerun_fields = getattr(template, 'prerun', None)
-            if isinstance(prerun_fields, list):
-                prerun = [serialize_dataclass(p) for p in prerun_fields]
-                valid_prerun_ids = {p['id'] for p in prerun if isinstance(p, dict) and p.get('id')}
-            else:
-                valid_prerun_ids = set()
+            # An unread `prerun` used to give an empty id set, which flagged every
+            # kickoff-triggered rule as pointing at a deleted field. ChecklistTransformer
+            # always sends it, so None refuses instead (#1545).
+            prerun = [
+                serialize_dataclass(p)
+                for p in required_list(template.prerun, f"the kickoff fields of template {template_id}")
+            ]
+            valid_prerun_ids = {p['id'] for p in prerun if isinstance(p, dict) and p.get('id')}
 
             suggestions = _build_suggestions(
                 automations, step_lookup, valid_capture_ids, valid_prerun_ids
@@ -1507,28 +1676,27 @@ REQUIRED: 'template_id'. Never call without it.""",
     # -----------------------------------------------------------------------
 
     def _fetch_template_document(sdk, org_id: str, template_id: str) -> dict:
-        """Read the RAW template payload, deliberately not through the SDK model.
+        """The template with its steps, rules and kickoff fields, as plain dicts.
 
-        🔴 ``sdk.templates.get_template`` returns a ``Template`` whose ``Step``
-        dataclass maps a FIXED key list and drops everything else, so
-        ``assign_run_starter``, ``owner_id`` and ``ai_assigned`` never survive it
-        on the pinned SDK. Feeding those to the engine reports every
-        run-starter-assigned step as unassigned, which the spec names as the
-        largest single false-positive source in check 4.
-
-        Reading raw also runs BEFORE serialization, so the walk is unaffected by
-        the 500-character string cap and the 25 KB result ceiling. That is the
-        strongest single argument for the engine being a plain function, and it
-        is thrown away by fetching through a model that trims.
+        Read with ``sdk.templates.get_template(with_="steps,automated_actions,prerun")``
+        and turned into a document with ``model_document``: every typed field,
+        None and empty ones included, no string cap and no result ceiling, so the
+        walk is unaffected by serialisation. On SDK 4.0 ``Step`` types
+        ``assign_run_starter``, ``owner_id`` and ``ai_assigned``, which check 4
+        needs: without them every run-starter-assigned step reads as unassigned,
+        the largest single false-positive source in the spec.
         """
-        endpoint = f"organizations/{org_id}/checklists/{template_id}"
-        response = sdk._make_request(
-            "GET", endpoint, params={"with": "steps,automated_actions,prerun"}
+        template = sdk.templates.get_template(
+            org_id, template_id=template_id, with_="steps,automated_actions,prerun"
         )
-        document = response.get("data") if isinstance(response, dict) else None
-        if not isinstance(document, dict):
-            raise ToolError("Template not found")
-        return document
+        # None is "not read", not "none" (SDK 4.0): a walk over an unread steps
+        # or rules list would report a template with nothing in it.
+        required_list(template.steps, f"the steps of template {template_id}")
+        required_list(
+            template.automated_actions, f"the automation rules of template {template_id}"
+        )
+        required_list(template.prerun, f"the kickoff fields of template {template_id}")
+        return model_document(template)
 
     # Plan codes on which api-v2 actually evaluates automations. Read from
     # api-v2 app/Models/Organization.php::hasProPlan() (lines 422-425) and the
@@ -1558,20 +1726,16 @@ REQUIRED: 'template_id'. Never call without it.""",
         `None` costs a sentence nobody needed; a wrong `active` costs the
         finding.
 
-        Read RAW rather than through the SDK model on purpose, the same reason
-        `_fetch_template_document` above does: `Organization.in_trial` is
-        declared with a default on the dataclass, so a field the API omitted
-        comes back as a confident value that was never sent.
+        Read with ``sdk.organizations.get_organization``. On SDK 4.0
+        ``Organization.plan_code`` and ``.in_trial`` are None when api-v2 did not
+        send them, never a default, so an omitted ``in_trial`` stays unknown.
         """
         try:
-            response = sdk._make_request("GET", f"organizations/{org_id}")
+            organization = sdk.organizations.get_organization(org_id)
         except Exception:  # noqa: BLE001 - any failure means "not known"
             return None
-        data = response.get("data") if isinstance(response, dict) else None
-        if not isinstance(data, dict):
-            return None
-        plan_code = data.get("plan_code")
-        in_trial = data.get("in_trial")
+        plan_code = organization.plan_code
+        in_trial = organization.in_trial
         # in_trial alone is enough, and it is checked first because a trial org
         # carries the free plan code while its automations do run.
         if in_trial is True:

@@ -65,12 +65,12 @@ step open, who has it now, and could an old rule still move it. Read on api-v2
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfyError, TallyfySDK
+from tallyfy import TallyfyError, TallyfyUnexpectedResponseError
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
@@ -83,7 +83,13 @@ from utils.fastmcp_types import (
     TemplateId,
 )
 from utils.response_sanitizer import sanitize_for_user_text
-from utils.sdk_serializer import _largest_prefix_that_fits, compact_dict_list_field
+from utils.sdk_client import TallyfySDK
+from utils.sdk_reads import required_list
+from utils.sdk_serializer import (
+    _largest_prefix_that_fits,
+    compact_dict_list_field,
+    model_document,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -218,10 +224,13 @@ def read_run_with_version(sdk, org_id: str, process_id: str) -> Dict[str, Any]:
     step's title and its form fields, so a rule on a step form field can be named
     and its expected value checked against that field's options. Measured on
     staging 2026-09-29 for a 33-step template: 0.5 s against 0.35 s.
+
+    Read through ``tasks.get_process`` and turned into plain dicts of the SDK's
+    typed fields (``model_document``), so the logic below reads the same keys it
+    read off api-v2's body (tallyfy/mcp#1545).
     """
-    endpoint = f"organizations/{org_id}/runs/{process_id}"
     try:
-        response = sdk._make_request("GET", endpoint, params={"with": "checklist.steps"})
+        process = sdk.tasks.get_process(org_id, process_id, with_="checklist.steps")
     except TallyfyError as exc:
         if getattr(exc, "status_code", None) == 404:
             raise ToolError(
@@ -230,12 +239,14 @@ def read_run_with_version(sdk, org_id: str, process_id: str) -> Dict[str, Any]:
                 "template id or a task id."
             )
         raise
-    run = response.get("data") if isinstance(response, dict) else None
+    run = model_document(process)
     if not isinstance(run, dict) or not run.get("id"):
         raise ToolError(f"No process with id {process_id} was found in this organization.")
-    version = _unwrap(run.get("checklist"))
+    version = run.get("checklist")
     if isinstance(version, dict):
-        steps = _unwrap(version.get("steps"))
+        # A retired version comes back without its steps, so None reads as []
+        # here and build_explanation says so in its limits.
+        steps = version.get("steps")
         version["steps"] = steps if isinstance(steps, list) else []
         run["checklist"] = version
     else:
@@ -251,9 +262,19 @@ class OutOfTime(Exception):
     """
 
 
-def _read_pages(sdk, endpoint: str, params: Dict[str, Any], max_pages: int,
+def _read_pages(fetch: Callable[[int], Any], what: str, max_pages: int,
                 deadline: Optional[float] = None) -> Tuple[List[dict], bool, Optional[int]]:
     """Every row of a paginated read, whether the read was complete, and the total.
+
+    ``fetch(page)`` is one public SDK call for that page, asking for
+    ``PAGE_SIZE`` rows, that returns a page object with ``data`` (models) and
+    ``meta`` (``PaginationMeta``). Each row comes back as ``model_document``.
+
+    A page without ``meta.total_pages`` cannot say whether another follows, so
+    it raises ``TallyfyUnexpectedResponseError`` (``upstream_error``) rather
+    than being read as the last page; until SDK 4.0 such a page ended the read
+    and called it complete (tallyfy/mcp#1545). ``get_activity_feed`` already
+    refuses one itself.
 
     With ``deadline`` (a ``time.monotonic()`` value), no page is requested once
     it has passed; ``OutOfTime`` is raised instead (tallyfy/mcp#1520).
@@ -263,16 +284,18 @@ def _read_pages(sdk, endpoint: str, params: Dict[str, Any], max_pages: int,
     page = 1
     while True:
         if deadline is not None and time.monotonic() >= deadline:
-            raise OutOfTime(endpoint)
-        response = sdk._make_request(
-            "GET", endpoint, params={**params, "per_page": PAGE_SIZE, "page": page}
-        )
-        data = response.get("data") if isinstance(response, dict) else None
-        if isinstance(data, list):
-            rows.extend(r for r in data if isinstance(r, dict))
-        pagination = ((response or {}).get("meta") or {}).get("pagination") or {}
-        total = pagination.get("total", total)
-        total_pages = pagination.get("total_pages") or 1
+            raise OutOfTime(what)
+        result = fetch(page)
+        rows.extend(r for r in (model_document(item) for item in result.data) if isinstance(r, dict))
+        meta = result.meta
+        total_pages = getattr(meta, "total_pages", None)
+        if not isinstance(total_pages, int):
+            raise TallyfyUnexpectedResponseError(
+                f"Page {page} of {what} came back without a page count, so whether "
+                f"more pages exist cannot be told."
+            )
+        if isinstance(meta.total, int):
+            total = meta.total
         if page >= total_pages:
             return rows, True, total
         if page >= max_pages:
@@ -283,7 +306,12 @@ def _read_pages(sdk, endpoint: str, params: Dict[str, Any], max_pages: int,
 def read_run_tasks(sdk, org_id: str, process_id: str) -> Tuple[List[dict], bool]:
     """Every task in the run, hidden ones included, and whether all were read."""
     rows, complete, _total = _read_pages(
-        sdk, f"organizations/{org_id}/runs/{process_id}/tasks", {}, MAX_TASK_PAGES
+        lambda page: sdk.tasks.get_tasks_for_process(
+            org_id, process_id=process_id, page=page, per_page=PAGE_SIZE,
+            without_pagination=None,
+        ),
+        f"the tasks of process {process_id}",
+        MAX_TASK_PAGES,
     )
     return rows, complete
 
@@ -297,9 +325,10 @@ def read_automation_checks(sdk, org_id: str, process_id: str,
     than read a page after it.
     """
     rows, complete, total = _read_pages(
-        sdk,
-        f"organizations/{org_id}/activity-feeds",
-        {"entity_type": "run", "entity_id": process_id},
+        lambda page: sdk.activity_feeds.get_activity_feed(
+            org_id, entity_type="run", entity_id=process_id, page=page, per_page=PAGE_SIZE,
+        ),
+        f"the activity feed of process {process_id}",
         MAX_FEED_PAGES,
         deadline,
     )
@@ -916,10 +945,13 @@ _VERB_EFFECT = {
 
 
 def read_template_with_steps(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
-    """The template's current version, with its steps and rules."""
-    endpoint = f"organizations/{org_id}/checklists/{template_id}"
+    """The template's current version, with its steps and rules.
+
+    ``steps`` was asked for, so a read without them refuses (``required_list``)
+    rather than reporting that the step is not on the template (tallyfy/mcp#1545).
+    """
     try:
-        response = sdk._make_request("GET", endpoint, params={"with": "steps"})
+        found = sdk.templates.get_template(org_id, template_id=template_id, with_="steps")
     except TallyfyError as exc:
         if getattr(exc, "status_code", None) == 404:
             raise ToolError(
@@ -928,11 +960,11 @@ def read_template_with_steps(sdk, org_id: str, template_id: str) -> Dict[str, An
                 "or a step id."
             )
         raise
-    template = response.get("data") if isinstance(response, dict) else None
+    template = model_document(found) if found is not None else None
     if not isinstance(template, dict) or not template.get("id"):
         raise ToolError(f"No template with id {template_id} was found in this organization.")
-    steps = _unwrap(template.get("steps"))
-    template["steps"] = [s for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+    steps = required_list(template.get("steps"), f"the steps of template {template_id}")
+    template["steps"] = [s for s in steps if isinstance(s, dict)]
     return template
 
 
@@ -950,9 +982,11 @@ def read_processes_in_motion(sdk, org_id: str, template_id: str) -> Tuple[List[d
     total = 0
     for status in STATUSES_IN_MOTION:
         rows, done, count = _read_pages(
-            sdk,
-            f"organizations/{org_id}/runs",
-            {"checklist_id": template_id, "status": status, "with": "tasks"},
+            lambda page, status=status: sdk.tasks.get_organization_runs(
+                org_id, per_page=PAGE_SIZE, page=page, with_data="tasks",
+                checklist_id=template_id, status=status,
+            ),
+            f"the {status} processes of template {template_id}",
             MAX_RUN_PAGES,
         )
         complete = complete and done
@@ -981,11 +1015,8 @@ def _tasks_for_step(process: Dict[str, Any], step_id: str) -> List[dict]:
 
 def read_launched_version(sdk, org_id: str, process_id: str) -> Optional[Dict[str, Any]]:
     """The template version one process launched from, or None when unreadable."""
-    response = sdk._make_request(
-        "GET", f"organizations/{org_id}/runs/{process_id}", params={"with": "checklist"}
-    )
-    run = response.get("data") if isinstance(response, dict) else None
-    version = _unwrap(run.get("checklist")) if isinstance(run, dict) else None
+    run = sdk.tasks.get_process(org_id, process_id, with_="checklist")
+    version = model_document(run.checklist) if run.checklist is not None else None
     return version if isinstance(version, dict) else None
 
 
@@ -1018,10 +1049,11 @@ def read_executed_automations(sdk, org_id: str, process_id: str,
     if state.get("feed_filter", True):
         try:
             rows, complete, _total = _read_pages(
-                sdk,
-                f"organizations/{org_id}/activity-feeds",
-                {"entity_type": "run", "entity_id": process_id,
-                 "type": "execution", "verb": "executed"},
+                lambda page: sdk.activity_feeds.get_activity_feed(
+                    org_id, entity_type="run", entity_id=process_id,
+                    type_="execution", verb="executed", page=page, per_page=PAGE_SIZE,
+                ),
+                f"the executed rules of process {process_id}",
                 MAX_FEED_PAGES,
                 deadline,
             )
@@ -1059,12 +1091,29 @@ def _assignment_rules_for_step(document: Dict[str, Any], step_id: str) -> List[D
     return rules
 
 
+def _user_id(key: Any) -> Optional[int]:
+    """A member id as ``users.get_user`` takes it: an int, or None for anything else.
+
+    Owner buckets carry ints (``BaseAssignees::users()``), but an automation's
+    stored assignees can carry the same id as a string, and SDK 4.0's
+    ``get_user`` refuses anything but an int with a ValueError.
+    """
+    if isinstance(key, bool):
+        return None
+    if isinstance(key, int):
+        return key
+    if isinstance(key, str) and key.strip().isdigit():
+        return int(key.strip())
+    return None
+
+
 class _Names:
     """Best-effort names for user and group ids, read once each and capped.
 
     ``complete`` is False whenever an id was not named: the lookup cap or the
     time budget ran out, or a lookup failed (a 403 for a standard member, a 404
-    for a removed user, any other error, or a body with no record). A failed
+    for a removed user, any other error, an id the SDK refuses before sending,
+    or a body with no record). A failed
     lookup used to be skipped with ``complete`` left True, so the result said
     nothing while showing a bare id (tallyfy/mcp#1515).
     """
@@ -1087,24 +1136,35 @@ class _Names:
                 self.complete = False
                 return
             try:
-                response = sdk._make_request("GET", f"organizations/{org_id}/{kind}/{key}")
-            except TallyfyError as exc:
+                if kind == "users":
+                    user_id = _user_id(key)
+                    if user_id is None:
+                        # Not a member id at all, so there is nothing to ask for.
+                        self.complete = False
+                        continue
+                    record = sdk.users.get_user(org_id, user_id)
+                else:
+                    record = sdk.groups.get_group(org_id, key)
+            except (TallyfyError, ValueError) as exc:
+                # ValueError: the SDK refused the id before sending it
+                # (validate_id on a group id). Still only "not named".
                 logger.info("Could not read the name of %s %s: %s", kind, key, exc)
                 self.complete = False
                 continue
-            data = response.get("data") if isinstance(response, dict) else None
-            if not isinstance(data, dict):
+            if record is None or getattr(record, "id", None) is None:
+                # get_user answers None, and get_group a Group with no id, for
+                # a body that carried no record.
                 self.complete = False
                 continue
             if kind == "users":
-                name = data.get("full_name") or " ".join(
-                    p for p in (data.get("first_name"), data.get("last_name")) if p
+                name = record.full_name or " ".join(
+                    p for p in (record.first_name, record.last_name) if p
                 )
-                entry = {"name": name or None, "email": data.get("email")}
+                entry = {"name": name or None, "email": record.email}
                 self.users[key] = {k: v for k, v in entry.items() if v}
             else:
-                if data.get("name"):
-                    self.groups[key] = {"name": data.get("name")}
+                if record.name:
+                    self.groups[key] = {"name": record.name}
 
     def people(self, buckets: Dict[str, list]) -> Dict[str, list]:
         return {

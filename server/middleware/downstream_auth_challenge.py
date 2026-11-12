@@ -190,7 +190,18 @@ _MAX_TRACKED_SESSIONS = 1000
 #: left to say about that credential.
 _SESSION_TTL_SECONDS = 3600.0
 
-_challenge_counts: "OrderedDict[str, tuple]" = OrderedDict()  # session_id -> (count, last_seen)
+#: Challenges the connect-time membership check (``middleware/connect_membership.py``,
+#: #1135) may issue to one person for one workspace before this breaker opens.
+#: One is enough: it sends the person to api-v2's authorize page, and since
+#: tallyfy/api-v2#10120 api-v2 does not mint the same unusable token again. So a
+#: second refusal for the same person and workspace within the TTL is a loop.
+#: Deliberately not read from ``MCP_AUTH_CHALLENGE_MAX_PER_SESSION``, whose ``0``
+#: turns suppression off: this budget must never be unbounded.
+MEMBERSHIP_CHALLENGES_PER_IDENTITY = 1
+
+#: Keys are an ``mcp-session-id`` string, or a tuple for a membership budget.
+#: A header value is always a string, so it can never name a tuple key.
+_challenge_counts: "OrderedDict[object, tuple]" = OrderedDict()  # key -> (count, last_seen)
 _challenge_lock = threading.Lock()
 
 
@@ -243,9 +254,14 @@ def _prune_locked(now: float) -> None:
         _challenge_counts.popitem(last=False)
 
 
-def _consume_challenge_budget(session_id: str) -> bool:
-    """Charge one challenge to this session. False means the circuit is open."""
-    limit = _max_challenges_per_session()
+def _consume_challenge_budget(session_id: object, limit: Optional[int] = None) -> bool:
+    """Charge one challenge to this key. False means the circuit is open.
+
+    ``limit`` defaults to the per-session budget for downstream 401s. The
+    connect-time membership check passes its own.
+    """
+    if limit is None:
+        limit = _max_challenges_per_session()
     if limit <= 0:
         return True
 
@@ -277,8 +293,32 @@ def note_upstream_success(session_id: Optional[str]) -> None:
         _challenge_counts.pop(session_id, None)
 
 
+def _membership_key(user_id: str, org_id: str) -> tuple:
+    return ("membership", str(user_id), str(org_id))
+
+
+def consume_membership_challenge(user_id: str, org_id: str) -> bool:
+    """Charge one connect-time membership challenge. False means do not challenge.
+
+    Called by ``middleware.connect_membership`` when api-v2 says this person is
+    not an active member of this workspace.
+    """
+    return _consume_challenge_budget(
+        _membership_key(user_id, org_id), limit=MEMBERSHIP_CHALLENGES_PER_IDENTITY
+    )
+
+
+def note_membership_confirmed(user_id: str, org_id: str) -> None:
+    """Clear the membership budget once api-v2 confirms the person is a member.
+
+    So a person who is re-added and later removed again is challenged again.
+    """
+    with _challenge_lock:
+        _challenge_counts.pop(_membership_key(user_id, org_id), None)
+
+
 def reset_challenge_state() -> None:
-    """Drop all tracked sessions. For tests only."""
+    """Drop all tracked sessions and membership budgets. For tests only."""
     with _challenge_lock:
         _challenge_counts.clear()
 

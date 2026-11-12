@@ -1,56 +1,42 @@
 """
-Monkey-patch TallyfySDK._make_request to track every Tallyfy API call
-via the tallyfy_api_* Prometheus metrics.
+Record every Tallyfy API call in the tallyfy_api_* Prometheus metrics, through
+the SDK's public request hook.
 
-Called once at server startup from server.py.
+``record_request`` is a request hook (SDK 4.0, ``tallyfy.request_events``):
+every client the server builds carries it (``utils/sdk_client.py``), and the
+SDK calls it once per HTTP attempt on all three transports, JSON calls, file
+downloads and uploads. It counts CALLS, not attempts: it acts on the one event
+per call whose ``final`` is True, so a call the SDK retried is one call, with
+the status it finally ended in and the duration of the whole call, backoff
+included. ``enable_api_metrics()`` turns it on, once, at server startup
+(``server.py``); until then it records nothing, as before.
+
+Until tallyfy/mcp#1545 this module monkey-patched the PRIVATE
+``BaseSDK._make_request`` (and later ``_download_bytes`` and
+``_upload_multipart``). The hook replaces all of that; no SDK method is wrapped.
 
 The ``operation`` label carries the endpoint SHAPE, never the endpoint itself
 (tallyfy/mcp#1353). Until then it carried the raw path, so every org id, run
 id, task id, email address and guest code became its own label value. Measured
 on the production Prometheus 2026-09-23: 4,820 distinct ``operation`` values
-came from this patch, and ``operation_label`` collapses them to 60. Each value
-is about a dozen series, which made this label an accelerant behind the
-tallyfy-mcp root disk filling (#1342). It also put customer org ids and guest email
-addresses into metric labels, which Prometheus keeps for its whole retention
-window.
+came from the old patch, and ``operation_label`` collapses them to 60. Each
+value is about a dozen series, which made this label an accelerant behind the
+tallyfy-mcp root disk filling (#1342). It also put customer org ids and guest
+email addresses into metric labels, which Prometheus keeps for its whole
+retention window. The SDK's ``RequestEvent.path_template`` is that same
+algorithm, moved into the SDK, so the label is ``f"{method} {path_template}"``
+and reads byte for byte as it did; ``test_sdk_metrics_patch.py`` pins that
+against a frozen copy of the algorithm this module used to carry.
 """
 import logging
-import re
-import time
-from functools import wraps
+
+from tallyfy.request_events import ID_PLACEHOLDER, path_template
 
 logger = logging.getLogger(__name__)
 
-_patched = False
+__all__ = ["ID_PLACEHOLDER", "enable_api_metrics", "operation_label", "record_request"]
 
-# What an id is replaced with. A fixed string, so every call to the same
-# endpoint shares one label value whatever it was called with.
-ID_PLACEHOLDER = "{id}"
-
-# A route word in a Tallyfy API path: lowercase letters, joined by "-" or "_".
-# "runs", "tasks", "completed-tasks", "automated-actions", "guests-list".
-# Anything else sitting in a path segment is a value the caller supplied. The
-# shapes seen live on 2026-09-23 were 32-hex ids, numeric user ids, 40-char
-# mixed-case guest codes and email addresses, and none of them can match this,
-# because each carries a digit, an uppercase letter or an "@".
-_ROUTE_WORD = re.compile(r"[a-z]+(?:[-_][a-z]+)*")
-
-# The one way an id could still pass as a route word: a hex id whose characters
-# all happen to be a-f. Real route words are never 8+ hex letters in a row, so
-# anything that long and that shape is an id.
-_HEX_RUN = re.compile(r"[0-9a-f]{8,}")
-
-# A route word is short. A lowercase slug or free text in a path position is
-# not, so a long all-letter segment is treated as a value too.
-_MAX_ROUTE_WORD_LEN = 32
-
-
-def _is_route_word(segment: str) -> bool:
-    return (
-        len(segment) <= _MAX_ROUTE_WORD_LEN
-        and _ROUTE_WORD.fullmatch(segment) is not None
-        and _HEX_RUN.fullmatch(segment) is None
-    )
+_enabled = False
 
 
 def operation_label(method, endpoint) -> str:
@@ -58,58 +44,40 @@ def operation_label(method, endpoint) -> str:
 
     ``GET organizations/<org>/runs/<run>/tasks?page=2`` becomes
     ``GET organizations/{id}/runs/{id}/tasks``. The query string is dropped, as
-    it always was. Empty segments (a leading, trailing or doubled slash) are
-    kept as they are, so a path that did not carry an id reads exactly as it
-    did before this change and existing dashboard queries keep matching.
+    it always was, and empty segments are kept as they are. This is exactly
+    what ``record_request`` writes for a ``RequestEvent``: the SDK's own
+    ``path_template``, after the upper-case method.
 
     A metric must not take down the API call it is measuring, so a method or
     endpoint that is not a string is stringified rather than rejected.
     """
-    path = str(endpoint).split("?", 1)[0]
-    segments = [
-        segment if not segment or _is_route_word(segment) else ID_PLACEHOLDER
-        for segment in path.split("/")
-    ]
-    return f"{str(method).upper()} {'/'.join(segments)}"
+    return f"{str(method).upper()} {path_template(endpoint)}"
 
 
-def patch_tallyfy_sdk():
-    global _patched
-    if _patched:
+def record_request(event) -> None:
+    """The request hook: count one finished call and observe its duration.
+
+    Non-final events (an attempt the SDK retries) are ignored, so a call is
+    counted once. ``status`` is ``error`` when the call raised, whatever it
+    raised, and ``success`` when it returned, as the wrapper this replaced
+    recorded it. Nothing is recorded until ``enable_api_metrics()`` runs.
+    Whatever this raises the SDK logs and drops, so a metric can never be why
+    a call fails.
+    """
+    if not _enabled or not event.final:
         return
-    _patched = True
-
-    try:
-        from tallyfy.core import BaseSDK
-    except ImportError:
-        logger.warning("tallyfy SDK not installed; skipping API metrics patch")
-        return
-
     from metrics import tallyfy_api_calls_total, tallyfy_api_duration_seconds
 
-    original = BaseSDK._make_request
+    operation = f"{event.method} {event.path_template}"
+    status = "error" if event.error is not None else "success"
+    tallyfy_api_calls_total.labels(operation=operation, status=status).inc()
+    tallyfy_api_duration_seconds.labels(operation=operation).observe(event.call_duration)
 
-    # *args as well as **kwargs, passed through unchanged (#1357). The SDK's
-    # own signature is (self, method, endpoint, params=None, data=None,
-    # form_data=None), so a caller may pass params positionally. A
-    # keyword-only wrapper refused that with a TypeError of its OWN, and
-    # because @wraps copies __qualname__ the message read
-    # "BaseSDK._make_request() takes 3 positional arguments", blaming the SDK
-    # for a call the SDK accepts. A metric must never be why a call fails.
-    @wraps(original)
-    def _instrumented(self, method, endpoint, *args, **kwargs):
-        operation = operation_label(method, endpoint)
-        start = time.time()
-        status = "success"
-        try:
-            return original(self, method, endpoint, *args, **kwargs)
-        except Exception:
-            status = "error"
-            raise
-        finally:
-            duration = time.time() - start
-            tallyfy_api_calls_total.labels(operation=operation, status=status).inc()
-            tallyfy_api_duration_seconds.labels(operation=operation).observe(duration)
 
-    BaseSDK._make_request = _instrumented
-    logger.info("Patched TallyfySDK._make_request with Prometheus metrics")
+def enable_api_metrics() -> None:
+    """Start recording Tallyfy API calls. Called once from ``server.py``."""
+    global _enabled
+    if _enabled:
+        return
+    _enabled = True
+    logger.info("Recording Tallyfy API calls through the SDK request hook")

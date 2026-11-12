@@ -101,11 +101,10 @@ def _uses_field(field: Dict[str, Any], texts: List[str]) -> bool:
 
 
 def compute_health_facts(template: Dict[str, Any]) -> Dict[str, Any]:
-    """The checkable facts about one raw template body.
+    """The checkable facts about one whole template.
 
-    ``template`` is the unwrapped body from ``_read_template_body``: raw, not
-    serialised, so no string has been cut yet. Includes may still be
-    Fractal-wrapped; both shapes are read.
+    ``template`` is the SDK ``Template`` from ``_read_template_body`` as plain
+    dicts (``sdk_serializer.model_document``), so no string has been cut yet. Includes may also be Fractal-wrapped; both shapes are read.
     """
     steps = steps_in_position_order(_as_list(template.get("steps")))
     rules = [r for r in _as_list(template.get("automated_actions")) if isinstance(r, dict)]

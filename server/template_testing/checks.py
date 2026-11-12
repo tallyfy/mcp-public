@@ -255,9 +255,10 @@ def check_inert_rule(
 
         if rule.id in ev.effective:
             continue
-        # An emit_webhook has an external side effect this engine cannot see, so a
+        # An emit_webhook, or an escalation comment that emails people
+        # (tallyfy/mcp#1740), has a side effect this engine cannot see, so a
         # rule carrying one is never `no_effect`.
-        if any(a.is_webhook for a in rule.actions):
+        if any(a.acts_outside_the_steps for a in rule.actions):
             continue
         if ev.truncated:
             title = f"Automation {label} changed nothing in the paths tested"

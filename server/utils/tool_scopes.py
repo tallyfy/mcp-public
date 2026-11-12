@@ -320,6 +320,7 @@ TOOL_SCOPES: Dict[str, FrozenSet[str]] = {
     "delete_form_field": _FORM_W,
     "delete_kickoff_field": _FORM_W,
     "move_form_field": _FORM_W,
+    "move_kickoff_field": _FORM_W,
     "reorder_form_fields": _FORM_W,
     "reorder_kickoff_fields": _FORM_W,
     "update_dropdown_options": _FORM_W,

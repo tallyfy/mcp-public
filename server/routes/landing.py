@@ -17,6 +17,9 @@ Closes #433.
 
 from starlette.responses import HTMLResponse, RedirectResponse
 
+from constants import MCP_ALLOWED_HOSTS
+from routes.health import _environment_label
+
 
 def register_landing_routes(mcp):
     """Register the public landing page route with the MCP server."""
@@ -75,6 +78,8 @@ _GCP_BANNER = """
 _PROD_ENDPOINT = "https://mcp.tallyfy.com/"
 _STAGING_ENDPOINT = "https://staging.mcp.tallyfy.com/"
 
+# Every label a deployment can carry. `_badge` picks one from the deployment's
+# environment, so the page says what /health says.
 _PROD_BADGE = (
     '<span class="badge"><span class="dot"></span>'
     "Production &middot; live now</span>"
@@ -82,6 +87,10 @@ _PROD_BADGE = (
 _STAGING_BADGE = (
     '<span class="badge"><span class="dot"></span>'
     "Staging &middot; for testing, not for production use</span>"
+)
+_TEST_BADGE = (
+    '<span class="badge"><span class="dot"></span>'
+    "Not production &middot; for testing only</span>"
 )
 
 _STAGING_NOTE = """
@@ -93,15 +102,56 @@ _STAGING_NOTE = """
     </div>
 """
 
+# For any other deployment that is not production. It says less than the staging
+# note on purpose: nothing here knows what such a server is running.
+_TEST_NOTE = """
+    <div class="gcp-banner" role="note">
+        <strong>This is a test server.</strong>
+        Its data is test data. Point a real AI client at
+        <code>mcp.tallyfy.com</code> instead.
+    </div>
+"""
 
-def _is_staging(host: str) -> bool:
-    """True for the staging host, false for production and the Cloud Run mirror.
 
-    Anchored on the leading label rather than a bare substring, so the production
-    host can never match and a future host that merely CONTAINS the word is not
-    misread. The port is stripped because a Host header may carry one.
+def _badge(environment: str) -> str:
+    """The label for this deployment, from its environment and never its host.
+
+    A check on the Host header could not match `dev.`, so that host called itself
+    production while its own /health said staging (#1148). Only the production
+    environment earns the production badge: an unset or unrecognized environment
+    gets the test badge, because claiming production is the mistake that hurts.
     """
-    return (host or "").lower().split(":")[0].startswith("staging.")
+    if environment == "production":
+        return _PROD_BADGE
+    if environment == "staging":
+        return _STAGING_BADGE
+    return _TEST_BADGE
+
+
+def _advertised_endpoint(host: str | None, environment: str) -> str:
+    """The endpoint to print: the host being served, when it is on the allowlist.
+
+    The Host header is caller input and this page is public, so it can only select
+    a name already in MCP_ALLOWED_HOSTS. Nothing from an unlisted host reaches the
+    page. The port is stripped because a Host header may carry one.
+
+    An unlisted host falls back to the deployment's own environment, so a staging
+    server never hands out production. The Cloud Run mirror is unlisted and takes
+    the production endpoint this way.
+    """
+    hostname = (host or "").lower().split(":")[0]
+    if hostname in MCP_ALLOWED_HOSTS:
+        return f"https://{hostname}/"
+    return _STAGING_ENDPOINT if environment == "staging" else _PROD_ENDPOINT
+
+
+def _environment_note(environment: str, endpoint: str) -> str:
+    """The note under the header. Production has none."""
+    if environment == "production":
+        return ""
+    if environment == "staging" and endpoint == _STAGING_ENDPOINT:
+        return _STAGING_NOTE
+    return _TEST_NOTE
 
 
 def _render_landing_for_host(host: str) -> str:
@@ -115,17 +165,20 @@ def _render_landing_for_host(host: str) -> str:
     to the production page and contained the word "staging" zero times, so
     somebody sent a staging link to check a connector would copy the endpoint off
     the page and point a real client at production.
+
+    The label and the note follow the deployment's environment and the endpoint
+    follows the host, so every allowlisted host names itself (#1148).
     """
-    lower = (host or "").lower()
-    banner = _GCP_BANNER if "mcp-gcp" in lower else ""
-    staging = _is_staging(lower)
-    if staging and not banner:
-        banner = _STAGING_NOTE
-    html = _LANDING_HTML.replace("{GEMINI_BANNER}", banner)
-    html = html.replace(
-        "{MCP_ENDPOINT}", _STAGING_ENDPOINT if staging else _PROD_ENDPOINT
+    environment = _environment_label()
+    endpoint = _advertised_endpoint(host, environment)
+    banner = (
+        _GCP_BANNER
+        if "mcp-gcp" in (host or "").lower()
+        else _environment_note(environment, endpoint)
     )
-    html = html.replace("{ENV_BADGE}", _STAGING_BADGE if staging else _PROD_BADGE)
+    html = _LANDING_HTML.replace("{GEMINI_BANNER}", banner)
+    html = html.replace("{MCP_ENDPOINT}", endpoint)
+    html = html.replace("{ENV_BADGE}", _badge(environment))
     html = html.replace("{TOOL_COUNT}", str(_total_tools()))
     html = html.replace("{PROTOCOL_VERSION}", _served_protocol_version())
     return html
@@ -217,14 +270,12 @@ def _render_tools_page_for_host(host: str) -> str:
 """
         )
 
-    staging = _is_staging(host)
+    environment = _environment_label()
     html = _TOOLS_HTML.replace("{SECTIONS}", "\n".join(sections))
     html = html.replace("{TOOL_COUNT}", str(total))
     html = html.replace("{CATEGORY_COUNT}", str(len(categories)))
-    html = html.replace(
-        "{MCP_ENDPOINT}", _STAGING_ENDPOINT if staging else _PROD_ENDPOINT
-    )
-    html = html.replace("{ENV_BADGE}", _STAGING_BADGE if staging else _PROD_BADGE)
+    html = html.replace("{MCP_ENDPOINT}", _advertised_endpoint(host, environment))
+    html = html.replace("{ENV_BADGE}", _badge(environment))
     return html
 
 

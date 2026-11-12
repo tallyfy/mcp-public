@@ -10,7 +10,6 @@ from typing import List, Optional
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfySDK
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
@@ -24,6 +23,7 @@ from utils.fastmcp_types import (
     TaskId,
     UserIdList,
 )
+from utils.sdk_client import TallyfySDK
 from utils.sdk_serializer import compact_result, serialize_dataclass
 
 logger = logging.getLogger(__name__)
@@ -403,7 +403,7 @@ REQUIRED: 'task_id' and 'content' (comment text).
 
 Optional:
 - 'run_id': process/run ID, pass it if you have it; you'll need it to call 'get_task_comments' later
-- 'label': "comment" (default) | "problem" | "resolve" | "improvement" | "advice"
+- 'label': "comment" (default) | "problem" | "resolve" | "improvement" | "advice" | "escalation"
 - 'state': "hide-for-guests" (Tallyfy's default) | "open" | "collapsed".
   This server adds no default; omit it and guests will NOT see the comment.
 - 'sent_to': numeric user IDs to @mention. Look up IDs via get_organization_users first.
@@ -453,7 +453,10 @@ CORRECT usage:
             content: Comment text (REQUIRED)
             run_id: Process/run ID, not used by this endpoint but accepted so callers retain
                 it in context for a subsequent get_task_comments call (optional)
-            label: Comment type: "comment" | "problem" | "resolve" | "improvement" | "advice" (default: "comment")
+            label: Comment type: "comment" | "problem" | "resolve" | "improvement" | "advice" | "escalation" (default: "comment").
+                "escalation" flags a late task to the people the comment mentions. Unlike
+                "problem", it never blocks completion and never changes the process status.
+                An automation's escalation action posts one.
             state: Visibility: "hide-for-guests" (default) | "open" | "collapsed".
                 This server substitutes no default of its own: when the caller omits
                 'state' it is forwarded as None and the value is chosen by api-v2,
@@ -612,7 +615,8 @@ CORRECT usage:
             comment_id: Comment ID to update (REQUIRED)
             content: New comment text (REQUIRED)
             run_id: Process/run ID, not used by this endpoint. Accepted for context continuity (optional)
-            label: Comment type: "comment" | "problem" | "resolve" | "improvement" | "advice" (optional)
+            label: Comment type: "comment" | "problem" | "resolve" | "improvement" | "advice" | "escalation" (optional).
+                "escalation" never blocks completion and never changes the process status.
             state: Visibility: "open" | "hide-for-guests" | "collapsed" (optional)
             sent_to: List of numeric user IDs to @mention (optional). Rendered into
                 the body as @[<user_id>] markup — the API has no request-side

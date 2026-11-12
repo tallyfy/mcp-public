@@ -18,9 +18,14 @@ Available middleware:
 - DiscoverWithoutAuth: Wraps the transport ENDPOINT, not the app. Lets a
   no-token, single, exact `server/discover` reach the unwrapped transport and
   sends every other request through RequireAuthMiddleware unchanged (#1317).
+- ConnectMembershipCheck: Installed on RequireAuthMiddleware's .app, so it
+  sees only verified requests. On the first request a new MCP OAuth token
+  makes, asks api-v2 once whether the token's user is still an active member
+  of the token's workspace, and answers a transport 401 if not (#1135).
 """
 
 from middleware.auth_error import AuthErrorMiddleware
+from middleware.connect_membership import ConnectMembershipCheck
 from middleware.discover_without_auth import DiscoverWithoutAuth
 from middleware.downstream_auth_challenge import DownstreamAuthChallengeMiddleware
 from middleware.rate_limit import RateLimitMiddleware
@@ -36,4 +41,5 @@ __all__ = [
     "ToolScopeEnforcementMiddleware",
     "RemovedToolHintsMiddleware",
     "DiscoverWithoutAuth",
+    "ConnectMembershipCheck",
 ]

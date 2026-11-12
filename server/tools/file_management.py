@@ -38,31 +38,35 @@ as downloading the file in the browser:
 * It writes a "File downloaded" entry to the activity feed. The tool stays
   ``readOnlyHint=True`` because it changes nothing a user owns.
 
-THE SDK CANNOT CARRY EITHER CALL, so these go over httpx directly
------------------------------------------------------------------
-``BaseSDK._make_request`` always tries ``response.json()`` and returns a parsed
-dict, and its only body modes are JSON and ``application/x-www-form-urlencoded``.
-A download needs raw bytes and an upload needs ``multipart/form-data``, so neither
-fits. ``tools/search.py`` already reaches for ``httpx`` inside a tool, so this is
-an established shape here rather than a new one.
+ALL THREE CALLS GO THROUGH THE SDK's PUBLIC FILE METHODS (tallyfy/mcp#1545)
+------------------------------------------------------------------------------
+``sdk.files.get_asset``, ``sdk.files.download_file`` and ``sdk.files.upload_file``
+(SDK 4.0, tallyfy/sdk#176). Until then these went over ``httpx`` directly,
+because ``BaseSDK._make_request`` parses every body as JSON and cannot send
+multipart. The SDK now streams the download and sends the multipart upload on
+its own session, so this module holds no HTTP code. The client is built with
+``TRANSFER_TIMEOUT_SECONDS``, so the metadata read gets that timeout too.
 
-They still raise ``TallyfyError`` rather than ``ToolError`` on an upstream status,
-which is deliberate: that is what plugs them into ``handle_tallyfy_errors`` like
-every other tool, so a 401 here reaches ``flag_downstream_auth_failure`` and gets
-the same re-authentication challenge, and a 404 is demoted to a warning by
+Upstream failures stay ``TallyfyError`` rather than ``ToolError``, which is
+deliberate: that is what plugs them into ``handle_tallyfy_errors`` like every
+other tool, so a 401 here reaches ``flag_downstream_auth_failure`` and gets the
+same re-authentication challenge, and a 404 is demoted to a warning by
 ``EXPECTED_UPSTREAM_STATUSES`` instead of paging Sentry. A bare ``ToolError``
 would skip all of that. ``ToolError`` is kept for what this tool itself refuses,
-before anything is sent.
+before anything is sent, and for a transfer the SDK reports as broken off or
+never sent, whose wording says what the caller may do next.
 
-THE DOWNLOAD IS STREAMED, AND THE CAP IS NOT COSMETIC
------------------------------------------------------
-Tallyfy accepts uploads up to 100MB. ``httpx.get`` on a 100MB asset buffers 100MB
-inside a shared production server process, so the read goes through
-``httpx.stream`` with a hard byte cap: an asset over the cap is never pulled into
-memory at all, and the tool answers with metadata plus a stated reason instead.
-Partial content is never returned as ``content_base64``, because half a base64
-string decodes to a corrupt file and nothing downstream can tell that from a
-whole one.
+THE DOWNLOAD IS CAPPED, AND THE CAP IS NOT COSMETIC
+---------------------------------------------------
+Tallyfy accepts uploads up to 100MB, which buffered whole would sit inside a
+shared production server process. ``download_file(max_bytes=MAX_ASSET_BYTES)``
+streams and stops: a file whose declared size is over the cap is refused before
+any of it is read, and one with no declared size is refused once the cap is
+passed. Either way it raises ``TallyfyFileTooLargeError`` (with
+``declared_bytes`` when the server declared it) and returns nothing, and the
+tool answers with metadata plus a stated reason instead. Partial content is
+never returned as ``content_base64``, because half a base64 string decodes to a
+corrupt file and nothing downstream can tell that from a whole one.
 
 ``compact_result`` IS DELIBERATELY NOT CALLED ON THE PAYLOAD HERE, and this is
 the one tidy-up to resist. It truncates to fit ``MAX_RESULT_BYTES``; applied to a
@@ -78,17 +82,22 @@ import mimetypes
 import re
 from typing import Annotated, Any, Dict, Optional
 
-import httpx
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from tallyfy import TallyfyError
+from tallyfy import (
+    TallyfyError,
+    TallyfyFileTooLargeError,
+    TallyfyIndeterminateError,
+    TallyfyNotDeliveredError,
+)
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.fastmcp_errors import _sanitize_api_error, handle_tallyfy_errors
-from utils.sdk_serializer import MAX_RESULT_BYTES
+from utils.sdk_client import TallyfySDK
+from utils.sdk_serializer import MAX_RESULT_BYTES, model_document
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +110,17 @@ logger = logging.getLogger(__name__)
 MAX_ASSET_BYTES = 10 * 1024 * 1024
 
 # Reading an asset can take a while over a slow link at the cap above, so the
-# transfer calls get their own timeout rather than the 30s the metadata call
-# uses (which mirrors tools/api_fallback.py).
-METADATA_TIMEOUT_SECONDS = 30.0
-TRANSFER_TIMEOUT_SECONDS = 60.0
+# SDK client these tools build waits this long per request rather than its own
+# 30s default. One client serves the metadata read and the transfer, so the
+# metadata read gets the same timeout (it had its own 30s before #1545).
+TRANSFER_TIMEOUT_SECONDS = 60
+
+# What the download route says about every file it serves. api-v2's
+# AssetsController::downloadFile (origin/production) writes
+# `header('Content-Type: application/octet-stream')` before echoing the bytes,
+# and `download_file` returns the bytes alone, so this is the value the route's
+# header carried and what `_mime_type_for` answers when the extension says nothing.
+_DOWNLOAD_CONTENT_TYPE = "application/octet-stream"
 
 # The subject_type values api-v2 actually accepts on an upload (#1348). These are
 # api-v2's MODEL names. #1340 sent "Template" and "Process", copied from the
@@ -185,12 +201,6 @@ _AMBIGUOUS_TASK_WORDS = frozenset({"task", "tasks"})
 
 _KICKOFF_FIELD_MARKER = "ko_field"
 
-# httpx errors raised before any of the request left this process, so the file
-# cannot have reached Tallyfy. Every other httpx.RequestError can fire after the
-# body was sent (a ReadTimeout is the usual one), and then Tallyfy may already
-# have stored it.
-_NOT_SENT_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
-
 _RETRY_WARNING = (
     "Do not upload it again automatically, because each retry can store another "
     "copy. Tell the user the upload may have partly gone through."
@@ -209,10 +219,6 @@ for _ext, _type in (
     (".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
 ):
     _MIME_TYPES.add_type(_type, _ext)
-
-# What the download route says about every file, which tells a caller nothing.
-_GENERIC_CONTENT_TYPES = frozenset({"application/octet-stream", "binary/octet-stream"})
-
 
 # ---------------------------------------------------------------------------
 # Parameter types
@@ -331,94 +337,89 @@ OptionalChecklistIdForUpload = Annotated[Optional[str], Field(
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _api_headers(api_key: str, accept: str) -> Dict[str, str]:
-    """The three headers every go.tallyfy.com/api call needs.
+def _cause_name(error: BaseException) -> str:
+    """The name of the transport error behind an SDK error, as the old text gave it.
 
-    ``X-Tallyfy-Client`` is not optional decoration: without it the edge answers
-    some routes with its own 404 body (error code apsh546) before the request
-    ever reaches Laravel, which reads exactly like a route that was never
-    deployed.
-
-    ``accept`` varies on purpose. The metadata call asks for JSON so an error
-    comes back as JSON. The file call asks for anything, because the response is
-    binary and a JSON-only Accept invites a 406 on a route whose whole job is to
-    stream a file.
+    The SDK wraps a ``requests`` exception (``ConnectionError``,
+    ``ReadTimeout`` ...) and keeps it as ``__cause__``; without one the SDK's
+    own class names the failure.
     """
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "X-Tallyfy-Client": "APIClient",
-        "Accept": accept,
-    }
+    cause = error.__cause__
+    return type(cause if cause is not None else error).__name__
 
 
-def _upstream_message(response: httpx.Response) -> Any:
-    """The API's own error body, parsed when it is JSON and raw text otherwise."""
-    try:
-        return response.json()
-    except ValueError:
-        return response.text
-
-
-def _is_ok(status_code: int) -> bool:
-    """2xx only.
-
-    ``>= 400`` is the obvious test and it is wrong HERE, on the file route. The
-    API streams the bytes itself rather than handing back a presigned S3 URL, so
-    a 3xx means that contract changed. ``follow_redirects`` is off (httpx's
-    default), so a 3xx carries an EMPTY body, and treating it as success would
-    publish a zero-byte file as if it were the real one. Refusing is the loud
-    half, and a 3xx is not in ``EXPECTED_UPSTREAM_STATUSES`` so it reaches
-    Sentry, which is right for a contract change nobody announced.
-
-    If the API ever does start redirecting, turning ``follow_redirects`` on is
-    safe as far as the credential goes: httpx's ``_redirect_headers`` drops the
-    ``Authorization`` header on any cross-origin redirect that is not a plain
-    http-to-https upgrade, so the Bearer token would not reach S3. Read off
-    httpx 0.28.1 rather than assumed. It is still a deliberate change with its
-    own test, not a default to drift into.
-    """
-    return 200 <= status_code < 300
-
-
-def _raise_upstream(response: httpx.Response, what: str) -> None:
-    """Turn a non-2xx into the TallyfyError the shared decorator understands.
-
-    Deliberately NOT a ToolError. See the module docstring: raising the SDK's
-    own error type is what routes a 401 into the downstream auth challenge and
-    keeps a 404 out of Sentry.
-    """
-    body = _upstream_message(response)
-    message = what
+def _upstream_text(what: str, body: Any) -> str:
+    """``what``, followed by api-v2's own message when its body carries one."""
     if isinstance(body, dict) and body.get("message"):
-        message = f"{what}: {body['message']}"
-    elif isinstance(body, str) and body.strip():
-        message = f"{what}: {body.strip()[:500]}"
-    raise TallyfyError(message, status_code=response.status_code, response_data=body)
+        return f"{what}: {body['message']}"
+    if isinstance(body, str) and body.strip():
+        return f"{what}: {body.strip()[:500]}"
+    return what
 
 
-def _raise_upload_failure(response: httpx.Response, filename: str) -> None:
-    """Turn a failed upload into a TallyfyError that says what may have happened.
+def _reraise_upstream(error: TallyfyError, what: str) -> None:
+    """Re-raise an SDK status error as a TallyfyError that names what failed.
 
-    A 4xx is refused before anything is stored (a FormRequest, an auth check or
-    a size limit), so it goes through ``_raise_upstream`` unchanged.
-
-    A 5xx is different, and #1348 is the measured case: api-v2 stores the row
-    and the S3 object in ``saveFile`` and can fail on the step after that, so a
-    server error does not mean nothing was saved. Telling the model nothing was
-    stored is what makes it retry, and every retry stores another copy.
-
-    The warning has to travel in ``response_data["message"]``, not only in the
-    exception's own message. ``handle_tallyfy_errors`` builds the text the model
-    sees from ``response_data["message"]`` when there is one and drops the rest,
-    which is why a model saw only ``Undefined array key "Template"``. The
-    upstream body is kept alongside it, so the Sentry context still carries the
-    API's own words. The status code is kept too, so a 5xx still logs at ERROR.
+    Deliberately NOT a ToolError. See the module docstring: the SDK's own error
+    type is what routes a 401 into the downstream auth challenge and keeps a
+    404 out of Sentry. The status and api-v2's body are kept as they came.
     """
-    status = response.status_code
-    if status < 500:
-        _raise_upstream(response, f"{filename} could not be uploaded")
+    body = error.response_data
+    raise TallyfyError(
+        _upstream_text(what, body), status_code=error.status_code, response_data=body
+    ) from error
 
-    body = _upstream_message(response)
+
+def _raise_upload_failure(error: TallyfyError, filename: str) -> None:
+    """Turn a failed upload into an error that says what may have happened.
+
+    ``upload_file`` sends once and never retries, and its error class says
+    which retry is safe:
+
+    * ``TallyfyNotDeliveredError``: the request never left this process, so
+      nothing reached Tallyfy.
+    * ``TallyfyIndeterminateError`` with no status: the connection failed
+      after the body was sent (a read timeout is the usual one), so Tallyfy may
+      have stored it.
+    * ``TallyfyIndeterminateError`` with a 2xx: accepted, but the answer
+      carried no asset, so the new id cannot be read.
+    * ``TallyfyIndeterminateError`` with a 5xx: #1348 is the measured case.
+      api-v2 stores the row and the S3 object in ``saveFile`` and can fail on
+      the step after that, so a server error does not mean nothing was saved.
+      Telling the model nothing was stored is what makes it retry, and every
+      retry stores another copy.
+    * any other ``TallyfyError`` (a 4xx): refused before anything was stored.
+
+    For the 5xx the warning has to travel in ``response_data["message"]``, not
+    only in the exception's own message. ``handle_tallyfy_errors`` builds the
+    text the model sees from ``response_data["message"]`` when there is one
+    and drops the rest, which is why a model saw only
+    ``Undefined array key "Template"``. The upstream body is kept alongside it,
+    so the Sentry context still carries the API's own words. The status code is
+    kept too, so a 5xx still logs at ERROR.
+    """
+    if isinstance(error, TallyfyNotDeliveredError):
+        raise ToolError(
+            f"Could not reach Tallyfy to upload {filename} "
+            f"({_cause_name(error)}). Nothing was uploaded; try again."
+        ) from error
+    status = error.status_code
+    if isinstance(error, TallyfyIndeterminateError) and status is None:
+        raise ToolError(
+            f"The connection to Tallyfy failed while uploading {filename} "
+            f"({_cause_name(error)}), after the file may already have been "
+            f"sent, so Tallyfy may have stored it. {_RETRY_WARNING}"
+        ) from error
+    if isinstance(error, TallyfyIndeterminateError) and 200 <= status < 300:
+        raise ToolError(
+            f"{filename} was accepted by Tallyfy but the response carried no "
+            "asset data, so the new asset's id could not be read. Check the "
+            "field in Tallyfy before uploading again."
+        ) from error
+    if not isinstance(error, TallyfyIndeterminateError) or status is None or status < 500:
+        _reraise_upstream(error, f"{filename} could not be uploaded")
+
+    body = error.response_data
     message = (
         f"Tallyfy reported a server error while handling {filename}. It may "
         "already have stored the file, because it saves an upload before its "
@@ -438,25 +439,25 @@ def _raise_upload_failure(response: httpx.Response, filename: str) -> None:
         message,
         status_code=status,
         response_data={"message": message, "upstream_response": body},
-    )
+    ) from error
 
 
-def _mime_type_for(declared: Optional[str], filename: Optional[str]) -> Optional[str]:
-    """The file's MIME type, when the download route will not say.
+def _mime_type_for(filename: Optional[str]) -> str:
+    """The file's MIME type, guessed from its filename's extension.
 
-    ``/file/{id}/dl`` answers ``application/octet-stream`` for every file, so a
-    specific type the server declares is kept (in case that ever changes) and a
-    generic one is replaced by a guess from the filename's extension. When there
-    is no usable extension the declared value is returned as it was.
+    ``/file/{id}/dl`` answers ``application/octet-stream`` for every file, and
+    the SDK's ``download_file`` returns the bytes without the response headers,
+    so the extension is the only thing that can say more. With no usable
+    extension the answer is what the route said, ``_DOWNLOAD_CONTENT_TYPE``:
+    no guess is better than a wrong one, and null would read as "no file".
+    Until #1545 the route's header was passed in, and a specific type it named
+    would have been kept; the SDK does not return it, so that branch is gone.
     """
-    base = (declared or "").split(";", 1)[0].strip().lower()
-    if base and base not in _GENERIC_CONTENT_TYPES:
-        return declared
     if filename:
         guessed, _encoding = _MIME_TYPES.guess_file_type(filename, strict=False)
         if guessed:
             return guessed
-    return declared or None
+    return _DOWNLOAD_CONTENT_TYPE
 
 
 def _decode_base64(content_base64: str) -> bytes:
@@ -575,122 +576,87 @@ def register_file_management_tools(mcp):
             {id, type}.
         """
         api_key, org_id = get_authenticated_credentials()
-        base = f"{TALLYFY_API_BASE_URL}/organizations/{org_id}"
 
-        try:
-            meta_response = httpx.get(
-                f"{base}/assets/{asset_id}",
-                headers=_api_headers(api_key, "application/json"),
-                timeout=METADATA_TIMEOUT_SECONDS,
-            )
-        except httpx.RequestError as exc:
-            raise ToolError(
-                f"Could not reach Tallyfy to look up asset {asset_id} "
-                f"({type(exc).__name__}). Nothing was read; try again."
-            ) from exc
+        with TallyfySDK(
+            api_key=api_key, base_url=TALLYFY_API_BASE_URL, timeout=TRANSFER_TIMEOUT_SECONDS
+        ) as sdk:
+            try:
+                asset = sdk.files.get_asset(org_id, asset_id)
+            except TallyfyError as exc:
+                if exc.status_code is None and exc.__cause__ is not None:
+                    # The connection failed (the SDK keeps the transport error
+                    # as the cause, after its own retries of this GET). An
+                    # answer it could not read has no cause and goes to the
+                    # decorator as upstream_error instead.
+                    raise ToolError(
+                        f"Could not reach Tallyfy to look up asset {asset_id} "
+                        f"({_cause_name(exc)}). Nothing was read; try again."
+                    ) from exc
+                if exc.status_code is None:
+                    raise
+                _reraise_upstream(exc, f"asset {asset_id} could not be read")
 
-        if not _is_ok(meta_response.status_code):
-            _raise_upstream(meta_response, f"asset {asset_id} could not be read")
+            payload: Dict[str, Any] = {
+                "id": asset.id if asset.id is not None else asset_id,
+                "filename": asset.filename,
+                "version": asset.version,
+                "uploaded_from": asset.uploaded_from,
+                "step_id": asset.step_id,
+                "source": asset.source,
+                "subject": asset.subject,
+                "mime_type": None,
+                "size_bytes": None,
+                "content_base64": None,
+                "content_omitted_reason": None,
+                "size_warning": None,
+            }
 
-        meta_body = _upstream_message(meta_response)
-        if not isinstance(meta_body, dict):
-            raise ToolError(
-                f"Tallyfy returned a non-JSON response for asset {asset_id}, so "
-                "its metadata could not be read."
-            )
-        meta = meta_body.get("data")
-        if not isinstance(meta, dict):
-            raise ToolError(
-                f"Tallyfy's response for asset {asset_id} carried no data "
-                "object, so the file could not be identified."
-            )
-
-        payload: Dict[str, Any] = {
-            "id": meta.get("id", asset_id),
-            "filename": meta.get("filename"),
-            "version": meta.get("version"),
-            "uploaded_from": meta.get("uploaded_from"),
-            "step_id": meta.get("step_id"),
-            "source": meta.get("source"),
-            "subject": meta.get("subject"),
-            "mime_type": None,
-            "size_bytes": None,
-            "content_base64": None,
-            "content_omitted_reason": None,
-            "size_warning": None,
-        }
-
-        try:
-            # /dl, not /file/{id}: the bare route rebuilds the storage key and
-            # misses every file on a task in a running process (#1348). See the
-            # module docstring.
-            with httpx.stream(
-                "GET",
-                f"{base}/file/{asset_id}/dl",
-                headers=_api_headers(api_key, "*/*"),
-                timeout=TRANSFER_TIMEOUT_SECONDS,
-            ) as file_response:
-                if not _is_ok(file_response.status_code):
-                    file_response.read()
-                    _raise_upstream(
-                        file_response,
-                        f"the stored file for asset {asset_id} could not be "
-                        f"downloaded (it may have been removed from storage)",
-                    )
-
-                payload["mime_type"] = _mime_type_for(
-                    file_response.headers.get("content-type"),
-                    payload.get("filename"),
-                )
-
-                # The cheap path: the API declares the length, so an oversized
-                # file is refused without transferring a single byte of it.
-                declared = file_response.headers.get("content-length")
-                declared_bytes: Optional[int] = None
-                if declared is not None:
-                    try:
-                        declared_bytes = int(declared)
-                    except ValueError:
-                        declared_bytes = None
-
-                if declared_bytes is not None and declared_bytes > MAX_ASSET_BYTES:
-                    payload["size_bytes"] = declared_bytes
+            try:
+                # /dl, not /file/{id}: the bare route rebuilds the storage key
+                # and misses every file on a task in a running process (#1348).
+                # download_file reads /file/{id}/dl. See the module docstring.
+                raw = sdk.files.download_file(org_id, asset_id, max_bytes=MAX_ASSET_BYTES)
+            except TallyfyFileTooLargeError as exc:
+                payload["mime_type"] = _mime_type_for(payload.get("filename"))
+                if exc.declared_bytes is not None:
+                    # The cheap path: the API declared the length, so the SDK
+                    # refused the file without reading a single byte of it.
+                    payload["size_bytes"] = exc.declared_bytes
                     payload["content_omitted_reason"] = (
-                        f"The file is {declared_bytes} bytes, over the "
+                        f"The file is {exc.declared_bytes} bytes, over the "
                         f"{MAX_ASSET_BYTES}-byte limit this tool downloads. Its "
                         "metadata is above; open the file in Tallyfy to read it."
                     )
-                    return ToolResult(content=payload, structured_content=None)
+                else:
+                    # No size_bytes: the transfer stopped early, so the only
+                    # honest answer is that the file is larger than the cap.
+                    # Reporting the bytes read so far would be a number that
+                    # looks like a file size and is not one.
+                    payload["content_omitted_reason"] = (
+                        f"The file is larger than the {MAX_ASSET_BYTES}-byte limit this "
+                        "tool downloads, and Tallyfy did not declare its exact size. "
+                        "Its metadata is above; open the file in Tallyfy to read it."
+                    )
+                return ToolResult(content=payload, structured_content=None)
+            except TallyfyError as exc:
+                if exc.status_code is None:
+                    # The SDK raises with no status only when the connection
+                    # failed or broke off mid-transfer (or never left).
+                    raise ToolError(
+                        f"Could not download the file for asset {asset_id} "
+                        f"({_cause_name(exc)}). Its metadata was read but its content "
+                        "was not; try again."
+                    ) from exc
+                # Any non-2xx, a 3xx included: the SDK follows no redirect, so
+                # a changed contract is refused rather than read as an empty
+                # file (see _is_ok's history in #1348).
+                _reraise_upstream(
+                    exc,
+                    f"the stored file for asset {asset_id} could not be "
+                    f"downloaded (it may have been removed from storage)",
+                )
 
-                chunks = []
-                total = 0
-                over_cap = False
-                for chunk in file_response.iter_bytes():
-                    total += len(chunk)
-                    if total > MAX_ASSET_BYTES:
-                        over_cap = True
-                        break
-                    chunks.append(chunk)
-        except httpx.RequestError as exc:
-            raise ToolError(
-                f"Could not download the file for asset {asset_id} "
-                f"({type(exc).__name__}). Its metadata was read but its content "
-                "was not; try again."
-            ) from exc
-
-        if over_cap:
-            # No size_bytes: the transfer stopped early, so the only honest
-            # answer is that the file is larger than the cap. Reporting the
-            # bytes read so far would be a number that looks like a file size
-            # and is not one.
-            payload["content_omitted_reason"] = (
-                f"The file is larger than the {MAX_ASSET_BYTES}-byte limit this "
-                "tool downloads, and Tallyfy did not declare its exact size. "
-                "Its metadata is above; open the file in Tallyfy to read it."
-            )
-            return ToolResult(content=payload, structured_content=None)
-
-        raw = b"".join(chunks)
+        payload["mime_type"] = _mime_type_for(payload.get("filename"))
         payload["size_bytes"] = len(raw)
         payload["content_base64"] = base64.b64encode(raw).decode("ascii")
 
@@ -845,55 +811,31 @@ def register_file_management_tools(mcp):
 
         api_key, org_id = get_authenticated_credentials()
 
-        form: Dict[str, str] = {
-            "uploaded_from": uploaded_from,
-            "subject_type": resolved_subject_type,
-            "subject_id": subject_id,
-            "source": "local",
-        }
-        if step_id:
-            form["step_id"] = step_id
-        if checklist_id:
-            form["checklist_id"] = checklist_id
-
-        try:
-            response = httpx.post(
-                f"{TALLYFY_API_BASE_URL}/organizations/{org_id}/assets",
-                headers=_api_headers(api_key, "application/json"),
-                data=form,
-                # httpx sets the multipart Content-Type and boundary itself. Do
-                # not add one to the headers: a hand-written Content-Type has no
-                # boundary and the API cannot parse the body.
-                files={"name": (filename, raw)},
-                timeout=TRANSFER_TIMEOUT_SECONDS,
-            )
-        except _NOT_SENT_ERRORS as exc:
-            raise ToolError(
-                f"Could not reach Tallyfy to upload {filename} "
-                f"({type(exc).__name__}). Nothing was uploaded; try again."
-            ) from exc
-        except httpx.RequestError as exc:
-            # Not "nothing was uploaded": a ReadTimeout, say, fires after the
-            # whole body was sent, and api-v2 may have stored it by then.
-            raise ToolError(
-                f"The connection to Tallyfy failed while uploading {filename} "
-                f"({type(exc).__name__}), after the file may already have been "
-                f"sent, so Tallyfy may have stored it. {_RETRY_WARNING}"
-            ) from exc
-
-        if not _is_ok(response.status_code):
-            _raise_upload_failure(response, filename)
-
-        body = _upstream_message(response)
-        if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
-            raise ToolError(
-                f"{filename} was accepted by Tallyfy but the response carried no "
-                "asset data, so the new asset's id could not be read. Check the "
-                "field in Tallyfy before uploading again."
-            )
+        with TallyfySDK(
+            api_key=api_key, base_url=TALLYFY_API_BASE_URL, timeout=TRANSFER_TIMEOUT_SECONDS
+        ) as sdk:
+            try:
+                asset = sdk.files.upload_file(
+                    org_id,
+                    raw,
+                    filename,
+                    uploaded_from=uploaded_from,
+                    subject_type=resolved_subject_type,
+                    subject_id=subject_id,
+                    step_id=step_id,
+                    checklist_id=checklist_id,
+                )
+            except ValueError as exc:
+                # The SDK checks every id before sending, as this tool's own
+                # checks above do; one it refuses never left this process.
+                raise ToolError(f"{exc}. Nothing was uploaded.") from exc
+            except TallyfyError as exc:
+                _raise_upload_failure(exc, filename)
 
         logger.info(
             "upload_asset stored %s as asset %s on %s %s",
-            filename, body["data"].get("id"), resolved_subject_type, subject_id,
+            filename, asset.id, resolved_subject_type, subject_id,
         )
-        return ToolResult(content=body["data"], structured_content=None)
+        # Every key AssetTransformer writes is a typed Asset field, so this is
+        # the body's `data` object as api-v2 sent it (nulls included).
+        return ToolResult(content=model_document(asset), structured_content=None)

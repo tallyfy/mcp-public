@@ -62,6 +62,20 @@ def fetch_single_page(
     api_total = meta.total if meta else len(page_items)
     api_total_pages = getattr(meta, "total_pages", None) if meta else None
 
+    if api_total is None:
+        # SDK 4.0 leaves a count api-v2 did not send as None (it used to be 0),
+        # so the total is unknown, not zero: report it as unknown (None) and
+        # pass through only a page count api-v2 itself sent (#1545). Working
+        # one out here would invent it.
+        return shape_page(
+            serialize_dataclass(page_items),
+            total=None,
+            total_pages=api_total_pages,
+            page=page,
+            page_offset=page_offset,
+            compact_fields=compact_fields,
+        )
+
     # When the API used its own (smaller) per_page instead of ours, its
     # total_pages is already computed correctly for that page size — trust it.
     # This happens on endpoints like guest tasks that ignore our per_page=20
@@ -94,8 +108,8 @@ def fetch_single_page(
 def shape_page(
     serialized: List[Any],
     *,
-    total: int,
-    total_pages: int,
+    total: Optional[int],
+    total_pages: Optional[int],
     page: int,
     page_offset: int = 0,
     compact_fields: Optional[List[str]] = None,
@@ -106,7 +120,8 @@ def shape_page(
     that reads its rows somewhere other than an SDK list method (the api-v2
     table query engine, #1660) returns exactly the same shape: the same
     ``meta`` keys, the same ``page_offset`` rule and the same byte cap with
-    its ``_truncated`` marker.
+    its ``_truncated`` marker. ``total`` and ``total_pages`` are None when
+    api-v2 did not say, and are reported as such.
     """
     if compact_fields:
         for record in serialized:

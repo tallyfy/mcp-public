@@ -13,7 +13,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from tallyfy import TallyfyError, TallyfySDK
+from tallyfy import TallyfyError, TallyfyUnexpectedResponseError
 
 from constants import DEFAULT_PAGE_SIZE
 from metrics import track_tool_execution
@@ -25,7 +25,13 @@ from utils.authoring_payloads import (
     TemplateUpdateData,
     documented_payload,
 )
-from utils.fastmcp_errors import handle_tallyfy_errors, step_not_in_template
+from utils.fastmcp_errors import (
+    handle_tallyfy_errors,
+    is_unreadable_answer,
+    name_lookup_miss_class,
+    step_not_in_template,
+    tag_error_class,
+)
 from utils.fastmcp_types import (
     GenericDict,
     GenericList,
@@ -40,14 +46,16 @@ from utils.fastmcp_types import (
     TemplateTitle,
 )
 from utils.pagination import fetch_single_page
+from utils.sdk_client import TallyfySDK
+from utils.sdk_reads import required_list
 from utils.sdk_serializer import (
     MAX_RESULT_BYTES,
     TRUNCATION_MARKER_PREFIX,
     compact_dict_list_field,
     compact_result,
+    model_document,
     page_list_by_bytes,
     serialize_dataclass,
-    unwrap_fractal,
     window_longest_text,
 )
 from utils.template_health_facts import compute_health_facts
@@ -199,21 +207,6 @@ _STEP_UPDATE_REJECTED_KEYS = {
         "no rule for it and the API discards it"
     ),
 }
-
-# The three buckets whose ABSENCE from a step PUT means "detach everyone", not
-# "leave that dimension alone". StepBuilder::build (app/Step/StepBuilder.php:37
-# on origin/production) unconditionally calls
-#   saveAssignees(Assignees::newFromArray(Arr::only($data, ['assignees','guests','groups'])))
-# and BaseAssignees::newFromArray reads `$data['users'] ?? $data['assignees'] ?? []`,
-# so an omitted key yields an EMPTY SET, Assignees::modify diffs it against
-# current and calls every existing member "removed", and
-# AssignableTrait::saveAssignees detaches them. HTTP 200, no error.
-#
-# api-v2 origin/master FIXES this (commit 29dc8ff7a / PR #9587, 2026-07-24 —
-# `assigneesFromPartial()` treats an omitted key as "leave alone"), but that fix
-# is NOT deployed to production, so every tool here must keep re-sending the
-# buckets. See tallyfy/api-v2#10052.
-_STEP_ASSIGNEE_BUCKETS = ("assignees", "guests", "groups")
 
 # The template METADATA keys the update path actually accepts, mirroring the
 # allowed_fields whitelist inside TemplateManagement.update_template_metadata on
@@ -434,100 +427,71 @@ def _resolve_template_name(sdk, org_id: str, template_name: str) -> str:
     template_id=...)` does not come through here, and neither does the template
     FETCH that follows a successful resolution, so a genuine failure of either
     still reaches Sentry.
+
+    Only a miss or an ambiguity is reworded (`name_lookup_miss_class`). Any
+    other failure of the search (an outage, a 401, an answer the SDK could not
+    read) is re-raised for `handle_tallyfy_errors` to classify and log, rather
+    than presented as a name the caller got wrong.
     """
     from tallyfy import TallyfyError
     try:
         return sdk.templates.search_templates_by_name(org_id, template_name)
     except TallyfyError as e:
-        raise ToolError(
-            f"{e} Use search_for_templates to find it by keyword, or "
-            f"get_all_templates to list what this organization has, then call "
-            f"get_template with the id."
-        )
+        error_class = name_lookup_miss_class(e)
+        if error_class is None:
+            raise
+        raise tag_error_class(
+            ToolError(
+                f"{e} Use search_for_templates to find it by keyword, or "
+                f"get_all_templates to list what this organization has, then call "
+                f"get_template with the id."
+            ),
+            error_class,
+        ) from e
 
 
-# The includes this server asks for on a whole-template read. Seeded from the
-# list `sdk.templates.get_template` sends, because that list was already correct
-# and api-v2 honours all four.
-#
-# The two do NOT have to stay in step, and it would be wrong to add a guard
-# saying they must: neither whole-template read calls the SDK method any more,
-# so this constant is the authority for what goes on the wire and the SDK's copy
-# governs nothing on this path. `assess_template_health` moved onto this read
-# in #1659, because its health facts need step keys the SDK's `Step` model does
-# not declare (`stage_id`, `owner_id`, `ai_assigned`) and kickoff `label`,
-# which `PrerunField` does not declare either.
+# The includes this server asks for on a whole-template read, passed as
+# `with_` to `sdk.templates.get_template`. api-v2 honours all four:
+# ChecklistTransformer writes `prerun` and `automated_actions` on every read,
+# and `steps` and `tags` come back only when named (ChecklistsControllerNew::show).
 _TEMPLATE_INCLUDES = "steps,automated_actions,prerun,tags"
 
 
-def _get_template_raw(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
-    """GET a template with its includes, staying on the raw transport on purpose.
+def _read_template_body(sdk, org_id: str, template_id: str):
+    """The template with its four includes, as the SDK's ``Template``, or None.
 
-    Deliberately not routed through `sdk.templates.get_template`, even though
-    that method now CAN carry everything this needs.
+    Read through ``sdk.templates.get_template`` (tallyfy/mcp#1545). On SDK 4.0
+    ``Template`` types every key ``ChecklistTransformer`` sends, and its
+    ``Step``, ``PrerunField``, ``AutomatedAction`` and ``TagLink`` type every
+    key their transformers send, including the step keys
+    ``assess_template_health`` needs (``stage_id``, ``owner_id``,
+    ``ai_assigned``) and the kickoff ``label`` (#1659). A key the SDK still
+    files under ``extra`` is never emitted; it is an SDK gap to fix there.
+    A read whose answer holds no template raises (SDK 4.0,
+    ``tallyfy.answers.answered_record``); it used to return None.
+    """
+    return sdk.templates.get_template(
+        org_id, template_id=template_id, with_=_TEMPLATE_INCLUDES
+    )
 
-    ⚠️ **HISTORY, no longer the live reason.** Until tallyfy 2.1.0
-    (tallyfy/sdk#41), `Template.from_dict()` declared no `tags` attribute and
-    mis-handled the Fractal envelope for `steps`/`prerun`/`linked_tasks`, so a
-    tag written by `tag_template` was unreadable by every read tool (#596) and
-    a value could silently vanish depending on which envelope shape arrived.
-    Both are fixed now: `Template` declares `tags`, and `_include_list()`
-    inside `from_dict` accepts either shape for all of `steps`, `prerun`,
-    `automated_actions`, `tags` and `linked_tasks`.
 
-    **Why this still reads raw instead of switching to the fixed model.** Two
-    independent reasons, neither of which the SDK bump touches:
+def _get_template_content(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
+    """A template with its includes, serialised the way `get_template` returns it.
 
-    1. `serialize_dataclass` strips EMPTY containers, not just missing ones
-       (`_is_empty`). An untagged template's `tags` would still vanish from the
-       response whether it came from a plain dict or from `Template.tags == []`
-       -- that is a property of the serialiser, not of the model. Verifying
-       `untag_template` therefore still needs the explicit re-attach below,
-       reading the SDK's now-populated `.tags` would not remove that step.
-    2. `Template` carries `@lossless()`, so any key the model does not declare
-       lands in `template.extra` -- nested -- instead of flat. The raw-dict
-       path here keeps every key exactly as api-v2 sent it, flat, which is
-       friendlier to an LLM caller that has no reason to know to look inside
-       `extra`. Going through the model would bury whatever is still unmapped
-       one level deeper for no benefit.
-
-    So this is the same failure CLASS, and remedy, as
-    `task_management._get_task_with_form_fields` (rule 24 in the repo
-    CLAUDE.md): asserting the include was requested does NOT prove it comes
-    back, so the tests for this assert on the returned payload.
-
-    `steps` and `prerun` are unwrapped alongside `tags` because Fractal wraps
-    every include the same way; `steps` in particular must stay a plain list or
-    `compact_dict_list_field` cannot trim an oversize template.
+    `tags` is re-attached after serialisation, because `serialize_dataclass`
+    strips an EMPTY list as well as a missing one, and an untagged template
+    with no `tags` key is byte-identical to the include not being read at all,
+    so `untag_template` could not be verified (#596). The tests for this assert
+    on the returned payload, because asking for the include does not prove it
+    comes back (rule 24 in the repo CLAUDE.md).
     """
     return _serialize_template_body(_read_template_body(sdk, org_id, template_id))
 
 
-def _read_template_body(sdk, org_id: str, template_id: str) -> Dict[str, Any]:
-    """The unwrapped template body exactly as api-v2 sent it, NOT serialised.
-
-    Split out of `_get_template_raw` for #1659: `assess_template_health`
-    computes its health facts from this, before the 500-character string cap
-    and before any trim, so a kickoff alias mentioned late in a long step
-    summary still counts as used. `{}` when nothing came back.
-    """
-    response = sdk._make_request(
-        "GET",
-        f"organizations/{org_id}/checklists/{template_id}",
-        params={"with": _TEMPLATE_INCLUDES},
-    )
-    return unwrap_fractal(
-        response, ("steps", "tags", "automated_actions", "prerun")
-    )
-
-
-def _serialize_template_body(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Serialise a body from `_read_template_body` the way `get_template` returns it."""
-    if not raw:
-        return {}
-
-    content = serialize_dataclass(raw)
-    tags = raw.get("tags")
+def _serialize_template_body(template) -> Dict[str, Any]:
+    """Serialise a ``Template`` from `_read_template_body` the way `get_template` returns it."""
+    content = serialize_dataclass(template)
+    tags = template.tags
     if isinstance(tags, list):
         # Re-attached AFTER serialisation, and unconditionally, because
         # `serialize_dataclass` strips an empty list. Surfacing the include is
@@ -542,7 +506,7 @@ def _serialize_template_body(raw: Dict[str, Any]) -> Dict[str, Any]:
         # `disabled_at` on an enabled guest, an empty `tags` on an untagged
         # template. Whenever a read is added so a write can be verified, ask
         # what it looks like when the answer is no.
-        content["tags"] = tags
+        content["tags"] = serialize_dataclass(tags)
     return content
 
 
@@ -713,13 +677,13 @@ def _require_complete_step_deadline(step_data: dict) -> None:
 
 
 def _assert_deadline_option_is_storable(payload: dict) -> None:
-    """Last check on the OUTGOING body, immediately before the PUT.
+    """Last check on the OUTGOING changes, immediately before the SDK call.
 
-    `_normalize_step_deadline` guards the caller's INPUT. This guards the bytes
-    that leave, which is a different question once a payload is assembled from
-    more than one source. It is the assertion that makes "this tool cannot emit
-    an unstorable deadline direction" true of the request rather than of one
-    code path.
+    `_normalize_step_deadline` guards the caller's INPUT. This guards the dict
+    handed to `sdk.templates.update_step`, which is a different question once
+    the changes pass through more than one step. The SDK adds only the step's
+    title and owner buckets (TemplateManagerBase._read_step_for_update), never
+    a deadline, so the deadline checked here is the deadline that leaves.
 
     api-v2 accepts any string for deadline.option, stores it, and then applies no
     offset at all (rule 29), so nothing downstream would ever report a mistake
@@ -737,14 +701,6 @@ def _assert_deadline_option_is_storable(payload: dict) -> None:
         )
 
 
-def _fetch_step_for_update(sdk, org_id: str, template_id: str, step_id: str):
-    """Return (endpoint, current step dict) for a step about to be updated."""
-    endpoint = f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}"
-    current = sdk._make_request("GET", endpoint)
-    step = current.get("data", current) if isinstance(current, dict) else {}
-    return endpoint, step
-
-
 def _deadline_anchors(steps: list, step_id: str) -> list:
     """Other steps whose deadline is anchored to ``step_id``.
 
@@ -759,7 +715,10 @@ def _deadline_anchors(steps: list, step_id: str) -> list:
     Compare ids on the TRANSFORMED payload. `StepTransformer.php:33` re-emits the
     key as `timelineID($step->deadline['step'])`, so what arrives here is a
     timeline id, and both sides of the comparison have been through the same
-    transform. That is why this takes already-fetched steps rather than querying.
+    transform. That is why this takes already-fetched steps rather than querying:
+    the SDK ``Step`` objects of one ``get_template(with_="steps")`` read, whose
+    ``deadline`` is None for a step with no deadline (``{"step": null}`` on the
+    wire, ``Step.from_dict``).
 
     It is NOT scoped by checklist_id. api-v2 therefore checks the whole tenant
     while this scan is template-scoped, so a step in ANOTHER template anchored to
@@ -769,72 +728,59 @@ def _deadline_anchors(steps: list, step_id: str) -> list:
     """
     anchors = []
     for step in steps:
-        if not isinstance(step, dict):
-            continue
-        if str(step.get("id", "")) == str(step_id):
+        if str(step.id or "") == str(step_id):
             continue  # a step anchored to itself is not a dependent
-        deadline = step.get("deadline")
-        if not isinstance(deadline, dict):
+        deadline = step.deadline
+        if deadline is None:
             continue
-        if str(deadline.get("step", "")) != str(step_id):
+        if str(deadline.step or "") != str(step_id):
             continue
         anchors.append({
-            "step_id": step.get("id"),
-            "step_title": step.get("title"),
-            "position": step.get("position"),
+            "step_id": step.id,
+            "step_title": step.title,
+            "position": step.position,
             "deadline": {
-                "value": deadline.get("value"),
-                "unit": deadline.get("unit"),
-                "option": deadline.get("option"),
+                "value": deadline.value,
+                "unit": deadline.unit,
+                "option": deadline.option,
             },
         })
     return anchors
 
 
-def _preserved_step_fields(step: dict, step_id: str) -> dict:
-    """Build the MINIMUM every step PUT must carry, and nothing else.
+# What the SDK's step write reads before it sends anything
+# (TemplateManagerBase._read_step_for_update): the title and the three owner
+# buckets. When one is not in the read it raises TallyfyUnexpectedResponseError
+# with that key in `missing_fields`, and nothing has been sent. The write's own
+# answer raises the same type with `missing_fields` of ["id"] or ["data"], and
+# then the write was applied, so the two must not be told apart by type.
+_STEP_PRE_READ_FIELDS = frozenset({"title", "assignees", "guests", "groups"})
 
-    Two categories, each for a stated reason, and deliberately no third:
 
-    - 'title', because UpdateStepRequest sets `$rules['title'] = 'required|max:600'`
-      on every update that is not a bare position-only payload. Omitting it is a
-      422 even when the caller is changing something unrelated.
-    - the three assignee buckets, because omitting one DETACHES everyone in it
-      (see _STEP_ASSIGNEE_BUCKETS).
+def _write_step(write, *args, **kwargs):
+    """Run one SDK step write, turning a refusal before the write into a ToolError.
 
-    Everything else is left out on purpose. `StepBuilder::editStep` applies
-    `Arr::only($data, $this->model->fields)`, so for summary, step_type, deadline,
-    start_date, the booleans and bp_to_launch an absent key genuinely means "leave
-    alone"; and `AddCapturesToStep` guards on `is_array($this->captures)`, so an
-    absent 'captures' is a no-op rather than a wipe. Echoing them back would buy
-    nothing and cost two things: it would widen the lost-update window to every
-    field a concurrent editor might have touched, and it would launder a value
-    already stored wrong straight back into the database — there are 62 production
-    step rows carrying the unstorable deadline.option "after" (rule 29), and a
-    read-modify-write that re-sent the deadline would rewrite each of them intact.
-
-    A bucket that is missing or not a list means the READ failed, so this aborts
-    rather than sending []. A genuinely empty list is legitimate and passes
-    through: StepTransformer emits all three keys unconditionally, so present-and-
-    empty is the real shape of an unassigned step (rule 10, verified live).
+    `handle_tallyfy_errors` treats every TallyfyUnexpectedResponseError as an
+    answer that came after a write, so it adds "it may have been applied" and
+    logs it as an upstream fault. A refused pre-read sent nothing, so that hint
+    would contradict the SDK's own "Nothing was sent". A ToolError passes
+    through the decorator as it is, as the local check this replaced did.
     """
-    title = step.get("title") or ""
-    if not title:
-        raise ToolError(
-            "Could not read the step's current title, which the API requires "
-            "on every step update. Verify template_id and step_id are correct."
-        )
-
-    payload = {"title": title}
-    for field in _STEP_ASSIGNEE_BUCKETS:
-        value = step.get(field)
-        if not isinstance(value, list):
-            raise ToolError(
-                f"Step {step_id} did not return its current '{field}', so "
-                f"updating it would detach every assignee. Nothing was sent."
+    try:
+        return write(*args, **kwargs)
+    except TallyfyUnexpectedResponseError as exc:
+        missing = set(getattr(exc, "missing_fields", None) or ())
+        if not missing or not missing <= _STEP_PRE_READ_FIELDS:
+            raise
+        if "title" in missing:
+            message = (
+                "Could not read the step's current title, which the API requires "
+                "on every step update, so nothing was sent. Verify template_id "
+                "and step_id are correct."
             )
-        payload[field] = list(value)
-    return payload
+        else:
+            message = str(exc)
+        raise ToolError(message) from exc
 
 
 def register_template_management_tools(mcp):
@@ -906,9 +852,7 @@ SIZE: {_WHOLE_TEMPLATE_SIZE_NOTE}""",
                 resolved_id = _resolve_template_name(sdk, org_id, template_name.strip())
             else:
                 resolved_id = template_id.strip()
-            template = _get_template_raw(sdk, org_id, resolved_id)
-            if not template:
-                return ToolResult(content={}, structured_content=None)
+            template = _get_template_content(sdk, org_id, resolved_id)
             _check_step_offset(step_offset, template)
             # Whole-template reads have no size control of their own: compact_result
             # only trims list-shaped results. Route through the ONE shared trimmer
@@ -926,7 +870,7 @@ SIZE: {_WHOLE_TEMPLATE_SIZE_NOTE}""",
 
     @mcp.tool(
         name="get_all_templates",
-        description="List templates (checklists), pinned first, then the most recently changed. Each row carries at least id, title, type, starred, is_pinned, started_processes, created_at, created_by, last_updated, last_updated_by, and extra.status, extra.folder_id and extra.steps_count. For a template's kickoff fields, steps or automations, call get_template or get_kickoff_fields with its id; do not rely on these rows for them. Returns 20 per page. Use page=2, page=3, etc. for more. meta.total_pages shows total page count. Optional: filter by folder name or folder ID.",
+        description="List templates (checklists), pinned first, then the most recently changed. Each row carries at least id, title, type, starred, is_pinned, started_processes, created_at, created_by, last_updated, last_updated_by, status, folder_id and steps_count. For a template's kickoff fields, steps or automations, call get_template or get_kickoff_fields with its id; do not rely on these rows for them. Returns 20 per page. Use page=2, page=3, etc. for more. meta.total_pages shows total page count. Optional: filter by folder name or folder ID.",
         tags=["templates", "blueprints", "read-only", "management"],
         annotations=ToolAnnotations(
             title="Get all templates",
@@ -1055,75 +999,31 @@ REQUIRED: 'template_id' AND 'step_id' (both 32-char hex). Never call without bot
             # the count is LEFT UNSET and the reason is stated. An absent count
             # means "not checked"; 0 means "checked, and there are none".
             try:
-                template = sdk._make_request(
-                    "GET",
-                    f"organizations/{org_id}/checklists/{template_id}",
-                    params={"with": "steps"},
+                template = sdk.templates.get_template(
+                    org_id, template_id=template_id, with_="steps"
                 )
-                # The block below is what separates "checked" from "not checked",
-                # which is the whole contract stated just above. It replaces two
-                # unguarded lines, and every shape it now rejects used to fall
-                # through to `raw_steps = None`, which `_normalize_steps` answers
-                # with [] -- so the tool reported a confident
-                # `deadline_anchor_count: 0` about a payload it had never read.
-                # Raising routes them into the `except` below, which already IS
-                # the unavailable path, so one place builds the marker and the
-                # two cannot drift.
-                if not isinstance(template, dict):
-                    raise ValueError(
-                        f"template read returned {type(template).__name__}, not an object"
+                # What separates "checked" from "not checked", which is the whole
+                # contract stated just above. A template whose `steps` is None
+                # (SDK 4.0: the read did not carry the include) is a payload this
+                # never read, and answering `deadline_anchor_count: 0` about it
+                # would be a confident lie; an answer with no template at all
+                # raises in the SDK. Both reach the `except` below, which already
+                # IS the unavailable path. An EMPTY list is a real answer: a
+                # template with no steps holds no step anchored anywhere.
+                steps = template.steps
+                if not isinstance(steps, list):
+                    raise TallyfyUnexpectedResponseError(
+                        "the template read carried no 'steps' include",
+                        missing_fields=["steps"],
                     )
-                data = template.get("data", template)
-                # `data` being a LIST is deliberately NOT rejected: that is what
-                # an empty template answers with, and an empty collection
-                # provably holds no step anchored anywhere, so 0 is a real
-                # answer there. Flipping it would make every empty template read
-                # as unchecked, which is worse than the gap being closed here.
-                raw_steps = data.get("steps") if isinstance(data, dict) else data
-                # Anything `_normalize_steps` would answer [] for WITHOUT having
-                # read a list. Absent and null `steps` both land here, and so
-                # does a `steps` that is neither a list nor a Fractal envelope.
-                # After the normalizer runs, "[] because empty" and "[] because
-                # unparseable" are indistinguishable, so the check has to be
-                # here rather than on its result.
-                if not (
-                    isinstance(raw_steps, list)
-                    or (isinstance(raw_steps, dict) and "data" in raw_steps)
-                ):
-                    raise ValueError(
-                        "template read carried no readable 'steps' include "
-                        f"(got {type(raw_steps).__name__})"
-                    )
-
-                # `?with=steps` is a Fractal INCLUDE, and ChecklistTransformer
-                # builds it with $this->collection() while its siblings use
-                # $this->map(). AppServiceProvider registers a bare `new Manager`
-                # and never calls setSerializer, so Fractal's default
-                # DataArraySerializer is in force and the include arrives as
-                # {"data": [...]}, NOT as a flat list. Reading the key directly
-                # yields [] on every real response. The SDK already solves this
-                # in exactly one place, so use that rather than a second copy.
-                #
-                # `.analysis`, NOT the facade. `sdk.templates` is a
-                # `TemplateManager` whose MRO is [TemplateManager, object]: it
-                # does NOT inherit `TemplateManagerBase`. It is a facade that
-                # re-exports a hand-written list of PUBLIC methods onto three
-                # sub-managers, and `_normalize_steps` is private, so it is not
-                # on that list. `sdk.templates._normalize_steps(...)` raises
-                # AttributeError, which the `except` below then swallows into
-                # the unavailable path -- i.e. the feature never runs at all.
-                # `.analysis` is the sub-manager that OWNS this call: it is the
-                # only module in the SDK that uses `_normalize_steps`, in
-                # `get_step_dependencies` and `get_step_visibility_conditions`,
-                # on this very payload. There is no public equivalent --
-                # `TemplateManagerBase` exposes zero public methods, and
-                # `get_template_steps` is a different endpoint plus a second
-                # round trip that returns dataclasses rather than raw dicts.
-                steps = sdk.templates.analysis._normalize_steps(raw_steps)
                 anchors = _deadline_anchors(steps, step_id)
             except Exception as exc:  # noqa: BLE001 - degrade, never fail the call
+                # The SDK names what an unreadable answer lacked (missing_fields),
+                # so the log says it without parsing the message.
+                missing = getattr(exc, "missing_fields", None)
                 logger.warning(
-                    "Deadline-anchor pre-flight failed for step %s: %s", step_id, exc
+                    "Deadline-anchor pre-flight failed for step %s: %s%s", step_id, exc,
+                    f" (missing {', '.join(missing)})" if missing else "",
                 )
                 if isinstance(dependencies, dict):
                     dependencies["deadline_anchors_unavailable"] = (
@@ -1191,10 +1091,10 @@ REQUIRED: Both 'template_id' and 'step_id' must be provided (32-character hex st
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             template = sdk.templates.get_template(org_id, template_id=template_id)
-            if not template:
-                raise ToolError("Template not found")
 
-            steps = template.steps or []
+            # None is "not read", not "no steps" (SDK 4.0): a step that is there
+            # must not be reported missing, nor the count as 0 (#1545).
+            steps = required_list(template.steps, f"the steps of template {template_id}")
             target_step = None
             for step in steps:
                 if step.id == step_id:
@@ -1337,12 +1237,12 @@ offering a guest slot, send 'allow_guest_owners': False through update_step.
             if not isinstance(guest_email, str):
                 raise ToolError(f"Guest email {guest_email!r} must be a string")
             try:
-                # check_deliverability=False — syntax only, NO DNS lookup. The SDK
-                # path this replaces used the library default (True), which resolves
-                # MX records on every call: a network round-trip plus a transient
-                # failure mode inside a tool call, and it rejected this tool's OWN
-                # documented example (alice@example.com has a null MX by RFC 2606).
-                # api-v2 is the authority on whether a guest address is acceptable.
+                # check_deliverability=False: syntax only, NO DNS lookup, so a
+                # transient DNS failure cannot fail the call and this tool's OWN
+                # documented example (alice@example.com has a null MX by RFC 2606)
+                # is accepted. Checked here, before the SDK call, so a bad address
+                # is a ToolError naming it. api-v2 is the authority on whether a
+                # guest address is acceptable.
                 validated_guests.append(
                     validate_email(guest_email, check_deliverability=False).normalized
                 )
@@ -1351,54 +1251,17 @@ offering a guest slot, send 'allow_guest_owners': False through update_step.
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # READ-MODIFY-WRITE, done here rather than via the SDK. The SDK's
-            # templates.add_assignees_to_step() (tallyfy/template_management/
-            # automation.py:248-254) builds {title, assignees, guests} with NO
-            # 'groups' key at all, and StepBuilder::build (app/Step/StepBuilder.php:37)
-            # unconditionally calls
-            #   saveAssignees(Assignees::newFromArray(Arr::only($data, ['assignees','guests','groups'])))
-            # where BaseAssignees::newFromArray (app/Domain/Owners/BaseAssignees.php:24)
-            # reads `$data['groups'] ?? []` — an ABSENT key is an EMPTY SET, not
-            # "leave alone". So ADDING one member silently DETACHED every group
-            # from the step. Same mechanism as edit_description_on_step above.
-            endpoint = f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}"
-            current = sdk._make_request("GET", endpoint)
-            step = current.get("data", current) if isinstance(current, dict) else {}
-
-            title = step.get("title") or ""
-            if not title:
-                raise ToolError(
-                    "Could not read the step's current title, which the API requires "
-                    "on every step update. Verify template_id and step_id are correct."
-                )
-
-            # StepTransformer.php:33-35 emits all three buckets unconditionally, so a
-            # missing or malformed bucket means the READ failed, not that the step is
-            # unassigned — and sending [] on a failed read is the wipe this guard
-            # exists to prevent. An empty list is legitimate and passes through.
-            payload = {"title": title}
-            for field in ("assignees", "guests", "groups"):
-                value = step.get(field)
-                if not isinstance(value, list):
-                    raise ToolError(
-                        f"Step {step_id} did not return its current '{field}', so "
-                        f"adding an assignee would detach every assignee. "
-                        f"Nothing was sent."
-                    )
-                payload[field] = list(value)
-
-            # Append-not-replace, preserving existing order (a set would reorder
-            # nondeterministically between runs).
-            for user_id in user_ids:
-                if user_id not in payload["assignees"]:
-                    payload["assignees"].append(user_id)
-            for guest_email in validated_guests:
-                if guest_email not in payload["guests"]:
-                    payload["guests"].append(guest_email)
-
-            response = sdk._make_request("PUT", endpoint, data=payload)
-            result = response.get("data", response) if isinstance(response, dict) else response
-            return ToolResult(content=result or {}, structured_content=None)
+            # The SDK reads the step and re-sends its title and all three owner
+            # buckets, appending only the new ids and emails (order kept, no
+            # duplicates), so adding one member never detaches a group
+            # (TemplateManagerBase._read_step_for_update, tallyfy/sdk#85). A read
+            # that does not show the title or a bucket is refused before any
+            # write, because re-sending [] for an unread bucket would clear it.
+            result = _write_step(
+                sdk.templates.add_assignees_to_step,
+                org_id, template_id, step_id, user_ids, guests=validated_guests,
+            )
+            return ToolResult(content=result, structured_content=None)
 
     @mcp.tool(
         name="edit_description_on_step",
@@ -1447,25 +1310,16 @@ Field variables in HTML: read tallyfy://variable-markup.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # READ-MODIFY-WRITE — the SDK's edit_description_on_step() sends only
-            # {title, summary}, and an omitted assignee bucket means "detach
-            # everything" on production (see _STEP_ASSIGNEE_BUCKETS). Editing a
-            # description therefore wiped every assignee off the step. Re-send the
-            # current sets: the diff comes out empty and saveAssignees returns
-            # before touching the pivot tables.
-            #
-            # _preserved_step_fields is shared with update_step on purpose. Two
-            # tools writing the same endpoint with two copies of this logic is
-            # exactly the sibling drift rule 16 is about; one helper cannot drift.
-            endpoint, step = _fetch_step_for_update(
-                sdk, org_id, template_id, step_id
+            # The SDK re-sends the step's current title and all three owner
+            # buckets with the new summary, and nothing else, so the description
+            # is the only thing that changes (TemplateManagerBase.
+            # _read_step_for_update). It refuses, sending nothing, when the read
+            # does not show the title or a bucket.
+            result = _write_step(
+                sdk.templates.edit_description_on_step,
+                org_id, template_id, step_id, description,
             )
-            payload = _preserved_step_fields(step, step_id)
-            payload["summary"] = description
-
-            response = sdk._make_request("PUT", endpoint, data=payload)
-            result = response.get("data", response) if isinstance(response, dict) else response
-            return ToolResult(content=serialize_dataclass(result) if result else {}, structured_content=None)
+            return ToolResult(content=serialize_dataclass(result), structured_content=None)
 
     @mcp.tool(
         name="update_step",
@@ -1526,25 +1380,25 @@ To MOVE a step use reorder_step; for questions use add_form_field_to_step.
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # READ-MODIFY-WRITE, and the READ is not optional. See
-            # _preserved_step_fields for exactly what is preserved and why the
-            # list is deliberately short.
-            endpoint, step = _fetch_step_for_update(
-                sdk, org_id, template_id, step_id
+            # Last gate on the bytes that leave, not on the input. The SDK adds
+            # only the step's current title and owner buckets to these changes,
+            # never a deadline, so the changes are the whole deadline that
+            # leaves.
+            _assert_deadline_option_is_storable(changes)
+
+            # The SDK reads the step and sends its current title and all three
+            # owner buckets plus these changes, the caller's values winning, so
+            # 'title' renames and 'assignees': [] clears. Nothing else is read
+            # back: StepBuilder::editStep leaves any other absent key alone, and
+            # echoing a stored value would write it again (a stored
+            # deadline.option of "after" is a 422 now, rule 29). A read that does
+            # not show the title or a bucket is refused before any write.
+            result = _write_step(
+                sdk.templates.update_step,
+                org_id, template_id, step_id, **changes,
             )
-            payload = _preserved_step_fields(step, step_id)
-
-            # The caller's values win over the preserved ones, so passing
-            # 'title' renames and passing 'assignees': [] genuinely clears.
-            payload.update(changes)
-
-            # Last gate on the bytes that leave, not on the input.
-            _assert_deadline_option_is_storable(payload)
-
-            response = sdk._make_request("PUT", endpoint, data=payload)
-            result = response.get("data", response) if isinstance(response, dict) else response
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None,
             )
 
@@ -1624,11 +1478,10 @@ step_data keys:
             # carries "where position is distinct from new_position", so no row
             # changes. It only moves rows when inserting mid-flow, which is exactly
             # the case that silently failed before.
-            step_id = result.get("id") if isinstance(result, dict) else None
-            if not step_id:
-                return ToolResult(
-                    content=serialize_dataclass(result), structured_content=None
-                )
+            # The SDK returns the created step only with its id
+            # (answered_record); an answer without it raised
+            # TallyfyCreatedButUnreadError before this point.
+            step_id = result["id"]
 
             try:
                 reordered = sdk.templates.reorder_step(
@@ -1639,11 +1492,22 @@ step_data keys:
                 # "the call failed" and invites a retry that creates a duplicate
                 # step. Report the partial success instead so the caller can decide.
                 result = dict(result)
-                result["_position_warning"] = (
-                    f"Step created, but reordering it to position {position} failed "
-                    f"({exc}). The step is at the end of the template. Call "
-                    f"reorder_step to move it."
-                )
+                if is_unreadable_answer(exc):
+                    # SDK 4.0: api-v2 answered 2xx and the answer was unreadable,
+                    # so the reorder WAS applied. "At the end" would be false,
+                    # and moving it again would be a second move.
+                    result["_position_warning"] = (
+                        f"Step created, and the move to position {position} was "
+                        f"applied, but Tallyfy's answer to it could not be read. Read "
+                        f"the template's steps to confirm the position before moving "
+                        f"it again."
+                    )
+                else:
+                    result["_position_warning"] = (
+                        f"Step created, but reordering it to position {position} failed "
+                        f"({exc}). The step is at the end of the template. Call "
+                        f"reorder_step to move it."
+                    )
                 return ToolResult(
                     content=serialize_dataclass(result), structured_content=None
                 )
@@ -1722,20 +1586,21 @@ REQUIRED: 'template_id'. OPTIONAL: 'step_offset', only as a "_truncated" marker 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             template = sdk.templates.get_template(org_id, template_id=template_id)
-            if not template:
-                raise ToolError("Template not found")
 
-            existing_prerun = [serialize_dataclass(f) for f in template.prerun] if template.prerun else []
+            # Both are always sent by ChecklistTransformer, so None is an unread
+            # include, never "no kickoff fields" or "no steps" (#1545).
+            prerun = required_list(template.prerun, f"the kickoff fields of template {template_id}")
+            template_steps = required_list(template.steps, f"the steps of template {template_id}")
+            existing_prerun = [serialize_dataclass(f) for f in prerun]
             steps_summary = []
-            if template.steps:
-                for s in template.steps:
-                    steps_summary.append({
-                        'id': s.id,
-                        'title': s.title,
-                        'summary': s.summary,
-                    })
+            for s in template_steps:
+                steps_summary.append({
+                    'id': s.id,
+                    'title': s.title,
+                    'summary': s.summary,
+                })
             _check_step_offset(step_offset, {"steps": steps_summary})
-            positions = {s.id: s.position for s in (template.steps or [])}
+            positions = {s.id: s.position for s in template_steps}
 
             # It had no size control at all (#1668). Through the one shared
             # trimmer with its own outline stage; see _bounded_kickoff_suggestion.
@@ -1783,9 +1648,12 @@ REQUIRED: 'template_id'. OPTIONAL: 'step_offset', only as a "_truncated" marker 
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             # Get the template which includes prerun fields
             template = sdk.templates.get_template(org_id, template_id=template_id)
-            if template and template.prerun:
+            # ChecklistTransformer always sends `prerun`; None means the read did
+            # not carry it, and [] there would say "no kickoff fields" (#1545).
+            prerun = required_list(template.prerun, f"the kickoff fields of template {template_id}")
+            if prerun:
                 return ToolResult(
-                    content=compact_result([serialize_dataclass(field) for field in template.prerun]),
+                    content=compact_result([serialize_dataclass(field) for field in prerun]),
                     structured_content=None
                 )
             return ToolResult(content=[], structured_content=None)
@@ -2005,18 +1873,25 @@ REQUIRED: 'template_id'. OPTIONAL: 'step_offset', only as a "_truncated" marker 
         _check_step_offset(step_offset)
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # The raw read get_template uses, not sdk.templates.get_template:
-            # the facts need stage_id, owner_id, ai_assigned and kickoff labels,
-            # none of which the SDK models declare (#1659).
-            raw = _read_template_body(sdk, org_id, template_id)
-            if not raw:
-                raise ToolError("Template not found")
-            template = _serialize_template_body(raw)
+            # The read get_template uses. On SDK 4.0 the models type stage_id,
+            # owner_id, ai_assigned and the kickoff label the facts need (#1659).
+            source = _read_template_body(sdk, org_id, template_id)
+            # None is "not read", not "none" (SDK 4.0): facts computed over an
+            # unread steps, kickoff or rules list would report a template with
+            # no steps, no kickoff fields or no rules (#1545).
+            for what, value in (
+                ("steps", source.steps),
+                ("kickoff fields", source.prerun),
+                ("automation rules", source.automated_actions),
+            ):
+                required_list(value, f"the {what} of template {template_id}")
+            template = _serialize_template_body(source)
             _check_step_offset(step_offset, template)
 
-            # Facts first, from the raw body: before the 500-character string
-            # cap and before any outline or page, so they cover every step.
-            content = {"health_facts": compute_health_facts(raw), **template}
+            # Facts first, from the whole model: before the 500-character string
+            # cap and before any outline or page, so they cover every step and a
+            # kickoff alias mentioned late in a long step summary still counts.
+            content = {"health_facts": compute_health_facts(model_document(source)), **template}
 
             # Same size control as get_template: one shared trimmer with the
             # template outline, not a third binary search. See
@@ -2154,7 +2029,7 @@ Field variables in HTML: read tallyfy://variable-markup.""",
 
             result = sdk.templates.update_template_metadata(org_id, template_id, **template_data)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -2207,7 +2082,7 @@ CORRECT usage:
                 org_id, template_id, new_name.strip(),tenant=org_id,
             )
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -2280,7 +2155,7 @@ collection, 'document' for reference docs), 'summary', 'guidance', 'starred'.
                 starred=starred,
             )
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -2434,7 +2309,7 @@ result. Treat any refusal as real; act on its message rather than retrying.
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             result = sdk.templates.clone_step(org_id, template_id, step_id)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -2474,6 +2349,6 @@ result. Treat any refusal as real; act on its message rather than retrying.
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             result = sdk.templates.reorder_step(org_id, template_id, step_id, position)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )

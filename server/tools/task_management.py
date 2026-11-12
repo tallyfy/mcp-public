@@ -9,13 +9,11 @@ from typing import Any, Dict, List, Optional, Union
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 
-# `tallyfy.models.Task` is deliberately NOT imported. Every task response in this
-# module is now serialized from the raw api-v2 body through
-# `_serialize_task_response`, because `Task.from_dict` drops any field the
-# dataclass does not enumerate (#784, root cause tallyfy/sdk#33). Re-adding the
-# import is the first step of reintroducing that loss.
+# Every task answer in this module is a `tallyfy.models.Task` from a public SDK
+# method, serialized by `_task_content` (tallyfy/mcp#1545). SDK 4.0 types every
+# key TaskTransformer sends, so nothing is read raw any more.
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfySDK, TaskOwners
+from tallyfy import TaskOwners
 
 from metrics import track_tool_execution
 from tools.form_fields import (
@@ -33,7 +31,12 @@ from utils.date_utils import (
     parse_api_deadline,
     utc_to_local_string,
 )
-from utils.fastmcp_errors import handle_tallyfy_errors
+from utils.fastmcp_errors import (
+    CREATED_BUT_UNREAD_ERROR_TYPES,
+    handle_tallyfy_errors,
+    name_lookup_miss_class,
+    tag_error_class,
+)
 from utils.fastmcp_types import (
     LocalDeadline,
     OptionalBool,
@@ -53,29 +56,22 @@ from utils.fastmcp_types import (
 from utils.field_value_encoding import coerce_field_values_safely
 from utils.guest_assignment import normalize_guest_emails
 from utils.pagination import fetch_single_page
+from utils.sdk_client import TallyfySDK
+from utils.sdk_reads import required_list
 from utils.sdk_serializer import (
     compact_dict_list_field,
     serialize_dataclass,
     serialize_task,
-    unwrap_fractal,
 )
 
 _OWNER_BUCKETS = ("users", "guests", "groups")
 
-# Mirrors tallyfy.task_management.creation.TaskCreation.TASK_TYPES. We POST the
-# one-off-task endpoint directly (see _create_one_off_task), so the SDK's own
-# guard no longer runs and this tool would otherwise degrade a clear local error
-# into a remote 422.
+# Mirrors tallyfy.task_management.creation.TaskCreation.TASK_TYPES. Checked here
+# too so the refusal is this tool's ToolError, before any name is resolved,
+# rather than the SDK's ValueError after.
 _TASK_TYPES = frozenset({"task", "approval", "expiring", "email", "expiring_email"})
 
 _CHOICE_FIELD_TYPES = ("dropdown", "radio", "multiselect")
-
-# Fan-out read-back paging. api-v2 defaults this endpoint to 10 rows
-# (`TasksController.php:769`), which silently undercounts any fan-out wider than
-# ten. 100 per page x 20 pages is 2000 tasks, far past any realistic fan-out,
-# and the cap only exists so a misbehaving API cannot loop forever.
-_FANOUT_PAGE_SIZE = 100
-_FANOUT_MAX_PAGES = 20
 
 # The `status` filter on every task LISTING route (me/tasks, users/{id}/tasks,
 # runs/{id}/tasks, guests/{code}/tasks) reaches api-v2's Task::scopeStatus through
@@ -294,127 +290,57 @@ def _validate_task_form_fields(form_fields: Any) -> None:
         _normalize_column_dicts(field.get("columns"))
 
 
-def _create_one_off_task(sdk, org_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """POST a one-off task and return the created task dict.
+def _task_content(task: Any) -> Dict[str, Any]:
+    """Serialize a task the SDK returned, as every tool in this module answers it.
 
-    Deliberately NOT routed through `sdk.tasks.create_task`. That method's
-    signature carries none of `run_id`, `form_fields` or
-    `separate_task_for_each_assignee`, and its request body hardcodes
-    `"separate_task_for_each_assignee": False`, so the fan-out flag is not merely
-    absent from the signature, it is pinned off on every call. `sdk._make_request`
-    is this repo's established escape hatch for exactly that situation (13 call
-    sites across 6 tool modules) and keeps the SDK's session, auth headers, retry
-    logic and the Prometheus instrumentation applied by
-    `utils/sdk_metrics_patch.py`, all of which a hand-rolled httpx call would lose.
+    The one place a task becomes a payload, so the read paths and the write
+    paths cannot drift apart about what a task looks like (#784). SDK 4.0's
+    ``Task`` types every key TaskTransformer and CompletedTaskTransformer send
+    (TaskTransformer.php:37-141, CompletedTaskTransformer.php:13-40), and the
+    ``form_fields`` include lands on ``Task.form_fields`` as a list, already
+    out of its Fractal ``data`` envelope (tallyfy/sdk#181). Each entry carries
+    ``field_value``, which is where the submitted answer lives, NOT ``value``.
+
+    The guest links keep their wire key ``owners.taskUrls``
+    (TaskTransformer.php:117-123), where the SDK names the field
+    ``task_urls``: ``serialize_dataclass`` writes every SDK field under the key
+    api-v2 sends (``utils.sdk_serializer.SDK_WIRE_NAMES``), for every tool.
+
+    The SDK never hands back ``None``: from SDK 4.0 a 2xx answer it cannot read
+    raises ``TallyfyUnexpectedResponseError`` (a read or an update: re-read,
+    do not retry) or ``TallyfyCreatedButUnreadError`` (a create: do not repeat
+    it), and ``handle_tallyfy_errors`` says which to the caller.
     """
-    response = sdk._make_request("POST", f"organizations/{org_id}/tasks", data=payload)
-    if isinstance(response, dict) and isinstance(response.get("data"), dict):
-        return response["data"]
-    return response if isinstance(response, dict) else {}
+    return serialize_task(task)
 
 
-def _get_task_with_form_fields(sdk, endpoint: str) -> Dict[str, Any]:
-    """GET a task with its form fields and submitted answers, and KEEP them.
+def _read_task(sdk, org_id: str, run_id: Optional[str], task_id: str,
+               with_: Optional[str] = None) -> Any:
+    """Read one task through the SDK: the run-scoped route when ``run_id`` is
+    given, the one-off route otherwise. A one-off task linked to no process
+    answers 404 on the run-scoped route, so the caller picks by what it has."""
+    if run_id:
+        return sdk.tasks.get_task(org_id, run_id, task_id, with_=with_)
+    return sdk.tasks.get_standalone_task(org_id, task_id, with_=with_)
 
-    Deliberately not routed through `sdk.tasks.get_task`. Passing `with_` to the
-    SDK does put `?with=form_fields` on the wire, and api-v2 does return the
-    include, but `tallyfy.models.Task` declares no `form_fields` attribute, so
-    `Task.from_dict()` silently drops it and the caller sees a task with no
-    questions and no answers. Measured 2026-08-06: the raw response carried the
-    field, `hasattr(Task.from_dict(...), "form_fields")` was False.
 
-    That is the whole failure class this repo keeps meeting: the request
-    parameter lands, the value never arrives, and nothing errors. Asserting that
-    `with_` was passed does NOT prove the fields come back, so the test for this
-    asserts on the returned payload.
+def _get_task_with_form_fields(sdk, org_id: str, run_id: Optional[str],
+                               task_id: str) -> Dict[str, Any]:
+    """Read a task with its form fields and submitted answers, and KEEP them.
 
-    The include is Fractal-wrapped as `form_fields.data`; it is unwrapped here so
-    callers get a plain list. Each entry carries `field_value`, which is where the
-    submitted answer lives (NOT `value`).
+    ``form_fields`` is a Fractal ``$availableIncludes`` on TaskTransformer
+    (TaskTransformer.php:14-30), so a plain read returns NO fields and no
+    answers. ``with_="form_fields"`` asks for it, and SDK 4.0 keeps it on
+    ``Task.form_fields`` (tallyfy/sdk#181). Before that the model had no field
+    for it, so this read went raw (measured 2026-08-06: the raw response
+    carried the include, the parsed Task did not).
+
+    That is the failure class this repo keeps meeting: the request parameter
+    lands, the value never arrives, and nothing errors. Asserting that
+    ``with_`` was passed does NOT prove the fields come back, so the tests for
+    this assert on the returned payload.
     """
-    response = sdk._make_request("GET", endpoint, params={"with": "form_fields"})
-    return _serialize_task_response(response)
-
-
-def _serialize_task_response(response: Any) -> Dict[str, Any]:
-    """Serialize a RAW api-v2 task body, keeping every field the API sent.
-
-    The one place any task response is turned into a payload, so the read paths
-    and the write paths cannot drift apart about what a task looks like (#784).
-
-    **Why the raw dict and not the SDK dataclass.** `tallyfy.models.Task`
-    enumerates 43 fields, and `Task.from_dict` keeps only those. Measured
-    2026-08-07 against `tallyfy==1.3.10`: feeding a body carrying `summary`,
-    `original_summary` and `form_fields` through it drops all three, silently,
-    while `title`, `taskdata` and `status` parse correctly. So the model did read
-    the body; it simply has no attribute to put those keys in. `serialize_task`
-    on the SAME raw dict returns them. That is `tallyfy/sdk#33`, and until it
-    ships every field api-v2 adds is dropped here until someone edits a
-    dataclass, with nothing anywhere reporting the loss.
-
-    Two shapes are handled, both seen in real responses:
-
-    * the Fractal envelope, `{"data": {...}}`, unwrapped to the task itself;
-    * the `form_fields` include, which arrives Fractal-wrapped a second time as
-      `form_fields.data`, unwrapped to a plain list. Each entry carries
-      `field_value`, which is where the submitted answer lives, NOT `value`.
-
-    Anything that is not a dict yields `{}`, because `ToolResult` requires
-    non-None content and an empty payload is the established sentinel.
-    """
-    return serialize_task(unwrap_fractal(response, ("form_fields",)))
-
-
-def _complete_task_raw(
-    sdk,
-    org_id: str,
-    run_id: str,
-    task_id: str,
-    is_approved: Optional[bool] = None,
-    override_user: Optional[int] = None,
-) -> Dict[str, Any]:
-    """POST a task completion and keep the whole response body (#784).
-
-    Same endpoint and body as `sdk.tasks.complete_task`, read from its source:
-    `POST organizations/{org}/runs/{run}/completed-tasks` with `{"task_id": ...}`.
-    The ONLY difference is the last line. The SDK ends in
-    `Task.from_dict(response['data'])`, which drops `summary` and
-    `original_summary`, and it exposes no hook to capture the body first.
-
-    Going raw rather than re-reading is what makes this free. A post-write
-    read-back like `_task_after_write` would also recover the fields, at one
-    extra GET on the most frequently called write in the server. `sdk._make_request`
-    is this repo's established escape hatch for exactly this situation (see
-    `_create_one_off_task`), and it keeps the SDK's session, auth headers, retry
-    logic and the Prometheus instrumentation from `utils/sdk_metrics_patch.py`,
-    all of which a hand-rolled httpx call would lose.
-
-    Validation is not lost with it: `run_id` and `task_id` reach this through
-    the `ProcessId` and `TaskId` Pydantic types, which Pydantic enforces before
-    the tool body runs, and those are stricter than the SDK's own checks.
-    """
-    body: Dict[str, Any] = {"task_id": task_id}
-    if is_approved is not None:
-        body["is_approved"] = is_approved
-    if override_user is not None:
-        body["override_user"] = override_user
-
-    return sdk._make_request(
-        "POST", f"organizations/{org_id}/runs/{run_id}/completed-tasks", data=body
-    )
-
-
-def _reopen_task_raw(sdk, org_id: str, run_id: str, task_id: str) -> Any:
-    """DELETE a task completion and keep the whole response body (#784).
-
-    The sibling of `_complete_task_raw`, and it exists for the same reason: the
-    SDK's `reopen_task` ends in `Task.from_dict(...)`. Endpoint read from its
-    source: `DELETE organizations/{org}/runs/{run}/completed-tasks/{task}`.
-    """
-    return sdk._make_request(
-        "DELETE",
-        f"organizations/{org_id}/runs/{run_id}/completed-tasks/{task_id}",
-    )
+    return _task_content(_read_task(sdk, org_id, run_id, task_id, with_="form_fields"))
 
 
 def _resolve_forwarded_is_approved(
@@ -436,6 +362,17 @@ def _resolve_forwarded_is_approved(
     """
     if is_approved is None:
         return None
+    if is_approved is False and task_type is None:
+        # SDK 4.0 leaves a task_type api-v2 did not send as None (SDK 3.x said
+        # 'task'). Unknown could be expiring, where False is the silent
+        # ACKNOWLEDGED-to-EXPIRED flip below, so it is refused, not forwarded
+        # (#1545). True is safe either way: api-v2 reads it as acknowledged.
+        raise ToolError(
+            "is_approved=False was not sent: the task came back without its "
+            "task_type, so this tool cannot tell an approval task (where False "
+            "rejects it) from an expiring one (where False would mark it EXPIRED). "
+            "Nothing was changed. Read the task with get_task and try again."
+        )
     if is_approved is False and task_type in ("expiring", "expiring_email"):
         raise ToolError(
             "is_approved=False cannot be used on an expiring task: "
@@ -462,26 +399,24 @@ def _resolve_forwarded_is_approved(
 # `update_standalone_task`'s own response can echo them directly -- the
 # original reason this tuple existed is gone for those two names.
 #
-# The read-back stays anyway, because `Task.from_dict` still cannot echo
-# `original_summary` at the top level. It is not a declared field: `Task`
-# carries `@lossless()`, so an unmapped key lands in `task.extra` instead of on
-# the object, and `serialize_dataclass` would then surface it as
-# `result["extra"]["original_summary"]` rather than `result["original_summary"]`
-# -- a shape that disagrees with `get_task`, which reads raw and always puts it
-# flat (rule 16). Verified live against the installed SDK: `Task.from_dict({
-# ..., "summary": "x", "original_summary": "y"}).extra == {"original_summary":
-# "y"}`. So this tuple still names the write-time arguments that trigger the
-# read-back -- `original_summary` can never join it, because a caller writes
-# `summary`, never `original_summary` -- and the read-back it triggers still
-# earns its extra GET by flattening that one field.
+# ⚠️ UPDATED 2026-11-04 after bumping tallyfy 3.0.4 -> 3.2.0. The read-back's
+# last reason was `original_summary`: until 3.2.0 it was not a declared `Task`
+# field, so `@lossless()` put it in `task.extra` and the update response could
+# not show it flat, where `get_task` does (rule 16). SDK 3.2.0 declares
+# `Task.original_summary` (tallyfy/sdk#181), so the update response now echoes
+# all three names itself and this mechanism is dead weight for them.
 #
-# ⚠️ This is a claim about the SDK, so it is asserted rather than trusted:
-# `test_task_management.py::TestTheEchoGapIsRealAndNarrow` pins that `summary`
-# and `top_secret` ARE now declared (the control that the extra GET is no
-# longer needed FOR THEM) while `original_summary` is still absent from
-# `dataclasses.fields(Task)` (the reason the read-back is still needed at all).
-# If a future SDK release ever promotes `original_summary` to a real field too,
-# that is when this whole mechanism becomes dead weight and should be deleted.
+# It is KEPT after the switch to public SDK methods (tallyfy/mcp#1545), on
+# purpose, because the update answer does not carry everything the read-back
+# adds. Both PUT routes answer through TaskTransformer on a route that binds the
+# task (Checklists/TasksController::update, OneOffTasksController::update), so
+# isSingleTaskDetailRequest() is true and `summary`, `original_summary`,
+# `top_secret` and `shown_at` are all in the PUT answer
+# (TaskTransformer.php:91-110, DetectsSingleTaskDetailRequest.php:14-17). The
+# `form_fields` include is not: the PUT carries no `?with=`, so Fractal includes
+# nothing, and a summary or top_secret write would stop returning the task's
+# form fields. Keeping the output identical means keeping one extra GET on
+# those two writes.
 _FIELDS_THE_SDK_TASK_MODEL_CANNOT_ECHO = ("summary", "top_secret")
 
 
@@ -500,28 +435,20 @@ def _write_needs_read_back(**written: Any) -> bool:
                for name in _FIELDS_THE_SDK_TASK_MODEL_CANNOT_ECHO)
 
 
-def _task_after_write(sdk, endpoint: str, task_id: str) -> Dict[str, Any]:
+def _task_after_write(sdk, org_id: str, run_id: Optional[str],
+                      task_id: str) -> Dict[str, Any]:
     """Re-read a task after a write that already succeeded, never fatally.
 
     This adds ONE thing to `_get_task_with_form_fields` and delegates everything
     else to it: the guard below. It is not a second reader.
 
-    Why a re-read is still needed. `sdk.tasks.update_task` and
-    `update_standalone_task` both end in `Task.from_dict(response['data'])`.
-    Since tallyfy 2.0.0 that DOES parse `summary` and `top_secret` onto the
-    object (tallyfy/sdk#33) — the original #633 gap for those two names is
-    closed. `original_summary` is not so lucky: it is not a declared field, so
-    `Task` (which carries `@lossless()`) puts it in `task.extra` instead, and
-    `serialize_task` would then surface it as `result["extra"]
-    ["original_summary"]` rather than flat at `result["original_summary"]`.
-    Measured against the installed SDK: `Task.from_dict({..., "summary": "x",
-    "original_summary": "y"}).extra == {"original_summary": "y"}`, while
-    `serialize_task` on the SAME raw dict returns both flat. That is rule 24 in
-    the root CLAUDE.md, still true for this one field: the write lands, the app
-    UI shows it, and no update response can echo it back at the shape this
-    server wants.
+    Why it is still here. The update answer already carries `summary`,
+    `original_summary` and `top_secret` (SDK 4.0 types all three, and the PUT
+    is a single-task detail request). What it does not carry is the
+    `form_fields` include, and this read-back adds it; see the comment above
+    `_FIELDS_THE_SDK_TASK_MODEL_CANNOT_ECHO`.
 
-    `?with=summary` is NOT the fix and is deliberately not sent. Verified live
+    `?with=summary` is NOT needed and is deliberately not sent. Verified live
     2026-08-06 against production, masquerading into a real org: a plain
     `GET .../runs/{run}/tasks/{task}` already returns `summary`, as does the
     same endpoint with `?with=form_fields`, as does `.../tasks/{task}` for a
@@ -534,105 +461,40 @@ def _task_after_write(sdk, endpoint: str, task_id: str) -> Dict[str, Any]:
     GET IS the failure and must propagate. Here the PUT has already returned
     2xx, so raising would report a landed change as a failure and invite a retry
     of a write that already happened. A failed re-read therefore degrades to the
-    pre-fix payload - the SDK-typed shape, `summary` absent - which is never
-    worse than the behaviour this replaces.
+    update answer alone, without `form_fields`.
     """
     try:
-        return _get_task_with_form_fields(sdk, endpoint)
+        return _get_task_with_form_fields(sdk, org_id, run_id, task_id)
     except Exception as exc:  # noqa: BLE001 - degraded read, never fatal
         logger.warning("Post-write read-back failed for task %s: %s", task_id, exc)
         return {}
 
 
-def _read_back_fanout(sdk, org_id: str, run_id: str) -> Optional[Dict[str, Any]]:
-    """Read every task in the container run produced by a fan-out create.
+def _fanout_result(tasks: List[Any]) -> Dict[str, Any]:
+    """The answer to a fan-out create: every task in the new process, counted.
 
-    The API returns only ONE task from a `separate_task_for_each_assignee` create
-    (`OneOffTasksController::create` hands a whole collection to
-    `respondWithItem`), so the caller cannot see, count or verify the fan-out from
-    the response alone. Verified live 2026-08-06: a three-assignee create returned
-    a single task while the run held three.
+    The API returns only ONE task from a `separate_task_for_each_assignee`
+    create (`OneOffTasksController::create` hands a whole collection to
+    `respondWithItem`), so the caller cannot see, count or verify the fan-out
+    from the response alone. Verified live 2026-08-06: a three-assignee create
+    returned a single task while the run held three. SDK 4.0's
+    `create_task_for_each_assignee` reads the new process's tasks back, page by
+    page at 100 a page (api-v2 defaults the listing to 10, TasksController.php:769,
+    which once reported `task_count: 10` for a 12-assignee fan-out), and
+    returns all of them, or raises `TallyfyCreatedButUnreadError` when they
+    cannot be read (tallyfy/sdk#170).
 
-    Returns None when the read fails. A failed read must not be reported as an
-    empty fan-out, so the caller falls back to the single task the POST returned
-    rather than implying nothing else was created.
-
-    **It MUST paginate.** `TasksController.php:769` reads
-    `'per_page' => $request['per_page'] ?? 10`, so a bare GET returns 10 rows.
-    A bare read therefore reported `task_count: 10` for a 12-assignee fan-out
-    while all 12 tasks existed, and did it while looking like a complete success.
-    Measured live 2026-08-06 before this fix. Ten is well inside a realistic fan
-    out: any group with more than ten members hits it, and the whole point of the
-    feature is that the count is trustworthy.
-
-    The loop stops on the first EMPTY page rather than on a short one, so it stays
-    correct if the API applies a per_page of its own choosing. Ids already seen are
-    skipped, so if `page` were ever ignored the loop terminates instead of
-    duplicating rows forever.
+    `{run_id, task_count, tasks}` carries no "data" key, so `compact_result`
+    falls through to its "cannot auto-compact" arm and returns the payload
+    whole. A big fan-out would then blow the 25 KB cap and the CLI would hide
+    the entire result behind <persisted-output>. Trim the list instead, and
+    keep `task_count` at the TRUE total: the count is the answer to "did
+    everyone get one?", so it must never shrink with the display list.
     """
-    endpoint = f"organizations/{org_id}/runs/{run_id}/tasks"
-    tasks: List[Dict[str, Any]] = []
-    seen: set = set()
-
-    for page in range(1, _FANOUT_MAX_PAGES + 1):
-        try:
-            response = sdk._make_request(
-                "GET", endpoint, params={"per_page": _FANOUT_PAGE_SIZE, "page": page}
-            )
-        except Exception as exc:  # noqa: BLE001 - degraded read, never fatal
-            logger.warning("Fan-out read-back failed for run %s: %s", run_id, exc)
-            return None
-
-        batch = response.get("data") if isinstance(response, dict) else None
-        if not isinstance(batch, list):
-            logger.warning("Fan-out read-back for run %s returned no task list", run_id)
-            return None
-
-        fresh = [
-            task for task in batch
-            if not (isinstance(task, dict) and task.get("id") in seen)
-        ]
-        for task in fresh:
-            if isinstance(task, dict) and task.get("id"):
-                seen.add(task["id"])
-        tasks.extend(fresh)
-
-        if not batch or not fresh:
-            break
-    else:
-        logger.warning(
-            "Fan-out read-back for run %s hit the %d page cap; count may be short",
-            run_id, _FANOUT_MAX_PAGES,
-        )
-
-    if not tasks:
-        # An empty list here is a FAILED read, not an empty fan-out. The POST has
-        # already succeeded, so at least one task provably exists; the run-tasks
-        # listing is served by a read replica that can lag a create. Returning
-        # `task_count: 0` would be a measurably false statement, and because the
-        # dict is not None the caller would skip its single-task fallback and
-        # report that nothing was created. Same principle as the exception and
-        # non-list arms above: when the read cannot be trusted, hand back the task
-        # the POST returned rather than a count we know is wrong.
-        logger.warning(
-            "Fan-out read-back for run %s returned zero tasks after a successful "
-            "create; treating as a failed read", run_id
-        )
-        return None
-
-    serialized_tasks = [serialize_task(task) for task in tasks]
-
-    # `{run_id, task_count, tasks}` carries no "data" key, so `compact_result`
-    # falls through to its "cannot auto-compact" arm and returns the payload
-    # whole. A big fan-out would then blow the 25 KB cap and the CLI would hide
-    # the entire result behind <persisted-output>. Trim the list instead, and
-    # keep `task_count` at the TRUE total: the count is the answer to "did
-    # everyone get one?", so it must never shrink with the display list. That is
-    # the same undercount the per_page fix above removed, and reintroducing it
-    # here would be just as invisible.
+    serialized_tasks = [_task_content(task) for task in tasks]
     return compact_dict_list_field(
         {
-            "run_id": run_id,
+            "run_id": tasks[0].run_id,
             "task_count": len(serialized_tasks),
             "tasks": serialized_tasks,
         },
@@ -641,37 +503,52 @@ def _read_back_fanout(sdk, org_id: str, run_id: str) -> Optional[Dict[str, Any]]
     )
 
 
-def _task_fields(sdk, endpoint: str) -> list:
+def _fanout_unread_note(run_id: Optional[str]) -> str:
+    """What a fan-out answer says when its tasks were created and could not
+    be read back: the one task shown is not the whole fan-out, and the create
+    must not be repeated."""
+    where = f"process {run_id}" if run_id else "a new process"
+    return (
+        f"One task per assignee was created in {where}, but they could not be "
+        f"read back, so only this one is shown. Do not create them again; read "
+        f"them with get_tasks_for_process."
+    )
+
+
+def _task_fields(sdk, org_id: str, run_id: Optional[str], task_id: str) -> list:
     """
     Read a task's form-field DEFINITIONS, which is the only way to coerce
     `taskdata` values into their per-type shapes.
 
     The definitions are an OPTIONAL Fractal include, so they have to be asked
-    for by name and then unwrapped. Verified against the live API on both task
-    surfaces (2026-07-24):
+    for by name. Verified against the live API on both task surfaces
+    (2026-07-24):
 
         GET .../runs/{run}/tasks/{task}?with=form_fields  ->  data.form_fields.data[]
         GET .../tasks/{task}?with=form_fields             ->  data.form_fields.data[]
 
-    Each entry carries `{id, field_type, label, options}`, which is exactly what
-    `coerce_field_values` matches on. A plain GET returns NEITHER `form_fields`
-    NOR `step` (`TaskTransformer.php:14-28` lists both under `$availableIncludes`),
-    so reading them off an already-fetched task object silently yields nothing -
-    that was the bug this replaced.
+    SDK 4.0 parses the include onto `Task.form_fields` as `TaskFormField`s, each
+    carrying the `id`, `field_type`, `label` and `options` that
+    `coerce_field_values` matches on. A plain read returns NEITHER
+    `form_fields` NOR `step` (`TaskTransformer.php:14-30` lists both under
+    `$availableIncludes`), so reading them off an already-fetched task object
+    silently yields nothing - that was the bug this replaced.
 
     `?with=step` also works for run tasks, but not for one-off tasks, which have
     no step and yet can carry their own choice fields. `form_fields` is the one
     parameter that covers both.
+
+    `form_fields` is None when the answer did not carry the include. That is a
+    failed read, not a task without fields, so it raises; the caller
+    (`coerce_field_values_safely`) then sends the values uncoerced.
     """
-    response = sdk._make_request("GET", endpoint, params={"with": "form_fields"})
-    data = response.get("data", response) if isinstance(response, dict) else response
-    fields = data.get("form_fields") if isinstance(data, dict) else None
-    if isinstance(fields, dict):
-        fields = fields.get("data")  # unwrap the Fractal include
-    return list(fields or [])
+    task = _read_task(sdk, org_id, run_id, task_id, with_="form_fields")
+    return required_list(
+        getattr(task, "form_fields", None), f"the form fields of task {task_id}"
+    )
 
 
-def _coerce_taskdata(sdk, endpoint: str,
+def _coerce_taskdata(sdk, org_id: str, run_id: Optional[str], task_id: str,
                      taskdata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """
     Shape `taskdata` values to their field types before sending.
@@ -688,11 +565,11 @@ def _coerce_taskdata(sdk, endpoint: str,
     the two cannot drift (CLAUDE.md rule 16).
     """
     return coerce_field_values_safely(
-        taskdata, lambda: _task_fields(sdk, endpoint)
+        taskdata, lambda: _task_fields(sdk, org_id, run_id, task_id)
     )
 
 
-def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
+def _completed_owner_buckets(sdk, org_id: str, run_id: Optional[str], task_id: str,
                              owners: Dict[str, Any]) -> Dict[str, Any]:
     """Fill in any owner bucket the caller left out, so the API keeps it.
 
@@ -717,18 +594,18 @@ def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
     Only the absent buckets are read back and re-sent.
 
     TaskTransformer.php:49-52 emits all three buckets unconditionally, so a
-    missing or non-list bucket on the READ means the read failed, and sending
-    [] on a failed read is exactly the wipe this guard exists to prevent.
-    Abort instead of guessing.
+    bucket the READ did not carry (SDK 4.0: ``TaskOwners.<bucket>`` is
+    ``None``, or ``Task.owners`` is ``None``) means the read failed, and
+    sending [] on a failed read is exactly the wipe this guard exists to
+    prevent. Abort instead of guessing.
     """
     missing = [b for b in _OWNER_BUCKETS if b not in owners]
     if not missing:
         return owners
 
-    current = sdk._make_request("GET", endpoint)
-    task = current.get("data", current) if isinstance(current, dict) else {}
-    current_owners = task.get("owners")
-    if not isinstance(current_owners, dict):
+    task = _read_task(sdk, org_id, run_id, task_id)
+    current_owners = getattr(task, "owners", None) if task is not None else None
+    if current_owners is None:
         raise ToolError(
             f"Task {task_id} did not return its current owners, so updating "
             f"only part of 'owners' would detach every assignee in the "
@@ -737,7 +614,7 @@ def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
 
     completed = dict(owners)
     for bucket in missing:
-        value = current_owners.get(bucket)
+        value = getattr(current_owners, bucket, None)
         if not isinstance(value, list):
             raise ToolError(
                 f"Task {task_id} did not return its current '{bucket}', so "
@@ -746,6 +623,28 @@ def _completed_owner_buckets(sdk, endpoint: str, task_id: str,
             )
         completed[bucket] = list(value)
     return completed
+
+
+def _current_owner_buckets(task: Any, task_id: str) -> Dict[str, Any]:
+    """The task's current owners as read, every bucket a list, or a refusal.
+
+    TaskTransformer emits all three buckets unconditionally, so a bucket the
+    read did not carry (SDK 4.0: ``None``) means the read failed. Re-sending
+    it as ``[]``, or leaving it out, detaches everyone in it.
+    """
+    current_owners = getattr(task, "owners", None) if task is not None else None
+    buckets: Dict[str, Any] = {}
+    for bucket in _OWNER_BUCKETS:
+        value = getattr(current_owners, bucket, None) if current_owners is not None else None
+        if not isinstance(value, list):
+            raise ToolError(
+                f"Task {task_id} did not return its current '{bucket}', so this "
+                f"change would detach everything in that bucket. Nothing was sent. "
+                f"Pass 'owners' with all three of users, guests and groups to set "
+                f"them outright."
+            )
+        buckets[bucket] = list(value)
+    return buckets
 
 
 # ---------------------------------------------------------------------------
@@ -821,7 +720,10 @@ def _search_process_by_name(sdk, org_id: str, process_name: str) -> str:
         run_id of the matching process
 
     Raises:
-        ToolError: If no match found or result is ambiguous
+        ToolError: If no match found or result is ambiguous. Any other
+            TallyfyError (an outage, a 401, an unreadable search answer) is
+            re-raised for handle_tallyfy_errors, as in
+            template_management._resolve_template_name.
     """
     from tallyfy import TallyfyError
     try:
@@ -829,9 +731,15 @@ def _search_process_by_name(sdk, org_id: str, process_name: str) -> str:
         logger.debug("search_processes_by_name(%r) -> %r", process_name, result)
         return result
     except TallyfyError as e:
-        raise ToolError(
-            f"{e} Use get_organization_runs to browse processes or provide the run_id directly."
-        )
+        error_class = name_lookup_miss_class(e)
+        if error_class is None:
+            raise
+        raise tag_error_class(
+            ToolError(
+                f"{e} Use get_organization_runs to browse processes or provide the run_id directly."
+            ),
+            error_class,
+        ) from e
 
 logger = logging.getLogger(__name__)
 
@@ -1525,48 +1433,51 @@ required (explicit - no default); dropdown/radio/multiselect also need options
 
         _validate_task_form_fields(form_fields)
 
-        # Field-for-field the body tallyfy 1.3.10 builds, so the default path is
-        # unchanged, plus the three parameters its signature cannot carry.
-        payload: Dict[str, Any] = {
-            "title": title.strip(),
-            "deadline": parsed_deadline,
-            "owners": {
-                "users": owners.users or [],
-                "guests": owners.guests or [],
-                "groups": owners.groups or [],
-            },
-            "task_type": resolved_task_type,
-            "separate_task_for_each_assignee": bool(separate_task_for_each_assignee),
-            "status": "not-started",
-            "everyone_must_complete": False,
-            "is_soft_start_date": True,
-        }
-        if description:
-            payload["summary"] = description.strip()
-        if max_assignable is not None:
-            payload["max_assignable"] = max_assignable
-        if prevent_guest_comment is not None:
-            payload["prevent_guest_comment"] = prevent_guest_comment
-        if run_id:
-            payload["run_id"] = run_id
-        if form_fields:
-            payload["form_fields"] = form_fields
+        # The SDK builds the same body this tool used to POST itself
+        # (TaskCreation._one_off_task_body: status not-started,
+        # everyone_must_complete False, is_soft_start_date True), and since SDK
+        # 4.0 it carries run_id, form_fields and the fan-out flag too.
+        create_args: Dict[str, Any] = dict(
+            owners=owners,
+            description=description.strip() if description else None,
+            task_type=resolved_task_type,
+            max_assignable=max_assignable,
+            prevent_guest_comment=prevent_guest_comment,
+            form_fields=form_fields or None,
+            run_id=run_id or None,
+        )
 
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            created = _create_one_off_task(sdk, org_id, payload)
+            if separate_task_for_each_assignee:
+                try:
+                    tasks = sdk.tasks.create_task_for_each_assignee(
+                        org_id, title.strip(), parsed_deadline, **create_args
+                    )
+                except CREATED_BUT_UNREAD_ERROR_TYPES as exc:
+                    # The tasks exist and could not be read back. With the one
+                    # task the create answered, answer with it and say the rest
+                    # exist; with none, re-raise, and the error handler tells
+                    # the caller the create was applied and must not be repeated.
+                    # Never an empty fan-out, which would invite a second create.
+                    # A created_task without its id is a body the SDK parsed
+                    # anyway (it does not check for the id there), so it counts
+                    # as none.
+                    if exc.created_task is None or exc.created_task.id is None:
+                        raise
+                    logger.warning("Fan-out read-back failed: %s", exc)
+                    result = _task_content(exc.created_task)
+                    result["_fanout_unread"] = _fanout_unread_note(exc.created_task.run_id)
+                    _format_local_deadline(
+                        result, parsed_deadline, effective_timezone, utc_fallback
+                    )
+                    return ToolResult(content=result, structured_content=None)
+                return ToolResult(content=_fanout_result(tasks), structured_content=None)
+            else:
+                created = sdk.tasks.create_task(
+                    org_id, title.strip(), parsed_deadline, **create_args
+                )
 
-            fanout = None
-            if separate_task_for_each_assignee and created.get("run_id"):
-                fanout = _read_back_fanout(sdk, org_id, created["run_id"])
-
-        if fanout is not None:
-            return ToolResult(content=fanout, structured_content=None)
-
-        # `created` is already the raw response dict -- the two lines above
-        # subscript it. Round-tripping it through Task.from_dict dropped
-        # `summary` (the description this tool just wrote), `original_summary`
-        # and `form_fields`, and saved exactly zero requests by doing so (#784).
-        result = _serialize_task_response(created) if created else {}
+        result = _task_content(created)
         _format_local_deadline(result, parsed_deadline, effective_timezone, utc_fallback)
 
         return ToolResult(content=result, structured_content=None)
@@ -1651,15 +1562,15 @@ Get run_id, task_id, and task_type from get_tasks_for_process() or get_my_tasks(
             forwarded_is_approved = is_approved
             if is_approved is not None:
                 task = sdk.tasks.get_task(org_id, run_id, task_id)
-                task_type = getattr(task, "task_type", None) if task else None
+                task_type = task.task_type
                 forwarded_is_approved = _resolve_forwarded_is_approved(task_type, is_approved)
-            response = _complete_task_raw(
-                sdk, org_id, run_id, task_id,
+            response = sdk.tasks.complete_task(
+                org_id, run_id, task_id,
                 is_approved=forwarded_is_approved,
                 override_user=override_user,
             )
             return ToolResult(
-                content=_serialize_task_response(response),
+                content=_task_content(response),
                 structured_content=None
             )
 
@@ -1724,12 +1635,12 @@ WRONG usage (will fail or create a misleading audit):
             )
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            response = _reopen_task_raw(sdk, org_id, run_id, task_id)
+            response = sdk.tasks.reopen_task(org_id, run_id, task_id)
             sdk.threads.add_task_comment(
                 org_id, task_id, reason.strip()
             )
             return ToolResult(
-                content=_serialize_task_response(response),
+                content=_task_content(response),
                 structured_content=None
             )
 
@@ -1830,10 +1741,10 @@ detached, but an empty list you DO pass means "unassign everyone here".
 
         Returns:
             Updated task object. When `summary` or `top_secret` was supplied,
-            the task is re-read so the response carries the STORED values
-            rather than the ones sent; the SDK's Task dataclass has a field for
-            neither, so nothing else could show them (#633, #585). Updates that
-            touch neither issue no extra request and are unchanged.
+            the task is re-read with its form fields, so the response carries
+            the STORED values and the task's questions and answers, as
+            get_task does (#633, #585). Updates that touch neither issue no
+            extra request and are unchanged.
         """
         _refuse_status_on_update(status, "complete_task", "reopen_task")
         if owners is not None and not isinstance(owners, dict):
@@ -1855,16 +1766,9 @@ detached, but an empty list you DO pass means "unassign everyone here".
             # buckets it omits. Complete it before sending; see
             # _completed_owner_buckets for the trace.
             if owners is not None:
-                owners = _completed_owner_buckets(
-                    sdk,
-                    f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}",
-                    task_id,
-                    owners,
-                )
+                owners = _completed_owner_buckets(sdk, org_id, run_id, task_id, owners)
 
-            taskdata = _coerce_taskdata(
-                sdk, f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}", taskdata
-            )
+            taskdata = _coerce_taskdata(sdk, org_id, run_id, task_id, taskdata)
 
             result = sdk.tasks.update_task(
                 org_id, run_id, task_id,
@@ -1881,19 +1785,15 @@ detached, but an empty list you DO pass means "unassign everyone here".
                 task_type=task_type,
                 webhook=webhook,
             )
-            content = serialize_task(result) if result else {}
-            # Rule 12: a 2xx does not mean the value landed - read it back. Here
-            # the caller structurally CANNOT, because the object the SDK returns
-            # has no `summary` or `top_secret` attribute to read (#633, #585;
-            # see _task_after_write). Gated on the caller having supplied one of
+            content = _task_content(result)
+            # Rule 12: a 2xx does not mean the value landed - read it back. The
+            # update answer carries the stored summary and top_secret; the
+            # read-back adds the task's form fields, which it does not (see
+            # _task_after_write). Gated on the caller having supplied one of
             # them, so every other update issues exactly the requests it did
             # before.
             if _write_needs_read_back(summary=summary, top_secret=top_secret) and content:
-                content.update(_task_after_write(
-                    sdk,
-                    f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}",
-                    task_id,
-                ))
+                content.update(_task_after_write(sdk, org_id, run_id, task_id))
             if deadline is not None and content:
                 _format_local_deadline(content, deadline, effective_timezone, utc_fallback)
             return ToolResult(content=content, structured_content=None)
@@ -1930,9 +1830,7 @@ detached, but an empty list you DO pass means "unassign everyone here".
             # `form_fields` is a Fractal $availableIncludes on TaskTransformer, so a
             # plain GET returns NO fields and no submitted answers. Without this the
             # assistant can put questions on a task and then never read the replies.
-            result = _get_task_with_form_fields(
-                sdk, f"organizations/{org_id}/runs/{run_id}/tasks/{task_id}"
-            )
+            result = _get_task_with_form_fields(sdk, org_id, run_id, task_id)
             return ToolResult(content=result, structured_content=None)
 
     @mcp.tool(
@@ -1966,9 +1864,7 @@ detached, but an empty list you DO pass means "unassign everyone here".
             # Sibling of get_task (repo rule 16). A fan-out task is BOTH a run task
             # and a one-off task, so both read tools must surface the answers or the
             # one the agent happens to pick decides whether it can see them.
-            result = _get_task_with_form_fields(
-                sdk, f"organizations/{org_id}/tasks/{task_id}"
-            )
+            result = _get_task_with_form_fields(sdk, org_id, None, task_id)
             return ToolResult(content=result, structured_content=None)
 
     @mcp.tool(
@@ -2062,8 +1958,7 @@ CORRECT usage:
 
         Returns:
             Updated task object. Same read-back as `update_task`, covering both
-            `summary` and `top_secret`, for the same reason and on the one-off
-            endpoint (#633, #585).
+            `summary` and `top_secret`, on the one-off endpoint (#633, #585).
         """
         _refuse_status_on_update(
             status, "complete_standalone_task", "reopen_standalone_task"
@@ -2084,33 +1979,36 @@ CORRECT usage:
             deadline = _deadline_for_api(deadline, effective_timezone)
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             current_task = sdk.tasks.get_standalone_task(org_id, task_id)
-            current_data = serialize_dataclass(current_task) if current_task else {}
+            current_data = serialize_dataclass(current_task)
 
             # Same partial-bucket hazard as update_task: OneOffTaskService::edit
             # routes through TaskFactory::editBasicTask, which hits the identical
             # is_array('owners') gate, so a partially-supplied owners detaches
-            # every assignee in the buckets it omits. Only the CALLER-supplied
-            # dict needs completing. The `current_data` fallback below is already
-            # safe: serialize_dataclass strips only EMPTY buckets, and detaching
-            # an already-empty bucket is a no-op.
+            # every assignee in the buckets it omits. A CALLER-supplied dict is
+            # completed from a fresh read; with none, the current owners are
+            # re-sent from the read above, bucket by bucket.
             if owners is not None:
-                owners = _completed_owner_buckets(
-                    sdk, f"organizations/{org_id}/tasks/{task_id}", task_id, owners
-                )
+                owners = _completed_owner_buckets(sdk, org_id, None, task_id, owners)
+            else:
+                # UpdateOneOffTaskRequest makes `owners` required, so the current
+                # owners are re-sent, and every bucket must be one that was READ.
+                # The serialized copy cannot say: it drops [] and None alike, and
+                # from SDK 4.0 an unread bucket is None, not [] (#1545). An absent
+                # bucket in the PUT is an empty set to api-v2, which detaches
+                # everyone in it, so an unread one refuses instead.
+                owners = _current_owner_buckets(current_task, task_id)
 
-            # current_task cannot serve here: `get_standalone_task` fetches
-            # without `?with=`, and the SDK's Task dataclass has no field for
-            # the definitions at all. This re-reads with the include.
-            taskdata = _coerce_taskdata(
-                sdk, f"organizations/{org_id}/tasks/{task_id}", taskdata
-            )
+            # current_task cannot serve here: it was read without `?with=`, so
+            # it carries no form-field definitions. This re-reads with the
+            # include.
+            taskdata = _coerce_taskdata(sdk, org_id, None, task_id, taskdata)
 
             result = sdk.tasks.update_standalone_task(
                 org_id, task_id,
                 title=title if title is not None else current_data.get('title'),
                 summary=summary,
                 deadline=deadline if deadline is not None else current_data.get('deadline'),
-                owners=owners if owners is not None else current_data.get('owners'),
+                owners=owners,
                 taskdata=taskdata,
                 max_assignable=max_assignable,
                 top_secret=top_secret,
@@ -2119,15 +2017,12 @@ CORRECT usage:
                 task_type=task_type,
                 webhook=webhook,
             )
-            content = serialize_task(result) if result else {}
-            # Sibling of update_task (rule 16). Same SDK dataclass, same dropped
-            # `summary` and `top_secret`, same read-back - and the one-off
+            content = _task_content(result)
+            # Sibling of update_task (rule 16). Same read-back, on the one-off
             # ENDPOINT, because the run-scoped path 404s for a task that belongs
             # to no run.
             if _write_needs_read_back(summary=summary, top_secret=top_secret) and content:
-                content.update(_task_after_write(
-                    sdk, f"organizations/{org_id}/tasks/{task_id}", task_id
-                ))
+                content.update(_task_after_write(sdk, org_id, None, task_id))
             if deadline is not None and content:
                 _format_local_deadline(content, deadline, effective_timezone, utc_fallback)
             return ToolResult(content=content, structured_content=None)
@@ -2191,8 +2086,8 @@ CORRECT usage:
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             task = sdk.tasks.get_standalone_task(org_id, task_id)
-            run_id = getattr(task, "run_id", None) if task is not None else None
-            task_type = getattr(task, "task_type", None) if task is not None else None
+            run_id = task.run_id
+            task_type = task.task_type
             forwarded_is_approved = _resolve_forwarded_is_approved(task_type, is_approved)
 
             if run_id:
@@ -2201,13 +2096,13 @@ CORRECT usage:
                 # resolves Task::whereNull('run_id') and would 404. Dispatch to
                 # the run-scoped pair the caller would otherwise have had to
                 # know run_id to reach.
-                response = _complete_task_raw(
-                    sdk, org_id, run_id, task_id,
+                response = sdk.tasks.complete_task(
+                    org_id, run_id, task_id,
                     is_approved=forwarded_is_approved,
                     override_user=override_user,
                 )
                 return ToolResult(
-                    content=_serialize_task_response(response),
+                    content=_task_content(response),
                     structured_content=None
                 )
 
@@ -2217,7 +2112,7 @@ CORRECT usage:
                 override_user=override_user,
             )
             return ToolResult(
-                content=serialize_task(result) if result else {},
+                content=_task_content(result),
                 structured_content=None
             )
 
@@ -2276,20 +2171,20 @@ WRONG usage (will fail or create a misleading audit):
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             task = sdk.tasks.get_standalone_task(org_id, task_id)
-            run_id = getattr(task, "run_id", None) if task is not None else None
+            run_id = task.run_id
 
             if run_id:
-                response = _reopen_task_raw(sdk, org_id, run_id, task_id)
+                response = sdk.tasks.reopen_task(org_id, run_id, task_id)
                 sdk.threads.add_task_comment(org_id, task_id, reason.strip())
                 return ToolResult(
-                    content=_serialize_task_response(response),
+                    content=_task_content(response),
                     structured_content=None
                 )
 
             result = sdk.tasks.reopen_standalone_task(org_id, task_id)
             sdk.threads.add_task_comment(org_id, task_id, reason.strip())
             return ToolResult(
-                content=serialize_task(result) if result else {},
+                content=_task_content(result),
                 structured_content=None
             )
 
@@ -2339,8 +2234,10 @@ CORRECT usage:
         OneOffTasksController::delete, documented "Delete a Task. Cannot be
         undone": OneOffTasksRepository::delete force-deletes the task, its
         form fields and their answers. The SDK's
-        ``tasks.delete_standalone_task`` calls the archive route, so this
-        tool sends the request itself.
+        ``tasks.delete_standalone_task`` is an alias of
+        ``archive_standalone_task`` and calls the archive route; this tool
+        calls ``tasks.permanently_delete_standalone_task``, which calls the
+        permanent one (tallyfy/sdk#149).
 
         The archive route refuses a task with a run_id ("Cannot delete linked
         tasks.") and the permanent route checks nothing of the kind, so the
@@ -2355,14 +2252,14 @@ CORRECT usage:
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             task = sdk.tasks.get_standalone_task(org_id, task_id)
-            run_id = getattr(task, "run_id", None) if task is not None else None
+            run_id = task.run_id
             if run_id:
                 raise ToolError(
                     f"Task {task_id} belongs to process {run_id}, so it was not "
                     "deleted. delete_standalone_task deletes only a standalone "
                     "task that is not part of a process."
                 )
-            sdk._make_request("DELETE", f"organizations/{org_id}/tasks/{task_id}/delete")
+            sdk.tasks.permanently_delete_standalone_task(org_id, task_id)
             return ToolResult(
                 content={"deleted": True, "task_id": task_id},
                 structured_content=None

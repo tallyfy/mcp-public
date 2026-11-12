@@ -6,7 +6,6 @@ Tools for discovering and managing organization folders
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfySDK
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
@@ -20,6 +19,7 @@ from utils.fastmcp_types import (
     GenericList,
     OptionalString,
 )
+from utils.sdk_client import TallyfySDK
 from utils.sdk_serializer import compact_result, serialize_dataclass
 
 # Folders are typed at creation time and the type is immutable afterwards.
@@ -236,18 +236,14 @@ CORRECT usage:
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # The SDK's create_folder() cannot send folder_type (it posts only
-            # name + parent_id), which is why every SDK-created folder came back
-            # as a template folder. Post the body directly instead.
-            endpoint = f"organizations/{org_id}/folders"
-            body = {"name": name, "folder_type": resolved_type}
-            if parent_id is not None:
-                body["parent_id"] = parent_id
-
-            response = sdk._make_request("POST", endpoint, data=body)
-            folder = response.get("data", response) if isinstance(response, dict) else response
+            # folder_type is always sent. api-v2 makes an empty or missing one a
+            # template folder, which is why every folder the SDK created before
+            # it took folder_type came back as one.
+            folder = sdk.folders.create_folder(
+                org_id, name, parent_id=parent_id, folder_type=resolved_type
+            )
             return ToolResult(
-                content=serialize_dataclass(folder) if folder else {},
+                content=serialize_dataclass(folder),
                 structured_content=None
             )
 
@@ -291,7 +287,7 @@ CORRECT usage:
                 parent_id=parent_id,
             )
             return ToolResult(
-                content=serialize_dataclass(folder) if folder else {},
+                content=serialize_dataclass(folder),
                 structured_content=None
             )
 

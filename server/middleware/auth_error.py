@@ -49,6 +49,20 @@ REJECTED_CREDENTIALS_ERROR_DESCRIPTION = (
 # survive untouched even though they too carry no Authorization header.
 MCP_TRANSPORT_PATHS = ("/", "/mcp", "/mcp/")
 
+# The OAuth proxy routes in routes/oauth.py. Each one already answers an error as
+# an RFC 6749 or RFC 7591 JSON object, with no-store headers, built from what the
+# authorization server said. So a 401 or 403 from one of them passes through this
+# middleware untouched (#1690). Before that, it was rewritten here: an upstream
+# invalid_client became invalid_token, with a Bearer challenge for this resource,
+# which told a client whose own authentication had failed that its access token
+# was bad. api-v2 answers a revoked client's refresh with exactly that 401
+# invalid_client since tallyfy/api-v2#11579.
+#
+# tests/unit/server/test_auth_error_middleware.py checks this tuple against every
+# /mcp/oauth/ route routes/oauth.py registers, so a new proxy route cannot be
+# left out of it unnoticed.
+OAUTH_PROXY_PATHS = ("/mcp/oauth/register", "/mcp/oauth/authorize", "/mcp/oauth/token")
+
 
 class AuthErrorMiddleware(BaseHTTPMiddleware):
     """
@@ -79,6 +93,11 @@ class AuthErrorMiddleware(BaseHTTPMiddleware):
 
         # Only process 401 and 403 responses
         if response.status_code not in (401, 403):
+            return response
+
+        # The proxy routes already speak OAuth, and their error is the
+        # authorization server's, so it reaches the client as it was sent (#1690).
+        if request.url.path in OAUTH_PROXY_PATHS:
             return response
 
         # Always transform to ensure a proper JSON body is present.
@@ -145,8 +164,8 @@ class AuthErrorMiddleware(BaseHTTPMiddleware):
         except Exception as e:
             logger.debug(f"Could not read response body: {e}")
 
-        # Every response other than that one keeps the upstream message, so an
-        # OAuth proxy route still surfaces the authorization server's own reason.
+        # Every response other than that one keeps the upstream message. The
+        # OAuth proxy routes never get here: dispatch passes them through above.
         if original is not None and not is_no_credentials_challenge:
             # Use original error description if available
             if "error_description" in original:

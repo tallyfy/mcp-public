@@ -12,16 +12,24 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from tallyfy import TallyfyError, TallyfySDK
+from tallyfy import (
+    TallyfyError,
+    TallyfyPayloadError,
+    TallyfyProbeAcceptedError,
+)
+from tallyfy.models import RecurringJob, RecurringJobType
 
 from constants import DEFAULT_PAGE_SIZE
 from metrics import track_tool_execution
 from utils import query_engine, scheduled_jobs as sj
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
 from utils.fastmcp_errors import (
+    UNREADABLE_ANSWER_ERROR_TYPES,
     _extract_api_message,
+    classify_tool_error,
     classify_upstream_status,
     handle_tallyfy_errors,
+    is_unreadable_answer,
     tag_error_class,
 )
 from utils.fastmcp_types import (
@@ -42,6 +50,7 @@ from utils.guest_assignment import (
 )
 from utils.kickoff_encoding import normalize_keyed_payload
 from utils.pagination import fetch_single_page
+from utils.sdk_client import TallyfySDK
 from utils.sdk_serializer import serialize_dataclass
 
 
@@ -50,43 +59,34 @@ def _is_tallyfy_id(value: str) -> bool:
     return bool(re.fullmatch(r'[0-9a-f]{32}', value.lower()))
 
 
-def _preserved_run_assignment_buckets(run: Dict[str, Any], run_id: str) -> Dict[str, list]:
-    """Return the run's CURRENT users/groups so a PUT does not wipe them.
+def _unread_run_assignee_bucket(exc: Exception) -> Optional[str]:
+    """The bucket ``update_process`` refused to guess, or None for any other error.
 
-    RunService::editRun (app/Services/RunService.php:135) unconditionally calls
+    Why the SDK reads first. RunService::editRun (app/Services/RunService.php:135)
+    unconditionally calls
       saveAssignees(Assignees::newFromArray(Arr::only($data, ['users','groups'])))
     and BaseAssignees::newFromArray (app/Domain/Owners/BaseAssignees.php:24)
     reads ``$data['users'] ?? []``, so an ABSENT key becomes an EMPTY SET, not
     "leave alone". Assignees::modify then calls every current member and group
     "removed" and AssignableTrait::saveAssignees (app/Models/Concerns/
-    AssignableTrait.php:115-124) detaches them. The guarded
-    ``if (isset($data['prerun']))`` one line above at :132 is the tell: prerun
-    is protected from exactly this, assignees are not.
+    AssignableTrait.php:115-124) detaches them. Proven live on production
+    2026-07-21: a run holding {"users":[10013],"groups":["53a4..."]} was PUT
+    with {"name":"renamed"}, returned HTTP 200, and read back
+    {"users":[],"groups":[]}.
 
-    A rename carrying only {name} therefore silently strips every member and
-    group off a RUNNING process. Proven live on production 2026-07-21: a run
-    holding {"users":[10013],"groups":["53a4..."]} was PUT with {"name":"renamed"},
-    returned HTTP 200, and read back {"users":[],"groups":[]}. Worse than the
-    template variant fixed in #624, because people lose access to work already
-    in flight.
-
-    RunTransformer.php:80-81 emits both keys unconditionally via
-    wrappedAssignees(), so a missing or non-list bucket means the READ failed,
-    and sending [] on a failed read is precisely the wipe this guard exists to
-    prevent. Abort instead of guessing. A genuinely empty list is legitimate
-    (nobody is assigned) and passes straight through.
+    SDK 4.0's ``update_process`` reads the process and re-sends both lists
+    with the change. RunTransformer.php:85-86 emits both unconditionally, so a
+    missing one means the read failed, and the SDK raises
+    ``TallyfyUnexpectedResponseError`` with ``missing_fields`` ``["users"]`` or
+    ``["groups"]`` before any PUT is sent (tallyfy/sdk#167). This tool keeps
+    its own refusal wording for that case. Any other unreadable answer, the
+    PUT's own included (``missing_fields`` ``["id"]`` or ``["data"]``), is
+    not this refusal and keeps the handler's re-read hint.
     """
-    buckets: Dict[str, list] = {}
-    for field in ("users", "groups"):
-        value = run.get(field)
-        if not isinstance(value, list):
-            raise ToolError(
-                f"Process {run_id} did not return its current '{field}', so "
-                f"updating it would detach every member and group from a "
-                f"running process. Nothing was sent."
-            )
-        buckets[field] = list(value)
-    return buckets
+    if not UNREADABLE_ANSWER_ERROR_TYPES or not isinstance(exc, UNREADABLE_ANSWER_ERROR_TYPES):
+        return None
+    missing = getattr(exc, "missing_fields", None) or []
+    return next((field for field in missing if field in ("users", "groups")), None)
 
 
 def _resolve_folder_name_to_id(sdk, org_id: str, folder_name: str) -> str:
@@ -126,7 +126,7 @@ OWNERS: Pass numeric user IDs. Filters by collaborator presence (run owner OR ta
 
 ROWS: each process carries at least id, name, checklist_id, checklist_title, status, progress
 (complete, total, percent), started_by, owner_id, starred, started_at, last_updated, due_date
-and extra.type. For everything about one process, call get_process. with_data or
+and type. For everything about one process, call get_process. with_data or
 form_fields_values returns the full records with what they name.
 
 PAGINATION: Returns 20 results per page. Use page=2, page=3, etc. to retrieve subsequent pages.
@@ -523,33 +523,23 @@ REQUIRED: 'run_id' plus at least one of: 'name', 'summary', or 'starred'.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # READ-MODIFY-WRITE, done here rather than via the SDK. The SDK's
-            # tasks.update_process() (tallyfy/task_management/creation.py:327-335)
-            # builds a body of ONLY {name, summary, starred} and has no parameter
-            # that could carry users/groups, while RunService::editRun detaches
-            # both on any payload that omits them. See
-            # _preserved_run_assignment_buckets for the full trace. Reading the
-            # run back and re-sending the current sets makes the diff empty, so
-            # saveAssignees returns before touching the pivot tables.
-            endpoint = f"organizations/{org_id}/runs/{run_id}"
-            current = sdk._make_request("GET", endpoint)
-            run = current.get("data", current) if isinstance(current, dict) else {}
-
-            payload: Dict[str, Any] = {}
-            if name is not None:
-                payload["name"] = name
-            if summary is not None:
-                payload["summary"] = summary
-            if starred is not None:
-                payload["starred"] = starred
-            payload.update(_preserved_run_assignment_buckets(run, run_id))
-
-            response = sdk._make_request("PUT", endpoint, data=payload)
-            result = response.get("data", response) if isinstance(response, dict) else response
-            return ToolResult(
-                content=serialize_dataclass(result) if result else {},
-                structured_content=None
-            )
+            # The SDK reads the process and re-sends its current users and
+            # groups with the change, so the update detaches nobody; see
+            # _unread_run_assignee_bucket.
+            try:
+                result = sdk.tasks.update_process(
+                    org_id, run_id, name=name, summary=summary, starred=starred
+                )
+            except TallyfyError as exc:
+                bucket = _unread_run_assignee_bucket(exc)
+                if bucket is None:
+                    raise
+                raise ToolError(
+                    f"Process {run_id} did not return its current '{bucket}', so "
+                    f"updating it would detach every member and group from a "
+                    f"running process. Nothing was sent."
+                ) from exc
+            return ToolResult(content=serialize_dataclass(result), structured_content=None)
 
     @mcp.tool(
         name="archive_process",
@@ -664,13 +654,11 @@ REQUIRED: 'run_id' plus at least one of: 'name', 'summary', or 'starred'.""",
 # ---------------------------------------------------------------------------
 # Scheduled jobs: launching a template on a schedule (tallyfy/mcp#1603)
 #
-# HOTFIX EXCEPTION to "Tools reach the Tallyfy API ONLY through public SDK
-# methods" (root CLAUDE.md, "Tool Registration", #1545). The SDK has no method
-# for api-v2's recurring-jobs routes, which is tallyfy/sdk#199, and a customer
-# was told on 2026-10-06 and 2026-10-12 that Claude can schedule his launches.
-# Every direct call below goes through _scheduled_job_request, the one place to
-# replace when tallyfy/sdk#199 ships. Nothing else in this module calls
-# _make_request for scheduled jobs.
+# Every api-v2 call below is a public SDK 4.0 method on sdk.recurring_jobs
+# (tallyfy/sdk#199, tallyfy/mcp#1545), and every job read is a typed
+# RecurringJob. A failure is a TallyfyError with api-v2's status_code and its
+# parsed body in response_data; a 2xx the SDK cannot read as a job is a
+# TallyfyUnexpectedResponseError (is_unreadable_answer).
 # ---------------------------------------------------------------------------
 
 # A job's id is core.recurring_jobs.id, a bigint, and the routes carry
@@ -704,41 +692,22 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _scheduled_job_request(sdk, method: str, path: str, *, params=None, data=None):
-    """The one direct api-v2 call the scheduled job tools make. Remove with tallyfy/sdk#199."""
-    return sdk._make_request(method, path, params=params, data=data)
+def _job_types(sdk, org_id: str) -> List[RecurringJobType]:
+    return sdk.recurring_jobs.get_recurring_job_types(org_id)
 
 
-def _jobs_path(org_id: str, job_id: Optional[int] = None, suffix: str = "") -> str:
-    path = f"organizations/{org_id}/recurring-jobs"
-    if job_id is not None:
-        path += f"/{int(job_id)}"
-    return path + suffix
-
-
-def _unwrap_data(response: Any) -> Any:
-    if isinstance(response, dict) and "data" in response:
-        return response["data"]
-    return response
-
-
-def _job_types(sdk, org_id: str) -> List[Dict[str, Any]]:
-    rows = _unwrap_data(_scheduled_job_request(sdk, "GET", f"organizations/{org_id}/recurring-job-types"))
-    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
-
-
-def _job_keys_by_id(types: List[Dict[str, Any]]) -> Dict[int, str]:
-    """{type id: job_key}. The id comes back as a string here and an integer on a job."""
+def _job_keys_by_id(types: List[RecurringJobType]) -> Dict[int, str]:
+    """{type id: job_key}. The id is a string on a type and an integer on a job."""
     keys: Dict[int, str] = {}
-    for row in types:
+    for job_type in types:
         try:
-            keys[int(row.get("id"))] = str(row.get("job_key"))
+            keys[int(job_type.id)] = str(job_type.job_key)
         except (TypeError, ValueError):
             continue
     return keys
 
 
-def _launch_type_id(types: List[Dict[str, Any]]) -> int:
+def _launch_type_id(types: List[RecurringJobType]) -> int:
     """The launch-process type's id, found by job_key because the ids differ by
     environment: read 2026-10-14, production "2" and staging "3"."""
     for job_id, key in _job_keys_by_id(types).items():
@@ -751,66 +720,85 @@ def _launch_type_id(types: List[Dict[str, Any]]) -> int:
 
 
 def _org_timezone(sdk, org_id: str) -> Optional[str]:
-    organization = sdk.organizations.get_organization(org_id)
-    zone = getattr(organization, "timezone", None) if organization is not None else None
+    """The organization's zone, or None when it has none set. An organization read
+    the SDK cannot read raises (TallyfyUnexpectedResponseError) rather than being
+    taken for one with no zone, which would show every time in UTC."""
+    zone = sdk.organizations.get_organization(org_id).timezone
     return zone.strip() if isinstance(zone, str) and zone.strip() else None
 
 
 def _schedule_reading(sdk, org_id: str) -> str:
     """Which clock this API reads start_date and start_time on (utils/scheduled_jobs.py).
 
-    First from any job the caller can see, which costs one read. Only when there
-    is none, from a create that can never be saved: it has no `name`, which both
-    readings require, so both answer 422 before anything is written. Anything
-    else is refused rather than guessed, because a guess moves every run by the
-    organization's UTC offset and nothing errors.
+    First from any job the caller can see, which costs one read: the SDK keeps
+    whether api-v2 sent next_occurrence (next_occurrence_sent). Only when there is
+    none, from the SDK's supports_days_of_week, a create that can never be saved:
+    it has no `name`, which both readings require, so both answer 422 before
+    anything is written. Anything else is refused rather than guessed, because a
+    guess moves every run by the organization's UTC offset and nothing errors.
     """
-    rows = _unwrap_data(_scheduled_job_request(sdk, "GET", _jobs_path(org_id), params={"per_page": 1}))
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict) and "schedule" in rows[0]:
-        return sj.reading_from_job(rows[0])
+    listed = sdk.recurring_jobs.get_recurring_jobs(org_id, page=1, per_page=1)
+    first = listed.data[0] if listed.data else None
+    # next_occurrence_sent is None only on an object no response built: unknown.
+    if first is not None and first.schedule is not None and first.next_occurrence_sent is not None:
+        return sj.reading_from_job(first)
     try:
-        _scheduled_job_request(sdk, "POST", _jobs_path(org_id), data=sj.READING_PROBE_BODY)
+        supported = sdk.recurring_jobs.supports_days_of_week(org_id)
+    except TallyfyProbeAcceptedError as exc:
+        # api-v2 answered the no-name create with a 2xx: a job may have been saved.
+        # An upstream fault, classed as handle_tallyfy_errors classes this error.
+        raise tag_error_class(
+            ToolError(
+                "Tallyfy accepted a scheduled job request that has no name, which it should "
+                "always refuse, so nothing was scheduled. Check get_scheduled_jobs for a job "
+                "with no name and delete it."
+            ),
+            classify_tool_error(exc, None),
+        ) from exc
     except TallyfyError as exc:
-        body = getattr(exc, "response_data", None)
-        errors = body.get("errors") if isinstance(body, dict) else None
-        reading = sj.reading_from_probe_errors(errors) if getattr(exc, "status_code", None) == 422 else None
-        if reading is not None:
-            return reading
         raise ToolError(
             "Could not tell whether this Tallyfy server reads schedule times in UTC or in "
             "the organization's time zone, so nothing was scheduled. "
             f"Tallyfy answered: {exc}"
         ) from exc
-    raise ToolError(
-        "Tallyfy accepted a scheduled job request that has no name, which it should "
-        "always refuse, so nothing was scheduled. Check get_scheduled_jobs for a job "
-        "with no name and delete it."
-    )
+    return sj.READING_ORGANIZATION if supported else sj.READING_UTC
 
 
-def _read_job(sdk, org_id: str, job_id: int) -> Dict[str, Any]:
-    job = _unwrap_data(_scheduled_job_request(sdk, "GET", _jobs_path(org_id, job_id)))
-    if not isinstance(job, dict) or "id" not in job:
-        raise ToolError(f"Scheduled job {job_id} did not come back as a job, so nothing was changed.")
-    return job
-
-
-def _put_status(sdk, org_id: str, job: Dict[str, Any], status: str) -> Dict[str, Any]:
+def _read_job(sdk, org_id: str, job_id: int) -> RecurringJob:
     try:
-        body = sj.update_body_from_job(job, status)
-    except sj.ScheduleInputError as exc:
-        raise ToolError(str(exc)) from exc
-    saved = _unwrap_data(_scheduled_job_request(sdk, "PUT", _jobs_path(org_id, job["id"]), data=body))
-    if not isinstance(saved, dict) or saved.get("status") != status:
-        got = saved.get("status") if isinstance(saved, dict) else None
+        return sdk.recurring_jobs.get_recurring_job(org_id, job_id)
+    except TallyfyError as exc:
+        if is_unreadable_answer(exc):
+            raise ToolError(
+                f"Scheduled job {job_id} did not come back as a job, so nothing was changed."
+            ) from exc
+        raise
+
+
+def _put_status(sdk, org_id: str, job: RecurringJob, status: str) -> RecurringJob:
+    """Send the job back as read with a new status (the SDK's set_recurring_job_status)."""
+    saved: Optional[RecurringJob]
+    try:
+        saved = sdk.recurring_jobs.set_recurring_job_status(org_id, job, status)
+    except TallyfyPayloadError as exc:
+        # Refused before sending: the job read back lacks a key the PUT requires.
         raise ToolError(
-            f"Tallyfy answered the change but scheduled job {job['id']} reads back with "
+            f"Scheduled job {job.id} did not come back whole, so it was not changed: {exc}"
+        ) from exc
+    except TallyfyError as exc:
+        if not is_unreadable_answer(exc):
+            raise
+        saved = None
+    if saved is None or saved.status != status:
+        got = saved.status if saved is not None else None
+        raise ToolError(
+            f"Tallyfy answered the change but scheduled job {job.id} reads back with "
             f"status {got!r}, not {status!r}. Read it with get_scheduled_job."
         )
     return saved
 
 
-def _read_job_to_change(sdk, org_id: str, job_id: int) -> Dict[str, Any]:
+def _read_job_to_change(sdk, org_id: str, job_id: int) -> RecurringJob:
     """Read a job before changing it, answering a missing one in plain words."""
     try:
         return _read_job(sdk, org_id, job_id)
@@ -833,7 +821,8 @@ def _member_by_email(sdk, org_id: str, email: str) -> Dict[str, Any]:
     never in this list, and a guest cannot own a scheduled job, so an email that
     matches no member is refused here, before anything is sent.
     """
-    users = getattr(sdk.users.get_organization_users_list(org_id), "data", None) or []
+    # An unreadable list raises in the SDK, so an empty one really has no members.
+    users = sdk.users.get_organization_users_list(org_id).data
     wanted = email.strip().lower()
     for user in users:
         if (getattr(user, "email", None) or "").strip().lower() == wanted:
@@ -849,7 +838,8 @@ def _member_by_email(sdk, org_id: str, email: str) -> Dict[str, Any]:
 
 
 def _owner_change_refusal(exc: TallyfyError, job_id: int, new_owner: str, current: str) -> BaseException:
-    """What to raise when api-v2 refuses PUT recurring-jobs/{id}/owner.
+    """What to raise when api-v2 refuses PUT recurring-jobs/{id}/owner
+    (sdk.recurring_jobs.change_recurring_job_owner).
 
     403, 422 and the two 404s get their own words. Anything else, a 401
     included, goes back to handle_tallyfy_errors as it came, so the
@@ -933,13 +923,13 @@ Give every time to schedule_process_launch in the organization's local time, the
             content={
                 "job_types": [
                     {
-                        "id": row.get("id"),
-                        "job_key": row.get("job_key"),
-                        "name": row.get("name"),
-                        "description": row.get("description"),
-                        "validations": row.get("validations"),
+                        "id": job_type.id,
+                        "job_key": job_type.job_key,
+                        "name": job_type.name,
+                        "description": job_type.description,
+                        "validations": job_type.validations,
                     }
-                    for row in types
+                    for job_type in types
                 ],
                 "organization_time_zone": zone,
                 "note": (
@@ -984,24 +974,18 @@ PAGINATION: 25 jobs per page. Use page=2, page=3 and so on; meta.total_pages say
         Returns:
             {"data": [job], "meta": {total, count, current_page, total_pages}}
         """
-        params: Dict[str, Any] = {"page": page or 1, "per_page": _JOBS_PER_PAGE}
-        if mine:
-            params["created_by"] = "me"
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            response = _scheduled_job_request(sdk, "GET", _jobs_path(org_id), params=params)
+            listed = sdk.recurring_jobs.get_recurring_jobs(
+                org_id, page=page or 1, per_page=_JOBS_PER_PAGE, created_by="me" if mine else None
+            )
             keys = _job_keys_by_id(_job_types(sdk, org_id))
             zone = _org_timezone(sdk, org_id)
-        rows = _unwrap_data(response)
-        rows = rows if isinstance(rows, list) else []
-        pagination = {}
-        if isinstance(response, dict):
-            pagination = ((response.get("meta") or {}).get("pagination") or {})
         return ToolResult(
             content={
-                "data": [sj.describe_job(row, tz_name=zone, job_keys=keys) for row in rows if isinstance(row, dict)],
+                "data": [sj.describe_job(job, tz_name=zone, job_keys=keys) for job in listed.data],
                 "meta": {
-                    key: pagination.get(key)
+                    key: getattr(listed.meta, key)
                     for key in ("total", "count", "current_page", "total_pages")
                 },
             },
@@ -1042,12 +1026,10 @@ A job the caller may not see answers not found, the same as a job that does not 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             job = _read_job(sdk, org_id, job_id)
-            history = _unwrap_data(
-                _scheduled_job_request(sdk, "GET", _jobs_path(org_id, job_id, "/history"))
-            )
+            history = sdk.recurring_jobs.get_recurring_job_history(org_id, job_id)
             keys = _job_keys_by_id(_job_types(sdk, org_id))
             zone = _org_timezone(sdk, org_id)
-        runs = [row for row in history if isinstance(row, dict)] if isinstance(history, list) else []
+        runs = [sj.history_row(run) for run in history]
         runs.sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
         described = sj.describe_job(job, tz_name=zone, job_keys=keys)
         described["history"] = runs[:_HISTORY_SHOWN]
@@ -1206,31 +1188,29 @@ WRONG:
                     ),
                 )
 
-            body: Dict[str, Any] = {
-                "name": label,
-                "start_date": plan.start_date,
-                "recurring_job_type_id": type_id,
-                "schedule": plan.schedule,
-                "data": data,
-            }
-            if note is not None:
-                body["description"] = note
-            if plan.end_date is not None:
-                body["end_date"] = plan.end_date
-            if plan.max_occurrences is not None:
-                body["max_occurrences"] = plan.max_occurrences
-
-            job = _unwrap_data(_scheduled_job_request(sdk, "POST", _jobs_path(org_id), data=body))
+            try:
+                job = sdk.recurring_jobs.create_recurring_job(
+                    org_id,
+                    name=label,
+                    start_date=plan.start_date,
+                    recurring_job_type_id=type_id,
+                    schedule=plan.schedule,
+                    data=data,
+                    description=note,
+                    end_date=plan.end_date,
+                    max_occurrences=plan.max_occurrences,
+                )
+            except TallyfyError as exc:
+                if is_unreadable_answer(exc):
+                    raise ToolError(
+                        "Tallyfy answered the request but returned no job. Check get_scheduled_jobs "
+                        "before scheduling again, so the launch is not scheduled twice."
+                    ) from exc
+                raise
         keys = _job_keys_by_id(types)
 
-        if not isinstance(job, dict) or "id" not in job:
-            raise ToolError(
-                "Tallyfy answered the request but returned no job. Check get_scheduled_jobs "
-                "before scheduling again, so the launch is not scheduled twice."
-            )
-
         warnings: List[str] = []
-        stored = job.get("data") if isinstance(job.get("data"), dict) else {}
+        stored = job.data if isinstance(job.data, dict) else {}
         if stored.get("name") != name:
             warnings.append(
                 f"The job stored the process name {stored.get('name')!r}, not {name!r}."
@@ -1239,11 +1219,11 @@ WRONG:
             warnings.append(
                 f"The job stored template {stored.get('checklist_id')!r}, not {template_id!r}."
             )
-        if repeat == "once" and "next_occurrence" in job:
-            if sj.same_minute(job.get("next_occurrence"), plan.first_run_local) is False:
+        if repeat == "once" and job.next_occurrence_sent:
+            if sj.same_minute(job.next_occurrence, plan.first_run_local) is False:
                 warnings.append(
                     "Tallyfy's next run is not the time asked for: "
-                    f"{sj.local_string(job.get('next_occurrence'), zone)} against "
+                    f"{sj.local_string(job.next_occurrence, zone)} against "
                     f"{plan.first_run_local.strftime('%Y-%m-%d %H:%M')} ({plan.zone_name})."
                 )
 
@@ -1278,7 +1258,7 @@ Returns the job as Tallyfy stored it, with status paused and no next run.""",
     def pause_scheduled_job(job_id: ScheduledJobId) -> GenericDict:
         """
         Pause a scheduled job. PUT takes the whole job, so it is read first and
-        sent back as stored with status paused.
+        sent back as stored with status paused (set_recurring_job_status).
 
         Args:
             job_id: Scheduled job ID (a whole number).
@@ -1289,7 +1269,7 @@ Returns the job as Tallyfy stored it, with status paused and no next run.""",
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             job = _read_job(sdk, org_id, job_id)
-            status = job.get("status")
+            status = job.status
             if status == "completed":
                 raise ToolError(sj.FINISHED_MESSAGE)
             changed = status != "paused"
@@ -1335,7 +1315,7 @@ Returns the job as Tallyfy stored it, with its next run where Tallyfy reports it
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             job = _read_job(sdk, org_id, job_id)
-            status = job.get("status")
+            status = job.status
             if status == "completed":
                 raise ToolError(sj.FINISHED_MESSAGE)
             changed = status != "active"
@@ -1345,7 +1325,7 @@ Returns the job as Tallyfy stored it, with its next run where Tallyfy reports it
                 except TallyfyError as exc:
                     body = getattr(exc, "response_data", None)
                     errors = body.get("errors") if isinstance(body, dict) else None
-                    one_time = job.get("max_occurrences") == 1
+                    one_time = job.max_occurrences == 1
                     if (
                         getattr(exc, "status_code", None) == 422
                         and one_time
@@ -1395,7 +1375,8 @@ When Tallyfy refuses, the reply says why and nothing changes: only admins may do
     def change_scheduled_job_owner(job_id: ScheduledJobId, new_owner: ScheduledJobNewOwner) -> GenericDict:
         """
         Change who a scheduled job runs as, through api-v2#11639's
-        PUT recurring-jobs/{id}/owner, then read the job back.
+        PUT recurring-jobs/{id}/owner (change_recurring_job_owner), then read
+        the job back.
 
         Args:
             job_id: Scheduled job ID (a whole number).
@@ -1426,29 +1407,30 @@ When Tallyfy refuses, the reply says why and nothing changes: only admins may do
             wanted = sj.owner_label(member) if member else f"user {user_id}"
 
             try:
-                _scheduled_job_request(
-                    sdk, "PUT", _jobs_path(org_id, job_id, "/owner"), data={"user_id": user_id}
-                )
+                sdk.recurring_jobs.change_recurring_job_owner(org_id, job_id, user_id)
             except TallyfyError as exc:
-                refusal = _owner_change_refusal(exc, job_id, wanted, sj.owner_label(previous))
-                if refusal is exc:
-                    raise
-                raise refusal from exc
+                # A 2xx whose body is not a job still changed the owner; the read
+                # below is the evidence either way.
+                if not is_unreadable_answer(exc):
+                    refusal = _owner_change_refusal(exc, job_id, wanted, sj.owner_label(previous))
+                    if refusal is exc:
+                        raise
+                    raise refusal from exc
 
             # Round trip: the owner is reported from a fresh read, never from the
             # PUT's own answer (root CLAUDE.md, rule 12).
             try:
-                saved = _unwrap_data(_scheduled_job_request(sdk, "GET", _jobs_path(org_id, job_id)))
+                saved = sdk.recurring_jobs.get_recurring_job(org_id, job_id)
             except TallyfyError as exc:
+                if is_unreadable_answer(exc):
+                    raise ToolError(
+                        f"Tallyfy answered the owner change, but scheduled job {job_id} did not read "
+                        "back as a job, so the new owner is not confirmed. Read it with get_scheduled_job."
+                    ) from exc
                 raise ToolError(
                     f"Tallyfy answered the owner change, but reading scheduled job {job_id} "
                     f"back failed, so the new owner is not confirmed: {_extract_api_message(exc)}"
                 ) from exc
-            if not isinstance(saved, dict) or "id" not in saved:
-                raise ToolError(
-                    f"Tallyfy answered the owner change, but scheduled job {job_id} did not read "
-                    "back as a job, so the new owner is not confirmed. Read it with get_scheduled_job."
-                )
 
         owner = sj.job_owner(saved)
         if owner is None or not sj.same_user(owner.get("id"), user_id):
@@ -1510,25 +1492,37 @@ To stop a job for a while instead, use pause_scheduled_job.""",
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            removed = _unwrap_data(_scheduled_job_request(sdk, "DELETE", _jobs_path(org_id, job_id)))
+            removed: Optional[RecurringJob]
             try:
-                _scheduled_job_request(sdk, "GET", _jobs_path(org_id, job_id))
+                removed = sdk.recurring_jobs.delete_recurring_job(org_id, job_id)
             except TallyfyError as exc:
+                # A 2xx whose body is not a job: the read-back below decides.
+                if not is_unreadable_answer(exc):
+                    raise
+                removed = None
+            # Gone only on a 404. A 2xx, even one whose body is not a job, means
+            # something still answers for it.
+            still_there = (
+                f"Tallyfy answered the delete, but scheduled job {job_id} still reads back. "
+                "Read it with get_scheduled_job before trying again."
+            )
+            try:
+                sdk.recurring_jobs.get_recurring_job(org_id, job_id)
+            except TallyfyError as exc:
+                if is_unreadable_answer(exc):
+                    raise ToolError(still_there) from exc
                 if getattr(exc, "status_code", None) != 404:
                     raise ToolError(
                         f"Tallyfy answered the delete, but reading scheduled job {job_id} back "
                         f"failed, so whether it is gone is not known: {exc}"
                     ) from exc
             else:
-                raise ToolError(
-                    f"Tallyfy answered the delete, but scheduled job {job_id} still reads back. "
-                    "Read it with get_scheduled_job before trying again."
-                )
+                raise ToolError(still_there)
         return ToolResult(
             content={
                 "deleted": True,
                 "job_id": job_id,
-                "name": removed.get("name") if isinstance(removed, dict) else None,
+                "name": removed.name if removed is not None else None,
             },
             structured_content=None
         )

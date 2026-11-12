@@ -440,8 +440,8 @@ OptionalBool = Annotated[Optional[bool], Field()]
 # `top_secret` was an OptionalBool, which publishes the schema entry "Optional
 # boolean parameter" and says nothing at all. #585 asked for two things: that the
 # written value be readable back, and that the flag have a documented purpose.
-# The read half is done (`_task_after_write` echoes it, and TaskTransformer emits
-# it on every task read); this is the half a read path cannot fix, because a model
+# The read half is done (the update answer echoes it, SDK 4.0's Task types it, and
+# TaskTransformer emits it on every task read); this is the half a read path cannot fix, because a model
 # handed a bare boolean has no way to know what setting it does.
 #
 # The behaviour is read from api-v2 `app/Scopes/SecretTaskScope.php`, not from a

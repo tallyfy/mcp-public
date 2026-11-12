@@ -215,14 +215,14 @@ def classify_upstream_status(status: Any) -> str:
 # table lists it beside the payload errors, and a future reader widening this
 # to "the SDK errors with no status" would silence an outage.
 #
-# THE IMPORT IS DEFENSIVE ON PURPOSE. The pin is an exact `tallyfy==1.3.12` in
-# every install path, and `tallyfy/payload.py` does not exist at that tag
-# (verified: `git cat-file -e v1.3.12:tallyfy/payload.py` fails, while the same
-# path resolves on origin/main). A plain `from tallyfy import
-# TallyfyPayloadError` would therefore fail at import time and take the server
-# down today, to guard against something the pinned SDK cannot yet raise. With
-# the class absent the tuple is empty, `isinstance(x, ())` is False, and this
-# whole path is inert -- which is correct, because nothing can produce one.
+# THE IMPORT IS DEFENSIVE ON PURPOSE. It was written when the pin was an exact
+# `tallyfy==1.3.12` in every install path, and `tallyfy/payload.py` does not
+# exist at that tag (verified: `git cat-file -e v1.3.12:tallyfy/payload.py`
+# fails). A plain `from tallyfy import TallyfyPayloadError` would then have
+# failed at import time and taken the server down. With the class absent the
+# tuple is empty, `isinstance(x, ())` is False, and this whole path is inert.
+# The pin is `tallyfy==4.0.0` now (tallyfy/mcp#1545), which has the class, so
+# the path is live; the import stays defensive for an older SDK.
 try:  # pragma: no cover - exercised by whichever SDK version is installed
     from tallyfy import TallyfyPayloadError as _TallyfyPayloadError
 except ImportError:  # SDK older than the payload-error family (<= 1.3.12)
@@ -249,6 +249,163 @@ def is_preflight_payload_error(error: BaseException) -> bool:
     return isinstance(error, PREFLIGHT_PAYLOAD_ERROR_TYPES)
 
 
+# ===========================================================================
+# SDK 4.0's typed answers: answered, but not found / unreadable / ambiguous
+# ===========================================================================
+#
+# Until SDK 4.0 the SDK raised a bare `TallyfyError` with `status_code` None
+# for three things that are not an outage, and this module read every one as
+# `upstream_unavailable` at ERROR, because an exhausted transport has the same
+# shape. SDK 4.0 (tallyfy/sdk PR #267, CHANGELOG "a not-found or unreadable
+# answer is no longer a bare TallyfyError") gives each its own class. Each is
+# recognised here by TYPE, never by message or by the absent status, for the
+# same reason as the payload errors above:
+#
+#   TallyfyNotFoundError (status 404). api-v2 answered and the thing is not
+#     there (a field not on its step, a step not in its template, no template
+#     or process by that name). Its status is already 404, so the status path
+#     classifies it `not_found` and logs it at WARNING; the type test is a
+#     backstop should a future SDK raise one without the status.
+#   TallyfyAmbiguousMatchError (no status). A by-name lookup found several
+#     candidates and none matched exactly. api-v2 answered normally; the
+#     caller's name did not pick one thing, so it is `bad_request` (the
+#     client's own input, as for a missing org id) and logs at WARNING.
+#   TallyfyUnexpectedResponseError (no status). api-v2 answered 2xx with a body
+#     the SDK cannot read. Tallyfy is reachable, so it is not
+#     `upstream_unavailable`, but api-v2 broke the shape its transformer always
+#     sends, which is an upstream fault: `upstream_error`, still at ERROR, so
+#     contract drift keeps paging.
+#   TallyfyCreatedButUnreadError (status usually None). A create landed and its
+#     result could not be read back. Same reasoning: `upstream_error`, ERROR.
+#   TallyfyProbeAcceptedError (no status). api-v2 answered 2xx to a body it
+#     must always refuse: RecurringJobManager.supports_days_of_week posts a
+#     scheduled job with no name, and a 2xx means one may have been saved.
+#     Tallyfy is reachable and broke its own contract: `upstream_error`, ERROR.
+#
+# The unreadable kinds carry a hint, because after a write the 2xx means
+# api-v2 applied it: a retry could do it twice (`side_effect_possible` is True
+# on the created-but-unread and probe-accepted errors).
+#
+# The imports are defensive like `TallyfyPayloadError`'s. The pin is
+# `tallyfy==4.0.0`, which has all five, so every path below is live; on an SDK
+# older than 4.0 each tuple would be empty and nothing would change.
+try:  # pragma: no cover - exercised by whichever SDK version is installed
+    from tallyfy import TallyfyNotFoundError as _TallyfyNotFoundError
+except ImportError:  # SDK older than 4.0
+    _TallyfyNotFoundError = None
+try:  # pragma: no cover
+    from tallyfy import TallyfyAmbiguousMatchError as _TallyfyAmbiguousMatchError
+except ImportError:  # SDK older than 4.0
+    _TallyfyAmbiguousMatchError = None
+try:  # pragma: no cover
+    from tallyfy import (
+        TallyfyUnexpectedResponseError as _TallyfyUnexpectedResponseError,
+    )
+except ImportError:  # SDK older than 4.0
+    _TallyfyUnexpectedResponseError = None
+try:  # pragma: no cover
+    from tallyfy import TallyfyCreatedButUnreadError as _TallyfyCreatedButUnreadError
+except ImportError:  # SDK older than 4.0
+    _TallyfyCreatedButUnreadError = None
+try:  # pragma: no cover
+    from tallyfy import TallyfyProbeAcceptedError as _TallyfyProbeAcceptedError
+except ImportError:  # SDK older than 4.0
+    _TallyfyProbeAcceptedError = None
+
+
+def _present(*types: Any) -> tuple:
+    return tuple(t for t in types if t is not None)
+
+
+#: Module-level, like PREFLIGHT_PAYLOAD_ERROR_TYPES, so a test can substitute a
+#: stand-in on an SDK without the class, and the predicates read them at call time.
+NOT_FOUND_ERROR_TYPES: tuple = _present(_TallyfyNotFoundError)
+AMBIGUOUS_MATCH_ERROR_TYPES: tuple = _present(_TallyfyAmbiguousMatchError)
+UNREADABLE_ANSWER_ERROR_TYPES: tuple = _present(_TallyfyUnexpectedResponseError)
+CREATED_BUT_UNREAD_ERROR_TYPES: tuple = _present(_TallyfyCreatedButUnreadError)
+PROBE_ACCEPTED_ERROR_TYPES: tuple = _present(_TallyfyProbeAcceptedError)
+
+
+def is_answered_not_found(error: BaseException) -> bool:
+    """True for the SDK's ``TallyfyNotFoundError``: api-v2 answered, it is not there."""
+    return isinstance(error, NOT_FOUND_ERROR_TYPES)
+
+
+def is_ambiguous_match(error: BaseException) -> bool:
+    """True for the SDK's ``TallyfyAmbiguousMatchError``: the name matched several."""
+    return isinstance(error, AMBIGUOUS_MATCH_ERROR_TYPES)
+
+
+def is_unreadable_answer(error: BaseException) -> bool:
+    """True when api-v2 answered 2xx and the SDK could not read the answer:
+    ``TallyfyUnexpectedResponseError`` or ``TallyfyCreatedButUnreadError``."""
+    return isinstance(error, UNREADABLE_ANSWER_ERROR_TYPES + CREATED_BUT_UNREAD_ERROR_TYPES)
+
+
+def is_probe_accepted(error: BaseException) -> bool:
+    """True for the SDK's ``TallyfyProbeAcceptedError``: api-v2 answered 2xx to a
+    body it must always refuse, so something may have been saved. Kept apart
+    from ``is_unreadable_answer``, whose callers read a 2xx with no record."""
+    return isinstance(error, PROBE_ACCEPTED_ERROR_TYPES)
+
+
+def _unreadable_answer_hint(error: BaseException) -> str:
+    """What the caller should do after an unreadable answer, or '' otherwise."""
+    if isinstance(error, PROBE_ACCEPTED_ERROR_TYPES):
+        return (
+            " Tallyfy accepted a request it should have refused, so something may"
+            " have been saved: check before trying again."
+        )
+    if isinstance(error, CREATED_BUT_UNREAD_ERROR_TYPES):
+        return (
+            " The create was applied: do not repeat it, or it is made twice."
+            " Read the result back instead."
+        )
+    if isinstance(error, UNREADABLE_ANSWER_ERROR_TYPES):
+        return (
+            " Tallyfy answered, in a shape this server could not read. If this"
+            " was a change, it may have been applied: read it back before"
+            " trying again."
+        )
+    return ""
+
+
+# The sentences SDK 3.x raised as a bare, status-less TallyfyError for a name
+# that matched nothing or several things (`search_management/operations.py`,
+# tallyfy 3.2.1:382-386 and 430-434). SDK 4.0 raises the same sentences as
+# TallyfyNotFoundError / TallyfyAmbiguousMatchError, so the prefixes are only
+# read for an error that has no type to read.
+_LEGACY_NAME_MISS_PREFIXES = (
+    ("No template found matching name: ", ERROR_CLASS_NOT_FOUND),
+    ("No process found matching name: ", ERROR_CLASS_NOT_FOUND),
+    ("Multiple templates found matching ", ERROR_CLASS_BAD_REQUEST),
+    ("Multiple processes found matching ", ERROR_CLASS_BAD_REQUEST),
+)
+
+
+def name_lookup_miss_class(error: BaseException) -> Optional[str]:
+    """The error class when a by-name lookup found nothing or several, else None.
+
+    For ``search_templates_by_name`` / ``search_processes_by_name``. A miss or
+    an ambiguity is a normal answer to a name the caller gave, so the caller
+    turns it into a ToolError naming the next step (#1080). Anything else, an
+    outage, a 401, an unreadable search answer, returns None and must be
+    re-raised for ``handle_tallyfy_errors`` to classify and log: until SDK 4.0
+    every TallyfyError from these calls was reworded as the caller's mistake.
+    """
+    if is_ambiguous_match(error):
+        return ERROR_CLASS_BAD_REQUEST
+    if is_answered_not_found(error):
+        return ERROR_CLASS_NOT_FOUND
+    if type(error) is not TallyfyError or getattr(error, "status_code", None) is not None:
+        return None
+    message = str(error)
+    for prefix, error_class in _LEGACY_NAME_MISS_PREFIXES:
+        if message.startswith(prefix):
+            return error_class
+    return None
+
+
 def classify_tool_error(error: BaseException, status: Any) -> str:
     """Error-class label for a failed tool call, status or no status.
 
@@ -256,10 +413,18 @@ def classify_tool_error(error: BaseException, status: Any) -> str:
     correctly maps "no status" to `upstream_unavailable` because that is what an
     exhausted transport looks like. Applying that to a caller's bad field name
     would count a model's typo as evidence that Tallyfy is down, so the type
-    test runs first and only then does the status decide.
+    tests run first and only then does the status decide. The same holds for
+    SDK 4.0's ambiguous, unreadable, probe-accepted and not-found answers (block
+    comment above).
     """
     if is_preflight_payload_error(error):
         return ERROR_CLASS_PAYLOAD_REJECTED
+    if is_ambiguous_match(error):
+        return ERROR_CLASS_BAD_REQUEST
+    if is_unreadable_answer(error) or is_probe_accepted(error):
+        return ERROR_CLASS_UPSTREAM_ERROR
+    if is_answered_not_found(error):
+        return ERROR_CLASS_NOT_FOUND
     return classify_upstream_status(status)
 
 
@@ -297,15 +462,19 @@ def step_not_in_template(
     another template paged us: Sentry MCP-SERVER-68, a Cursor client on
     2026-09-27.
 
+    SDK 4.0 raises the same sentence as ``TallyfyNotFoundError``, status 404
+    (``template_management/analysis.py``, tallyfy/sdk PR #267), so both shapes
+    are recognised: no status (3.x) or 404 (4.0).
+
     The match is EQUALITY with the exact sentence the SDK builds from the two
-    ids this server passed, and only when there is no status. A transport
+    ids this server passed, and only with no status or 404. A transport
     failure also has no status and must keep logging at ERROR (see
     EXPECTED_UPSTREAM_STATUSES), and no message of that kind can equal this
     sentence, so nothing else is reclassified.
     """
     if not isinstance(error, TallyfyError):
         return None
-    if getattr(error, "status_code", None) is not None:
+    if getattr(error, "status_code", None) not in (None, 404):
         return None
     if str(error) != f"Step {step_id} not found in template {template_id}":
         return None
@@ -838,6 +1007,12 @@ def handle_tallyfy_errors(operation_name: str):
                         f"{operation_name} rejected before sending "
                         f"({type(e).__name__}): {e}"
                     )
+                elif is_ambiguous_match(e) or is_answered_not_found(e):
+                    # api-v2 answered; the caller's name matched several
+                    # things, or what it named is not there. Not an outage.
+                    logger.warning(
+                        f"{operation_name} answered ({type(e).__name__}): {e}"
+                    )
                 elif status in EXPECTED_UPSTREAM_STATUSES:
                     logger.warning(f"{operation_name} returned {status}: {e}")
                 else:
@@ -856,7 +1031,13 @@ def handle_tallyfy_errors(operation_name: str):
                         "response_body": str(response_data)[:2000] if response_data else None,
                     })
                     # logger.error triggers Sentry via LoggingIntegration — no explicit capture needed
-                    logger.error(f"Tallyfy API error in {operation_name}: {e}")
+                    if is_unreadable_answer(e):
+                        logger.error(
+                            f"Tallyfy answered {operation_name} in a shape the SDK "
+                            f"could not read ({type(e).__name__}): {e}"
+                        )
+                    else:
+                        logger.error(f"Tallyfy API error in {operation_name}: {e}")
 
                 # 401, and 403s that actually look like auth failures, mean the OAuth
                 # token is expired or carries an audience the Tallyfy API rejects, so a
@@ -918,7 +1099,10 @@ def handle_tallyfy_errors(operation_name: str):
                 # Deliberately NO HTTP status code in the text: see
                 # _build_error_message's docstring above, which is the contract.
                 raise tag_error_class(
-                    ToolError(_build_error_message(operation_name, e)),
+                    ToolError(
+                        _build_error_message(operation_name, e)
+                        + _unreadable_answer_hint(e)
+                    ),
                     classify_tool_error(e, status),
                 )
             except ToolError as e:

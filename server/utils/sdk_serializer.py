@@ -56,6 +56,49 @@ MAX_STRING_LENGTH = 500
 TRUNCATION_MARKER_PREFIX = "[truncated:"
 
 
+# The SDK's lossless passthrough: every model files a key it has no field for
+# under `extra`. MCP never reads or emits it (tallyfy/mcp#1545), at any depth,
+# so a model's output is exactly its typed fields. A key MCP needs that the SDK
+# does not type is an SDK gap to fix in the SDK, not a reason to pass `extra`
+# through. SDK 4.0 types every key the transformers MCP reads send, so the keys
+# that used to arrive as `extra.status`, `extra.type` and so on are now flat
+# (`status`, `type`). Only a dataclass FIELD of this name is dropped; a plain
+# dict key called "extra" (a raw api-v2 body) is data and is kept.
+SDK_PASSTHROUGH_FIELD = "extra"
+
+# SDK model fields whose attribute name is not the key api-v2 sends, mapped
+# back to the wire key so every tool answers with the key api-v2 uses, as it
+# did while tools read raw bodies (tallyfy/mcp#1545). Each is a camelCase key a
+# transformer writes and the SDK reads into a snake_case attribute; the model's
+# `from_dict` names the wire key. One place, so a list tool, a search hit and a
+# single read cannot disagree about the name.
+#   TaskOwners.task_urls     <- owners.taskUrls  (TaskTransformer.php:117-123)
+#   Run/Template.starred_by_users <- starredByUsers (RunTransformer.php:97-99,
+#                               ChecklistTransformer, `?with=starredByUsers`)
+#   QueryPageMeta.*          <- the table query engine's camelCase meta
+#                               (QueryEngine.php:135-143)
+# tests/unit/server/utils/test_sdk_wire_names.py discovers every such field in
+# the installed SDK and fails when one is missing here.
+SDK_WIRE_NAMES: Dict[tuple, str] = {
+    ("TaskOwners", "task_urls"): "taskUrls",
+    ("Run", "starred_by_users"): "starredByUsers",
+    ("Template", "starred_by_users"): "starredByUsers",
+    ("QueryPageMeta", "page_size"): "pageSize",
+    ("QueryPageMeta", "has_more"): "hasMore",
+    ("QueryPageMeta", "next_cursor"): "nextCursor",
+    ("QueryPageMeta", "count_is_estimate"): "countIsEstimate",
+    ("QueryPageMeta", "count_is_at_least"): "countIsAtLeast",
+}
+
+
+def _wire_name(obj: Any, field_name: str) -> str:
+    """The key ``field_name`` of SDK model ``obj`` is sent under by api-v2."""
+    cls = type(obj)
+    if not cls.__module__.startswith("tallyfy"):
+        return field_name
+    return SDK_WIRE_NAMES.get((cls.__name__, field_name), field_name)
+
+
 def _truncation_marker(kept: int, total: int) -> str:
     """The suffix appended to a string this module had to cut.
 
@@ -101,10 +144,12 @@ def _serialize_inner(obj: Any, max_string_length: Optional[int] = MAX_STRING_LEN
     if is_dataclass(obj) and not isinstance(obj, type):
         result = {}
         for field in fields(obj):
+            if field.name == SDK_PASSTHROUGH_FIELD:
+                continue
             value = getattr(obj, field.name)
             serialized = _serialize_inner(value, max_string_length)
             if not _is_empty(serialized):
-                result[field.name] = serialized
+                result[_wire_name(obj, field.name)] = serialized
         return result
 
     elif isinstance(obj, list):
@@ -163,6 +208,33 @@ def serialize_dataclass(
     if _sanitize:
         return sanitize_for_user_text(serialized)
     return serialized
+
+
+def model_document(obj: Any) -> Any:
+    """An SDK model as plain dicts and lists, for code that reads a whole document.
+
+    Unlike ``serialize_dataclass`` it keeps every typed field, ``None`` and empty
+    ones included, cuts no string and does not sanitise, so a walker that reads
+    keys (``template_testing``, ``template_health_facts``, the automation history
+    tools) sees the shape api-v2 sent: a template with no steps still has
+    ``"steps": []``, and ``None`` (not read) stays apart from ``[]`` (none). Like
+    it, it never emits a model's ``extra`` at any depth (tallyfy/mcp#1545); a
+    plain dict key named ``extra`` is data and is kept. A tuple becomes a list.
+    The one helper for this: ``utils/sdk_reads.py`` had a copy, ``model_fields``,
+    until it was folded in here. Nothing here bounds its size, so a tool that
+    returns the result (``upload_asset``) must return something small.
+    """
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return {
+            field.name: model_document(getattr(obj, field.name))
+            for field in fields(obj)
+            if field.name != SDK_PASSTHROUGH_FIELD
+        }
+    if isinstance(obj, (list, tuple)):
+        return [model_document(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: model_document(value) for key, value in obj.items()}
+    return obj
 
 
 def unwrap_fractal(response: Any, includes: Iterable[str] = ()) -> Dict[str, Any]:

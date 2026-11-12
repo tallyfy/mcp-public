@@ -140,6 +140,12 @@ def _step_owner_buckets(step: Any) -> Dict[str, List[Any]]:
     rather than that the step is unassigned. Sending ``[]`` on a failed read
     would detach whoever is on the step, which is the wipe this whole module is
     written to avoid, so an unreadable bucket aborts instead.
+
+    That includes ``None``. SDK 4.0's ``Step`` keeps ``[]`` as ``[]`` and
+    leaves a bucket api-v2 did not send as ``None`` (tallyfy/mcp#1545), so
+    ``None`` is an unread bucket, and reading it as empty would re-send ``[]``
+    for a bucket nobody read. (SDK 3.x filled an absent bucket with ``[]``, so
+    the two could not be told apart there.)
     """
     # The SDK's Step dataclass spells the member bucket ``assignees`` while the
     # launch payload spells it ``users``. ``BaseAssignees::newFromArray`` reads
@@ -153,13 +159,6 @@ def _step_owner_buckets(step: Any) -> Dict[str, List[Any]]:
     }
     buckets: Dict[str, List[Any]] = {}
     for bucket, value in raw.items():
-        if value is None:
-            # A genuinely absent bucket on the SDK model is treated as empty
-            # rather than as a failed read: unlike the api-v2 transformer, the
-            # dataclass defaults these to None when the key was absent AND when
-            # it was an empty list, and the two are indistinguishable here.
-            buckets[bucket] = []
-            continue
         if not isinstance(value, (list, tuple)):
             raise ToolError(
                 f"Step '{getattr(step, 'id', '?')}' returned a "
@@ -202,13 +201,13 @@ def resolve_run_starter_user_id(sdk: Any, org_id: str, template_id: str) -> Opti
     (api-v2 ``app/Models/User.php:549``, with ``const BOT = 'bot'``), and
     ``UserTransformer`` emits ``type`` on the wire, so the value is readable.
 
-    The SDK's ``User`` dataclass has no ``type`` field today, so the value
-    arrives in the lossless ``extra`` passthrough. Both spellings are read, in
-    that order, so promoting ``type`` to a real field later does not silently
-    break this: the known-key set is derived from ``dataclasses.fields()``, so
-    a promoted key LEAVES ``extra`` and an ``extra``-only read stops finding it
-    with no error. That is the same trap ``assign_run_starter`` just walked
-    into, one field over.
+    ``User.type`` is a typed SDK field (3.2.1 and 4.0), so it is read from
+    there and nowhere else. MCP never reads a model's ``extra`` (#1545).
+    ``users.type`` is a non-null enum defaulting to ``member`` (api-v2
+    migration ``2020_05_07_194551_add_type_column_in_users_table``) and
+    ``UserTransformer::transform`` always sends it, so a read without it did
+    not say who the caller is. That is ``None`` here, never a guess that the
+    caller is a member: a bot taken for a member would put the bot on the task.
 
     Returns ``None`` when the answer cannot be established, which the caller
     turns into a refusal. Guessing here would put the wrong person on a task.
@@ -217,11 +216,9 @@ def resolve_run_starter_user_id(sdk: Any, org_id: str, template_id: str) -> Opti
     if me is None:
         return None
 
-    user_type = getattr(me, "type", None)
-    if user_type is None:
-        user_type = (getattr(me, "extra", None) or {}).get("type")
-
-    if user_type == _BOT_USER_TYPE:
+    if me.type is None:
+        return None
+    if me.type == _BOT_USER_TYPE:
         template = sdk.templates.get_template(org_id, template_id=template_id)
         return getattr(template, "owner_id", None) if template is not None else None
 
@@ -351,7 +348,19 @@ def build_guest_task_overrides(
                 if isinstance(caller_bucket, (list, tuple)):
                     buckets[bucket] = _merge_bucket(buckets[bucket], caller_bucket)
 
-        if getattr(step, "allow_guest_owners", True):
+        allow_guest_owners = getattr(step, "allow_guest_owners", None)
+        if allow_guest_owners is None:
+            # StepTransformer sends it on every step and `steps.allow_guest_owners`
+            # is NOT NULL, so None is an unread value. SDK 3.x read an absent key
+            # as False and skipped the step in silence; SDK 4.0 leaves it None.
+            # Either guess puts the guest on the wrong set of steps (#1545).
+            raise ToolError(
+                f"Step '{step_id}' came back with no 'allow_guest_owners' value, so "
+                "this tool cannot tell whether a guest may be assigned to it. "
+                "Refusing to launch. Assign the step explicitly with 'tasks' to "
+                "launch in the meantime."
+            )
+        if allow_guest_owners:
             # ORDER IS LOAD-BEARING. This has to be asked BEFORE the guest goes
             # in, because adding the guest is the thing that makes the bucket
             # non-empty and hides the case from api-v2 as well as from here.

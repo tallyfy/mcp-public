@@ -3,12 +3,13 @@ Form Field Management Tools
 Tools for managing form fields in templates
 """
 
-from typing import List, Union
+from typing import Annotated, Final, List, Literal, Optional, Union
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfySDK
+from pydantic import Field
+from tallyfy import TallyfyError, TallyfyIndeterminateError
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
@@ -19,7 +20,7 @@ from utils.authoring_payloads import (
     StepFormFieldUpdateData,
     documented_payload,
 )
-from utils.fastmcp_errors import handle_tallyfy_errors
+from utils.fastmcp_errors import handle_tallyfy_errors, is_answered_not_found
 from utils.fastmcp_types import (
     FieldId,
     FieldIdList,
@@ -31,7 +32,9 @@ from utils.fastmcp_types import (
     TemplateId,
 )
 from utils.field_value_encoding import option_pairs
-from utils.sdk_serializer import serialize_dataclass
+from utils.sdk_client import TallyfySDK
+from utils.sdk_reads import required_list
+from utils.sdk_serializer import model_document, serialize_dataclass
 
 # The field types this server will CREATE. api-v2's `BaseCapture::$field_types`
 # accepts ten, including `email`; `email` is deliberately excluded here because the
@@ -156,6 +159,156 @@ def _normalize_column_dicts(columns):
     for i, column in enumerate(columns, start=1):
         if isinstance(column, dict) and "id" not in column:
             column["id"] = i
+
+
+# ---------------------------------------------------------------------------
+# Moving a field onto the kick-off form and off it (tallyfy/mcp#1666)
+#
+# api-v2#11403 gave the field move route a kick-off target and added a route that
+# moves a kick-off field into a step. Both go through the SDK's
+# form_fields.move_form_field_to_kickoff and .move_kickoff_field_to_step
+# (tallyfy/sdk#227, SDK 4.0); until then they were the one direct api-v2 call
+# here. The step to step move calls the SDK's own move_form_field.
+#
+# The contract, read from api-v2 origin/production 59bd9962 on 2026-10-29:
+# - MoveCaptureRequest: 'target' => 'nullable|in:step,kickoff', 'target_step_id'
+#   => 'exclude_if:target,kickoff|required|exists:steps,...', 'position' =>
+#   'required|integer|between:1,9999'.
+# - MovePrerunRequest: 'target_step_id' => 'required|exists:steps,...',
+#   'position' => 'required|integer|between:1,9999'.
+# - FormFieldMoveService::move keeps the row and its timeline_id (the public id),
+#   clamps the position to the end of the target list, renumbers both lists, and
+#   re-types the live version's automations. The answer is the moved field in the
+#   shape of its new kind: PrerunTransformer ('checklist_id') on the kick-off form,
+#   CaptureTransformer ('step_id') on a step.
+# ---------------------------------------------------------------------------
+
+# Final, so a type checker reads each as its literal and accepts the step default
+# against MoveTarget.
+_MOVE_TARGET_STEP: Final = "step"
+_MOVE_TARGET_KICKOFF: Final = "kickoff"
+
+MoveTarget = Annotated[Literal["step", "kickoff"], Field(
+    description=(
+        "Where the field goes. 'step' (the default) moves it to the step named in "
+        "to_step. 'kickoff' moves it onto the template's kick-off form, and to_step "
+        "must then be left out."
+    ),
+)]
+
+# Optional here because target='kickoff' has no step, and local to this module so
+# the shared StepId keeps its own description (the #1252 hazard of a shared alias).
+# The empty string stays valid and means "left out", like OptionalTaskId.
+OptionalTargetStepId = Annotated[Optional[str], Field(
+    default=None,
+    max_length=32,
+    pattern="^(?:[a-f0-9]{32})?$",
+    description=(
+        "ID of the step to move the field to, as a 32-character hex string. Required "
+        "when target is 'step'. Leave it out when target is 'kickoff'."
+    ),
+    examples=["b828317aab9ff295a6aedf10c6a7450c"],
+)]
+
+
+def _is_not_there(error: BaseException) -> bool:
+    """api-v2 answered that the thing is not there: the SDK's TallyfyNotFoundError,
+    or a 404 api-v2 sent itself (a plain TallyfyError with status 404)."""
+    return is_answered_not_found(error) or getattr(error, "status_code", None) == 404
+
+
+def _moved_field_document(move, *args):
+    """Run one SDK move and give the moved field as a plain dict, or None.
+
+    The dict is the moved field as api-v2 answered it (PrerunTransformer on the
+    kick-off form, CaptureTransformer on a step): every typed key, None ones
+    included, so "field" in the result is the same object the raw call used to
+    return. None when api-v2 answered 2xx without the field, which the SDK
+    raises as TallyfyIndeterminateError, and the tool reports as unconfirmed
+    exactly as it did before.
+    """
+    try:
+        return model_document(move(*args))
+    except TallyfyIndeterminateError:
+        return None
+
+
+def _move_step_field_to_kickoff(sdk, org_id, template_id, from_step, field_id, position):
+    """Move a step field onto the template's kick-off form and say where it landed."""
+    moved = _moved_field_document(
+        sdk.form_fields.move_form_field_to_kickoff,
+        org_id, template_id, from_step, field_id, position,
+    )
+    if moved and moved.get("id") == field_id and moved.get("checklist_id") == template_id:
+        landed_at = moved.get("position") or position
+        return ToolResult(
+            content={
+                "success": True,
+                "message": (
+                    f"Form field '{moved.get('label') or field_id}' moved from step "
+                    f"'{from_step}' onto the kick-off form at position {landed_at}. It kept "
+                    f"its id '{field_id}', its alias and its settings."
+                ),
+                "field_id": field_id,
+                "from_step": from_step,
+                "target": _MOVE_TARGET_KICKOFF,
+                "position": landed_at,
+                "field": moved,
+            },
+            structured_content=None,
+        )
+    return ToolResult(
+        content={
+            "success": False,
+            "message": (
+                f"Tallyfy answered without showing field '{field_id}' on the kick-off form, "
+                f"so the move is not confirmed. It may still be on step '{from_step}'. Check "
+                f"with get_kickoff_fields before trying again."
+            ),
+            "field_id": field_id,
+            "from_step": from_step,
+            "target": _MOVE_TARGET_KICKOFF,
+        },
+        structured_content=None,
+    )
+
+
+def _move_kickoff_field_to_step(sdk, org_id, template_id, field_id, to_step, position):
+    """Move a kick-off field into a step of the same template and say where it landed."""
+    moved = _moved_field_document(
+        sdk.form_fields.move_kickoff_field_to_step,
+        org_id, template_id, field_id, to_step, position,
+    )
+    if moved and moved.get("id") == field_id and moved.get("step_id") == to_step:
+        landed_at = moved.get("position") or position
+        return ToolResult(
+            content={
+                "success": True,
+                "message": (
+                    f"Kick-off field '{moved.get('label') or field_id}' moved into step "
+                    f"'{to_step}' at position {landed_at}. It kept its id '{field_id}', its "
+                    f"alias and its settings."
+                ),
+                "field_id": field_id,
+                "to_step": to_step,
+                "position": landed_at,
+                "field": moved,
+            },
+            structured_content=None,
+        )
+    return ToolResult(
+        content={
+            "success": False,
+            "message": (
+                f"Tallyfy answered without showing field '{field_id}' on step '{to_step}', "
+                f"so the move is not confirmed. It may still be on the kick-off form. Check "
+                f"with get_kickoff_fields and get_template_steps before trying again."
+            ),
+            "field_id": field_id,
+            "to_step": to_step,
+        },
+        structured_content=None,
+    )
 
 
 def register_form_fields_tools(mcp):
@@ -298,7 +451,7 @@ CORRECT usage:
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             result = sdk.form_fields.add_form_field_to_step(org_id, template_id, step_id, field_data)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -433,28 +586,38 @@ CORRECT usage:
             if missing_keys or needs_options or needs_columns:
                 current = None
 
-                # Try step captures first
+                # Try the step's own fields first. A step api-v2 says is not there
+                # (404) may mean the field is a kick-off field, so that is the one
+                # failure that falls through to the template. Any other failure
+                # (a 5xx, an answer SDK 4.0 could not read) is raised as it came:
+                # it is not "this field is not on the step" (#1545).
                 try:
                     step = sdk.form_fields.get_step(org_id, template_id, step_id)
-                except Exception:
+                except TallyfyError as exc:
+                    if not _is_not_there(exc):
+                        raise
                     step = None
-                if step and hasattr(step, "captures") and step.captures:
-                    current = next(
-                        (c for c in step.captures if getattr(c, "id", None) == field_id),
-                        None,
+                if step is not None:
+                    # StepTransformer always sends `captures`; None is a read that
+                    # did not carry them, not a step without this field.
+                    captures = required_list(
+                        step.captures, f"the form fields of step {step_id}"
                     )
+                    current = next((c for c in captures if c.id == field_id), None)
 
                 # Fallback: kickoff/prerun fields live on the template, not on a step
                 if current is None:
                     try:
-                        template = sdk.templates.get_template(org_id, template_id)
-                    except Exception:
+                        template = sdk.templates.get_template(org_id, template_id=template_id)
+                    except TallyfyError as exc:
+                        if not _is_not_there(exc):
+                            raise
                         template = None
-                    if template and hasattr(template, "prerun") and template.prerun:
-                        current = next(
-                            (f for f in template.prerun if getattr(f, "id", None) == field_id),
-                            None,
+                    if template is not None:
+                        prerun = required_list(
+                            template.prerun, f"the kick-off fields of template {template_id}"
                         )
+                        current = next((f for f in prerun if f.id == field_id), None)
 
                 if current is None:
                     raise ToolError(
@@ -465,16 +628,30 @@ CORRECT usage:
 
                 stored_field_type = getattr(current, "field_type", None)
 
-                for key in missing_keys:
-                    default = False if key == "required" else None
-                    field_data[key] = getattr(current, key, default)
+                # SDK 4.0 invents nothing: a key the read did not carry is None
+                # (SDK 3.x filled required=True, field_type='text', options=[]).
+                # Sending that None would null the stored value, and an unread
+                # `options` sent as [] would delete every option, so a missing
+                # stored value refuses and names the key to pass (#1545).
+                def _stored(key):
+                    value = getattr(current, key, None)
+                    if value is None:
+                        raise ToolError(
+                            f"Field '{field_id}' came back without its current "
+                            f"'{key}', so it cannot be filled in for you. Nothing was "
+                            f"sent. Pass '{key}' explicitly in field_data."
+                        )
+                    return value
+
+                for key in sorted(missing_keys):
+                    field_data[key] = _stored(key)
 
                 # Re-check field_type now that it may have been auto-filled
                 ft = field_data.get("field_type")
                 if ft in ("dropdown", "radio", "multiselect") and "options" not in field_data:
-                    field_data["options"] = getattr(current, "options", []) or []
+                    field_data["options"] = list(_stored("options"))
                 if ft == "table" and "columns" not in field_data:
-                    field_data["columns"] = getattr(current, "columns", []) or []
+                    field_data["columns"] = list(_stored("columns"))
 
             # Normalize any option/column dicts (caller-supplied or auto-filled) to the
             # shapes api-v2 requires (#627), via the shared helpers. Without this,
@@ -517,13 +694,25 @@ CORRECT usage:
 
             result = sdk.form_fields.update_form_field(org_id, template_id, step_id, field_id, **field_data)
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
     @mcp.tool(
         name="move_form_field",
-        description="Move form field between steps with position control. REQUIRED: 'template_id', 'from_step', 'field_id', and 'to_step'. Optional: 'position' (1-BASED integer between 1 and 9999, where the first field is position 1, not 0; defaults to 1).",
+        description=(
+            "Move a form field off a step, either to another step or onto the template's kick-off form. "
+            "REQUIRED: 'template_id', 'from_step' (the step the field is on now) and 'field_id'. "
+            "To move it to a step, pass 'to_step'. To move it onto the kick-off form, pass target='kickoff' and leave out 'to_step'. "
+            "Optional: 'position' (1-BASED integer between 1 and 9999, where the first field is position 1, not 0; defaults to 1; "
+            "a number past the end puts the field last). "
+            "The field keeps its id, alias and settings, and the automations that use it follow it, so nothing needs re-pointing. "
+            "Both lists are renumbered. It works on a template with launched processes; those processes keep the form they started with. "
+            "To move a kick-off field into a step, use move_kickoff_field. "
+            "Refusals come back as an error carrying Tallyfy's own message: the field is not on 'from_step' (reload the template); "
+            "'to_step' is deleted, unknown or in another template; or the template borrows another template's kick-off form, "
+            "so the move has to be made on the template that owns it."
+        ),
         tags=["forms", "fields", "ui", "write", "management", "positioning"],
         annotations=ToolAnnotations(
             title="Move form field",
@@ -540,25 +729,47 @@ CORRECT usage:
         template_id: TemplateId,
         from_step: StepId,
         field_id: FieldId,
-        to_step: StepId,
+        to_step: OptionalTargetStepId = None,
         position: FieldPosition = 1,
+        target: MoveTarget = _MOVE_TARGET_STEP,
     ) -> bool:
         """
-        Move form field between steps.
+        Move a form field off a step, to another step or onto the kick-off form.
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
             from_step: Source step ID (REQUIRED - 32-character hex string)
             field_id: Form field ID to move (REQUIRED - 32-character hex string)
-            to_step: Target step ID (REQUIRED - 32-character hex string)
-            position: Position in target step (1-BASED integer between 1 and 9999;
+            to_step: Target step ID (32-character hex string). Required when target
+                is 'step'; leave it out when target is 'kickoff'.
+            position: Position in the target list (1-BASED integer between 1 and 9999;
                 the first field is position 1, not 0. Default: 1)
+            target: 'step' (default) or 'kickoff'
 
         Returns:
-            True if move was successful
+            Whether the move landed, and where
         """
+        # Checked before any call, so a contradictory or incomplete request writes
+        # nothing. api-v2 would ignore target_step_id beside target=kickoff
+        # (MoveCaptureRequest 'exclude_if:target,kickoff'), so a caller who sent both
+        # is told rather than having one of them dropped in silence.
+        to_step = to_step or None
+        if target == _MOVE_TARGET_KICKOFF and to_step:
+            raise ToolError(
+                "move_form_field: 'to_step' and target='kickoff' were both given, so it is "
+                "not clear where the field should go. Leave out 'to_step' to move it onto the "
+                "kick-off form, or leave out target to move it to that step. Nothing was moved."
+            )
+        if target != _MOVE_TARGET_KICKOFF and not to_step:
+            raise ToolError(
+                "move_form_field: 'to_step' is required to move a field to a step. To move it "
+                "onto the kick-off form instead, pass target='kickoff'. Nothing was moved."
+            )
+
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            if target == _MOVE_TARGET_KICKOFF:
+                return _move_step_field_to_kickoff(sdk, org_id, template_id, from_step, field_id, position)
             result = sdk.form_fields.move_form_field(org_id, template_id, from_step, field_id, to_step, position)
             if result:
                 return ToolResult(
@@ -586,7 +797,7 @@ CORRECT usage:
 
     @mcp.tool(
         name="delete_form_field",
-        description="Delete a form field from a step. REQUIRED: 'template_id', 'step_id', and 'field_id'. WARNING: the API does not stop this when an automation depends on the field. The delete goes through, answers 204 No Content, and every automation rule condition pointing at this field is removed along with it, silently, with nothing in the response saying so. The automation itself survives without that condition, so a rule that used to fire on this field can start behaving differently. This cannot be undone. PRE-FLIGHT: call analyze_template_automations first and look for a condition whose 'conditionable_type' is \"Capture\" and whose 'conditionable_id' equals this field_id. If one exists, name the affected automations to the user and get agreement before deleting.",
+        description="Delete a form field from a step. REQUIRED: 'template_id', 'step_id', and 'field_id'. This cannot be undone. If an automation rule condition uses the field, Tallyfy refuses the delete with a 403 (\"Cannot delete a form field that is being used in a rule in other steps\") and nothing is removed: edit or delete that rule first. To find it, call analyze_template_automations and look for a condition whose 'conditionable_type' is \"Capture\" and whose 'conditionable_id' equals this field_id. A delete that goes ahead also removes the field's {{alias}} references from this template's text.",
         tags=["forms", "fields", "ui", "write", "management", "deletion"],
         annotations=ToolAnnotations(
             title="Delete form field",
@@ -647,7 +858,10 @@ CORRECT usage:
         drops every id, which makes a dropdown value unconstructible from the
         one tool whose whole job is reading options: `FormValuesValidator.php:23`
         requires BOTH `id` and `text` and requires them to resolve to the same
-        option. So this reads the step directly and keeps the pairs intact.
+        option. So this reads `get_dropdown_options_with_ids`, which keeps the
+        pairs (tallyfy/sdk#172). A field not on the step is the SDK's
+        TallyfyNotFoundError (404), and a step read without its form fields is
+        refused rather than read as no options.
 
         Args:
             template_id: Template ID (REQUIRED - 32-character hex string)
@@ -659,24 +873,13 @@ CORRECT usage:
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            response = sdk._make_request(
-                "GET",
-                f"organizations/{org_id}/checklists/{template_id}/steps/{step_id}",
+            stored = sdk.form_fields.get_dropdown_options_with_ids(
+                org_id, template_id, step_id, field_id
             )
-            step = response.get("data", response) if isinstance(response, dict) else {}
-            captures = step.get("captures") or []
-            field = next(
-                (c for c in captures if isinstance(c, dict) and c.get("id") == field_id),
-                None,
-            )
-            if field is None:
-                raise ToolError(
-                    f"Form field {field_id} not found in step {step_id}."
-                )
 
             # Same helper the write path resolves against, so what this tool
             # reports and what `update_task` will accept cannot drift.
-            options = option_pairs(field.get("options"))
+            options = option_pairs(stored)
             return ToolResult(content=options, structured_content=None)
 
     @mcp.tool(
@@ -812,10 +1015,10 @@ REQUIRED: 'template_id' and 'step_id'.""",
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             template = sdk.templates.get_template(org_id, template_id=template_id)
-            if not template:
-                raise ToolError("Template not found")
 
-            steps = template.steps or []
+            # None is "not read" (SDK 4.0): neither a missing step nor a step
+            # with no fields may be reported from it (#1545).
+            steps = required_list(template.steps, f"the steps of template {template_id}")
             target_step = None
             for step in steps:
                 if step.id == step_id:
@@ -825,7 +1028,10 @@ REQUIRED: 'template_id' and 'step_id'.""",
             if not target_step:
                 raise ToolError(f"Step {step_id} not found in template {template_id}")
 
-            existing_fields = [serialize_dataclass(c) for c in target_step.captures] if target_step.captures else []
+            existing_fields = [
+                serialize_dataclass(c)
+                for c in required_list(target_step.captures, f"the form fields of step {step_id}")
+            ]
 
             return ToolResult(
                 content={
@@ -895,43 +1101,53 @@ REQUIRED: 'template_id' and 'step_id'.""",
     # ------------------------------------------------------------------
 
     def _get_template_and_prerun(sdk, org_id, template_id):
-        """Fetch template title, current kickoff fields, and the raw payload.
+        """Read the template for a kick-off form write.
 
-        Uses ``get_template_with_steps`` which exposes ``raw_data`` — the
-        unmodified API response before SDK model conversion.  This preserves
-        ``label`` and every other field the API returns, which the
-        ``PrerunField`` dataclass would otherwise drop.
+        Returns ``(title, prerun, template)``: the template's title, its kick-off
+        fields as the dicts a template write sends back (``PrerunField.to_payload()``:
+        every writable key the read carried, so ``columns``, ``settings``,
+        ``default_value``, ``prefix``, ``suffix`` and the rest survive; never the
+        read-only ``alias``, ``increment_id`` or timestamps), and the SDK
+        ``Template`` for ``_preserved_assignment_buckets``.
 
-        Returns (title, prerun_list, raw_template).
+        A template write REPLACES the kick-off form (``Preruns::save()`` deletes a
+        field the list leaves out), so a ``prerun`` the read did not carry (None,
+        SDK 4.0) is refused: sending ``[]`` or a partial list would wipe the form.
+        ChecklistTransformer always sends ``prerun`` and ``title``
+        (ChecklistTransformer.php:44, 51).
         """
-        result = sdk.templates.get_template_with_steps(org_id, template_id=template_id)
-        if not result or not result.get("raw_data"):
-            raise ToolError(f"Template '{template_id}' not found")
-        raw = result["raw_data"]
-        return raw.get("title", ""), raw.get("prerun", []), raw
+        template = sdk.templates.get_template(org_id, template_id=template_id)
+        fields = required_list(
+            template.prerun, f"the kick-off fields of template {template_id}"
+        )
+        if not template.title:
+            raise ToolError(
+                f"Template {template_id} did not return its title, which every "
+                f"template write must carry. Nothing was sent."
+            )
+        return template.title, [field.to_payload() for field in fields], template
 
-    def _preserved_assignment_buckets(raw_template, template_id):
-        """Return the template's CURRENT users/groups so a PUT does not wipe them.
+    def _preserved_assignment_buckets(template, template_id):
+        """Return the template's CURRENT users/groups to re-send with a kick-off form write.
 
-        ChecklistService::update (app/Services/ChecklistService.php:209)
-        unconditionally calls
-          saveAssignees(Assignees::newFromArray(Arr::only($data, ['users','groups'])))
-        and BaseAssignees::newFromArray (app/Domain/Owners/BaseAssignees.php:24)
-        reads ``$data['users'] ?? []`` — so an ABSENT key becomes an EMPTY SET,
-        not "leave alone". Assignees::modify then computes removed = every
-        current user/group and AssignableTrait::saveAssignees detaches them.
-        A kickoff-field PUT carrying only {title, prerun} therefore silently
-        strips every member and group off the template, HTTP 200, no error.
+        Until 2026-08-29 an ABSENT key on a template PUT was an EMPTY SET on
+        api-v2 production (ChecklistService::update ran
+        ``Assignees::newFromArray(Arr::only($data, ['users','groups']))``), so a
+        kickoff-field PUT carrying only {title, prerun} stripped every member and
+        group off the template, HTTP 200, no error. Production now keeps an
+        omitted bucket (``assigneesFromPartial``, api-v2 29dc8ff7a, merged to
+        production in e14804637). Re-sending the current lists is correct under
+        both, and an unchanged list makes ``saveAssignees`` return before it
+        touches anything.
 
-        ChecklistTransformer.php:55-56 emits both keys unconditionally via
-        wrappedAssignees(), so a missing or non-list bucket means the READ
-        failed — and sending [] on a failed read is precisely the wipe this
-        guard exists to prevent. Abort instead of guessing. A genuinely empty
-        list is legitimate (nobody is assigned) and passes straight through.
+        ChecklistTransformer emits both keys unconditionally via
+        wrappedAssignees(), so None (SDK 4.0: not read) means the READ failed,
+        and sending [] on a failed read would clear them. Abort instead of
+        guessing. A genuinely empty list is legitimate and passes straight through.
         """
         buckets = {}
         for field in ("users", "groups"):
-            value = raw_template.get(field)
+            value = getattr(template, field)
             if not isinstance(value, list):
                 raise ToolError(
                     f"Template {template_id} did not return its current '{field}', "
@@ -1058,14 +1274,14 @@ CORRECT usage:
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            title, existing, raw = _get_template_and_prerun(sdk, org_id, template_id)
+            title, existing, template = _get_template_and_prerun(sdk, org_id, template_id)
             existing.append(field_data)
             result = sdk.update_template_metadata(
                 org_id, template_id, title=title, prerun=existing,
-                **_preserved_assignment_buckets(raw, template_id),
+                **_preserved_assignment_buckets(template, template_id),
             )
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -1145,7 +1361,7 @@ CORRECT usage:
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            title, existing, raw = _get_template_and_prerun(sdk, org_id, template_id)
+            title, existing, template = _get_template_and_prerun(sdk, org_id, template_id)
 
             target = None
             for f in existing:
@@ -1203,10 +1419,10 @@ CORRECT usage:
 
             result = sdk.update_template_metadata(
                 org_id, template_id, title=title, prerun=existing,
-                **_preserved_assignment_buckets(raw, template_id),
+                **_preserved_assignment_buckets(template, template_id),
             )
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 
@@ -1219,15 +1435,14 @@ REQUIRED: 'template_id' and 'field_id'.
 WARNING: Deleting a kickoff field removes it permanently and drops all collected data
 for that field across existing process runs. This cannot be undone.
 
-WARNING: the API does not stop this when an automation depends on the field. The delete
-goes through, answers 204 No Content, and every automation rule condition pointing at this
-field is removed along with it, silently, with nothing in the response saying so. The
-automation itself survives without that condition, so a rule that used to fire on this
-field can start behaving differently. This cannot be undone.
+If an automation rule condition uses the field, Tallyfy refuses the delete with a 403
+("Cannot delete the kick off field because it is part of a rule.") and nothing is
+removed: edit or delete that rule first. To find it, call analyze_template_automations
+and look for a condition whose 'conditionable_type' is "Prerun" and whose
+'conditionable_id' equals this field_id.
 
-PRE-FLIGHT: call analyze_template_automations first and look for a condition whose
-'conditionable_type' is "Prerun" and whose 'conditionable_id' equals this field_id. If one
-exists, name the affected automations to the user and get agreement before deleting.
+A delete that goes ahead also removes the field's {{alias}} references from this
+template's text. A template that borrows this kick-off form keeps its references.
 
 """,
         tags=["forms", "fields", "kickoff", "prerun", "write", "deletion"],
@@ -1258,9 +1473,59 @@ exists, name the affected automations to the user and get agreement before delet
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            endpoint = f"organizations/{org_id}/checklists/{template_id}/preruns/{field_id}"
-            result = sdk._make_request("DELETE", endpoint)
-            return ToolResult(content=result or {"success": True}, structured_content=None)
+            # api-v2 answers 204 and the SDK returns True; a refusal (403 when an
+            # automation uses the field, 404) is raised with its status.
+            sdk.form_fields.delete_kickoff_field(org_id, template_id, field_id)
+            return ToolResult(content={"success": True}, structured_content=None)
+
+    @mcp.tool(
+        name="move_kickoff_field",
+        description=(
+            "Move a field off the template's kick-off form into one of its steps. "
+            "REQUIRED: 'template_id', 'field_id' (the kick-off field's id, from get_kickoff_fields) and 'to_step'. "
+            "Optional: 'position' (1-BASED integer between 1 and 9999, where the first field is position 1, not 0; defaults to 1; "
+            "a number past the end puts the field last). "
+            "The field keeps its id, alias and settings, and the automations that use it follow it, so nothing needs re-pointing. "
+            "Both lists are renumbered. It works on a template with launched processes; those processes keep the form they started with. "
+            "To move a step field onto the kick-off form, use move_form_field with target='kickoff'. "
+            "Refusals come back as an error carrying Tallyfy's own message: the field is not on this template's kick-off form "
+            "(reload the template); 'to_step' is deleted, unknown or in another template; or the template borrows another "
+            "template's kick-off form, so the move has to be made on the template that owns it."
+        ),
+        tags=["forms", "fields", "kickoff", "prerun", "write", "positioning"],
+        annotations=ToolAnnotations(
+            title="Move kickoff field into a step",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+        output_schema=None
+    )
+    @track_tool_execution("move_kickoff_field")
+    @handle_tallyfy_errors("move kickoff field")
+    def move_kickoff_field(
+        template_id: TemplateId,
+        field_id: FieldId,
+        to_step: StepId,
+        position: FieldPosition = 1,
+    ) -> GenericDict:
+        """
+        Move a kick-off (prerun) field into a step of the same template.
+
+        Args:
+            template_id: Template ID (REQUIRED - 32-character hex string)
+            field_id: Kick-off field ID to move (REQUIRED - 32-character hex string)
+            to_step: Step ID to move it into (REQUIRED - 32-character hex string)
+            position: Position in the step (1-BASED integer between 1 and 9999;
+                the first field is position 1, not 0. Default: 1)
+
+        Returns:
+            Whether the move landed, and where
+        """
+        api_key, org_id = get_authenticated_credentials()
+        with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
+            return _move_kickoff_field_to_step(sdk, org_id, template_id, field_id, to_step, position)
 
     @mcp.tool(
         name="reorder_kickoff_fields",
@@ -1308,7 +1573,7 @@ CORRECT usage:
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            title, existing, raw = _get_template_and_prerun(sdk, org_id, template_id)
+            title, existing, template = _get_template_and_prerun(sdk, org_id, template_id)
 
             fields_by_id = {f.get("id"): f for f in existing if f.get("id")}
 
@@ -1342,10 +1607,10 @@ CORRECT usage:
 
             result = sdk.update_template_metadata(
                 org_id, template_id, title=title, prerun=reordered,
-                **_preserved_assignment_buckets(raw, template_id),
+                **_preserved_assignment_buckets(template, template_id),
             )
             return ToolResult(
-                content=serialize_dataclass(result) if result else {},
+                content=serialize_dataclass(result),
                 structured_content=None
             )
 

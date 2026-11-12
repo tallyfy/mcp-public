@@ -1,4 +1,4 @@
-"""Normalise one raw template document into the domain model the walk uses.
+"""Normalise one template document into the domain model the walk uses.
 
 Every fact encoded here was read from api-v2 source and is cited in
 tallyfy/mcp#997 section 2. The citations are kept in the code because the whole
@@ -8,13 +8,15 @@ the tool wrong in a way nobody can debug.
 The input is the payload of
 ``GET /organizations/{org}/checklists/{id}?with=steps,automated_actions,prerun``.
 
-⚠️ It must be the RAW payload, not ``serialize_dataclass(sdk_template)``. On the
-pinned SDK (``tallyfy==1.3.12``) ``Step.from_dict`` maps a fixed key list and
-drops everything else, so ``assign_run_starter``, ``owner_id`` and ``ai_assigned``
-never survive it. Feeding this engine an SDK-serialised step therefore reports
-every run-starter-assigned step as unassigned, which spec 2.9 names as the
-largest single false-positive source in check 4. ``assert_is_template_document``
-below is the guard; the tool fetches raw.
+The tools pass the SDK's ``Template`` for that read as plain dicts
+(``utils.sdk_serializer.model_document``, tallyfy/mcp#1545): every typed field,
+None and empty ones included. On SDK 4.0 ``Step`` types ``assign_run_starter``,
+``owner_id`` and ``ai_assigned``. On the old ``tallyfy==1.3.12`` pin
+``Step.from_dict`` dropped them, which reported every run-starter-assigned step
+as unassigned, the largest single false-positive source in check 4 (spec 2.9),
+and is why the tools read raw until then. Never feed it
+``serialize_dataclass(...)``: that drops empty lists, so a template with no
+steps and no rules fails ``assert_is_template_document`` below.
 """
 
 from __future__ import annotations
@@ -74,6 +76,8 @@ ACTION_VERBS_BY_TYPE = {
     "status": frozenset({"reopen"}),
     "assignment": frozenset({"assign", "assign_only", "clear_assignees", "unassign"}),
     "webhook": frozenset({"emit_webhook"}),
+    # tallyfy/mcp#1740, the api-v2 side is tallyfy/api-v2#11737.
+    "escalation": frozenset({"raise_escalation"}),
 }
 
 # Deadline::START_RUN, app/Step/Deadline.php:18. Not a step id (spec 2.8).
@@ -213,6 +217,21 @@ class ActionDef:
     position: int
     deadline: Optional[tuple] = None  # (value, unit, option), hashable
     has_assignees: bool = False
+
+    @property
+    def is_escalation(self) -> bool:
+        return self.action_type == "escalation" or self.action_verb == "raise_escalation"
+
+    @property
+    def acts_outside_the_steps(self) -> bool:
+        """True for an action whose effect this engine cannot see.
+
+        A webhook calls out to another system, and an escalation posts a
+        comment that emails people (tallyfy/mcp#1740). Neither changes a
+        step's visibility, assignees, deadline or status, so neither can
+        be judged "changes nothing" from the walk (spec check 2).
+        """
+        return self.is_webhook or self.is_escalation
 
     @property
     def is_webhook(self) -> bool:
@@ -414,7 +433,7 @@ def _unwrap(doc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def parse_template(doc: Dict[str, Any]) -> TemplateDoc:
-    """Normalise a raw template payload. Pure; raises NotATemplateDocument.
+    """Normalise a template document. Pure; raises NotATemplateDocument.
 
     The envelope is unwrapped BEFORE the guard runs, so a caller may hand over
     either the bare document or the ``{"data": {...}}`` the API actually returns.

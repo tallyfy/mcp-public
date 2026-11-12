@@ -363,16 +363,10 @@ def _normalize_token_error(status_code: int, content: bytes, grant_type: str) ->
         # through the Authorization header, and our discovery document advertises
         # client_secret_basic, so this must stay a 401 rather than becoming a 400.
         #
-        # NOTE, so nobody reads more into this than is true: middleware/auth_error.py
-        # intercepts EVERY 401 and 403 leaving this app, and /mcp/oauth/token is
-        # deliberately not in its SKIP_PATHS (see server/CLAUDE.md, "The 401
-        # challenge"). It preserves this error_description but only preserves an
-        # ``error`` code drawn from its own allowlist, which does not include
-        # ``invalid_client``, so the code a caller finally sees on this path is
-        # ``invalid_token`` plus a correct WWW-Authenticate header. That is a
-        # deliberate design in that middleware, not a defect here, and no
-        # acceptance criterion on issue #849 depends on this branch. Left correct
-        # at this layer so the right thing happens if that allowlist ever widens.
+        # middleware/auth_error.py passes a 401 or 403 from this route through
+        # untouched (OAUTH_PROXY_PATHS, #1690), so the invalid_client built here is
+        # what the caller sees. Until #1690 that middleware rewrote it to
+        # invalid_token.
         return _oauth_error_response(
             "invalid_client",
             _upstream_description(payload, "Client authentication failed."),

@@ -36,7 +36,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from tallyfy import TallyfyError, TallyfySDK
+from tallyfy import TallyfyError
 
 from constants import TALLYFY_API_BASE_URL
 from metrics import track_tool_execution
@@ -45,6 +45,7 @@ from utils.auth_context import (
     get_authenticated_credentials,
     get_verified_org_claim,
 )
+from utils.sdk_client import TallyfySDK
 
 logger = logging.getLogger(__name__)
 

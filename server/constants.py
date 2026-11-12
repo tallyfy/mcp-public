@@ -148,6 +148,8 @@ ACCEPTED_MCP_RESOURCES: FrozenSet[str] = frozenset({
 # Allowlist of hostnames that are acceptable to reflect in OAuth discovery URLs.
 # Any X-Forwarded-Host / Host header not in this set is ignored and
 # MCP_RESOURCE_URL is used instead (see issue #217).
+# The landing and tools pages read it too: a listed host is printed as the
+# endpoint, so every host here must be a public name (#1148).
 # Comma-separated env. Defaults cover current Tallyfy deployments.
 MCP_ALLOWED_HOSTS: FrozenSet[str] = frozenset(
     h.strip() for h in os.getenv(
@@ -287,14 +289,14 @@ TOOL_ERROR_CLASS_ATTR = "_tallyfy_error_class"
 
 TOOL_ERROR_CLASSES: FrozenSet[str] = frozenset({
     "validation",            # upstream 422, or a pydantic ValidationError
-    "not_found",             # upstream 404
+    "not_found",             # upstream 404, or the SDK's TallyfyNotFoundError
     "auth",                  # upstream 401 or 403
-    "bad_request",           # upstream 400
+    "bad_request",           # upstream 400, or TallyfyAmbiguousMatchError (a name matched several)
     "conflict",              # upstream 409
     "rate_limited",          # upstream 429
     "client_error",          # any other upstream 4xx
-    "upstream_error",        # upstream 5xx
-    "upstream_unavailable",  # TallyfyError with no int status: retries exhausted
+    "upstream_error",        # upstream 5xx, or a 2xx the SDK could not read (TallyfyUnexpectedResponseError, TallyfyCreatedButUnreadError)
+    "upstream_unavailable",  # any other TallyfyError with no int status: retries exhausted
     "payload_rejected",      # the SDK refused the payload BEFORE any request
     "internal_error",        # an unexpected exception inside the tool body
     "tool_rejected",         # the tool's own code raised ToolError

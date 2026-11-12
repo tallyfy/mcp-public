@@ -9,8 +9,6 @@ from typing import Any, Dict, List, Optional
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfySDK
-from tallyfy.models import Guest
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
@@ -29,120 +27,72 @@ from utils.fastmcp_types import (
     UserRole,
 )
 from utils.pagination import fetch_single_page
+from utils.sdk_client import TallyfySDK
 from utils.sdk_serializer import (
     serialize_dataclass,
     serialize_paginated_response,
-    unwrap_fractal,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _get_guest_raw(sdk, org_id: str, email: str) -> Dict[str, Any]:
-    """GET a guest and KEEP the fields `Guest`/`GuestDetails` still cannot hold.
+def _get_guest(sdk, org_id: str, email: str) -> Dict[str, Any]:
+    """Read a guest through `sdk.users.get_guest` and serialise it.
 
-    Deliberately not routed through `sdk.users.get_guest`. Issue #590 was that
-    method returning a `Guest`, whose `details` is a `GuestDetails`, and
-    `GuestDetails.from_dict` reading a key named `disabled_on` that api-v2 has
-    never emitted (it emits `disabled_on` elsewhere, on the organization-members
-    pivot in OrganizationTransformer, a different resource), while
-    `GuestTransformer::guestDetails` emits `disabled_at`. One character apart,
-    so the single field carrying a guest's live state was dropped on the floor.
+    This used to GET the guest raw, because the SDK model could not hold what
+    the tool returns: `GuestDetails.from_dict` read `disabled_on`, a key api-v2
+    has never sent (#590), and `GuestDetails` had no field for `cadence_days`,
+    `associated_members`, `last_city`, `last_country` or the pivot's
+    `last_accessed_at`, nor `Guest` for the numeric `id`. SDK 3.2.1 types all of
+    them (tallyfy/sdk#33, #169, #264), so the read goes through the public SDK
+    method, as tallyfy/mcp#1545 requires, and the answer is unchanged.
 
-    ⚠️ THAT HALF IS FIXED, as of tallyfy 2.0.0 (tallyfy/sdk#33):
-    `GuestDetails.disabled_at` is now a real field, correctly populated.
-    Reading raw is NOT retired by that fix, because it recovers several other
-    things the model still cannot: `guest_id` (the SDK derives it from `link`
-    and never puts it on `GuestDetails` at all) plus `cadence_days`,
-    `associated_members`, `last_city`, `last_country` and the pivot's own
-    `last_accessed_at`, none of which `GuestDetails` declares an attribute
-    for even now.
+    `guest_id` is the guest's access code, which the SDK takes from `link`. It
+    is not the numeric `id`: measured live on the test org 2026-09-01,
+    `get_guest_tasks(guest_id="48418")`, the numeric id, answered 404 while the
+    code from the same guest's `link` answered 200. The tool's description tells
+    callers to chain it into `get_guest_tasks`.
 
-    `disabled_at` IS the live state, read from api-v2's own service rather than
-    inferred: `GuestService::disable` sets `disabled_at` and `disabled_by`, and
-    `GuestService::enable` sets `disabled_at` back to null while stamping
-    `reactivated_at` and `reactivated_by`. So `disabled_by` and `reactivated_at`
-    are historical breadcrumbs that survive the opposite operation, exactly as
-    #590 reported, and neither answers the question.
+    Two things the model carries never reach the answer, so it matches what the
+    raw read returned:
+    - `details.disabled_on`, the SDK's deprecated alias of `disabled_at`;
+    - `extra`, the model's store for keys it has no field for, which MCP must
+      not read; `serialize_dataclass` drops it at every depth (#1545).
 
-    ⚠️ `details.status` is NOT the disabled indicator, and it is the field
-    somebody looking for one will reach first. Neither `disable` nor `enable`
-    touches `pivot->status`; it is a separate lifecycle value that is frequently
-    null, and `serialize_dataclass` strips nulls, which is why it appears in no
-    response and why its absence looked like the bug.
-
-    Reading raw also recovers `cadence_days`, `associated_members`, `last_city`,
-    `last_country` and the pivot's own `last_accessed_at`, all of which
-    `GuestDetails` declares no attribute for.
+    `is_disabled` makes the live state explicit. `disabled_at` IS that state:
+    `GuestService::disable` sets it and `GuestService::enable` nulls it while
+    stamping `reactivated_at`, so `disabled_by` and `reactivated_at` are
+    breadcrumbs that survive the opposite operation. `serialize_dataclass`
+    strips nulls, so an enabled guest's `disabled_at` vanishes, and absence
+    alone could not be told from "the tool cannot see the field". A `False`
+    survives. `details.status` is NOT the indicator: neither operation touches
+    it. When the guest has no details (no pivot row in this organization), no
+    `is_disabled` is emitted at all, because `False` there would report an
+    unreadable guest as enabled.
     """
-    response = sdk._make_request("GET", f"organizations/{org_id}/guests/{email}")
-    raw = unwrap_fractal(response)
-    if not raw:
-        return {}
-    return _with_guest_id(raw, serialize_dataclass(_with_disabled_flag(raw)))
+    return _guest_content(sdk.users.get_guest(org_id, email))
 
 
-def _with_guest_id(raw: Dict[str, Any], content: Dict[str, Any]) -> Dict[str, Any]:
-    """Put back the identifier the raw read costs us, because a caller needs it.
+def _guest_content(guest: Any) -> Dict[str, Any]:
+    """Serialise a Guest the SDK returned, as every guest tool answers it.
 
-    Reading raw recovers everything `GuestDetails` drops, and loses the one field
-    the SDK ADDS. `guest_id` is not sent by api-v2: `Guest.from_dict` derives it
-    from `link` by pulling the segment after `/guest/`, and it is the guest's
-    access code, not the numeric `id` the body carries.
-
-    That matters because this tool's own description tells the caller to hand it
-    to `get_guest_tasks`, and `OptionalGuestId` describes itself as "extracted
-    from the guest link URL" with a 40-character example. Measured live on the
-    test org 2026-09-01, in one run: `get_guest_tasks(guest_id="48418")`, the
-    numeric id, answers **404 Resource not found**, while the code out of the
-    same guest's `link` answers 200 with data and meta. So the numeric id is not
-    a substitute, and a response carrying it and not the code sends the caller
-    somewhere that does not exist.
-
-    Derived through the SDK's own extractor rather than reimplemented here, so
-    the two cannot disagree about the URL shape. That is a `_`-prefixed method
-    on a pinned dependency, which is a coupling, so
-    `test_the_sdk_still_exposes_the_extractor_this_depends_on` fails loudly if a
-    bump removes it. Without that pin the field would go quietly missing again,
-    which is the failure this whole function exists to undo.
-
-    Absent or unparseable `link` yields no key, rather than a null or a guess: a
-    caller that reads a key and gets nothing usable is worse off than one that
-    sees the field is absent.
+    `get_guest`, `create_guest` and `update_guest` all answer through
+    GuestsController with GuestTransformer and the organization set
+    (createGuest, show and updateGuest in
+    app/Http/Controllers/Accounts/GuestsController.php), so one shape serves
+    all three; see `_get_guest` for what is dropped and why `is_disabled` is
+    added. The SDK never hands back ``None`` here: an answer it cannot read
+    raises (``TallyfyUnexpectedResponseError``, or ``TallyfyCreatedButUnreadError``
+    after the create), and the error handler tells the caller to read back
+    rather than repeat the write.
     """
-    guest_id = Guest._extract_guest_id(raw.get("link"))
-    if guest_id:
-        # Assigned after serialisation for the same reason `is_disabled` is: the
-        # value is derived rather than present in the body, so it has to be put
-        # somewhere the serialiser has already finished with.
-        content = dict(content)
-        content["guest_id"] = guest_id
+    content = serialize_dataclass(guest)
+    details = content.get("details")
+    if isinstance(details, dict):
+        details.pop("disabled_on", None)
+    if guest.details is not None:
+        content["is_disabled"] = bool(guest.details.disabled_at)
     return content
-
-
-def _with_disabled_flag(raw: Dict[str, Any]) -> Dict[str, Any]:
-    """Add an explicit `is_disabled` boolean, but ONLY when it can be answered.
-
-    This is not decoration on top of `details.disabled_at`, it is what makes
-    that field usable. `serialize_dataclass` strips null and empty values, so an
-    ENABLED guest carries `disabled_at: null` and the key vanishes from the
-    response entirely. Absence would then mean either "this guest is enabled" or
-    "this tool still cannot see the field", which is the ambiguity #590 is
-    about. A `False` survives serialisation, so the boolean says it out loud.
-
-    The guard is the point. When `details` is missing or is not a dict the read
-    did not deliver what it should have, so NOTHING is emitted rather than
-    `False`. Defaulting to `False` there would report every unreadable guest as
-    enabled, which is a check that cannot fail in the direction that matters:
-    an operator confirming a disable would be told the disable had not worked
-    when the truth is that the tool could not tell.
-    """
-    details = raw.get("details")
-    if not isinstance(details, dict):
-        return raw
-    result = dict(raw)
-    result["is_disabled"] = bool(details.get("disabled_at"))
-    return result
 
 
 def _guest_after_write(sdk, org_id: str, email: str) -> Dict[str, Any]:
@@ -159,7 +109,7 @@ def _guest_after_write(sdk, org_id: str, email: str) -> Dict[str, Any]:
     acknowledgement rather than to a wrong answer about the guest's state.
     """
     try:
-        return _get_guest_raw(sdk, org_id, email)
+        return _get_guest(sdk, org_id, email)
     except Exception as exc:  # noqa: BLE001 - degraded read, never fatal
         logger.warning("Post-write guest read-back failed for %s: %s", email, exc)
         return {}
@@ -455,32 +405,21 @@ CORRECT usage:
         """
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # The SDK's create_guest() sends a singular "phone" key, which is not in
-            # CreateGuestRequest::rules() (app/Http/Requests/Guests/CreateGuestRequest.php
-            # declares phone_1 and phone_2) — so onlyValidatedFields() dropped it and the
-            # guest was created phone-less at HTTP 201. Post the correct body directly.
-            endpoint = f"organizations/{org_id}/guests"
-            body = {"email": email}
-            # Names are nullable at the API (#622 item 8), so omit a blank one entirely
-            # rather than posting "". Sending an empty string would store an empty name
-            # where the customer expects no name at all.
-            if first_name is not None and first_name.strip():
-                body["first_name"] = first_name.strip()
-            if last_name is not None and last_name.strip():
-                body["last_name"] = last_name.strip()
-            if phone_1 is not None:
-                body["phone_1"] = phone_1
-            if phone_2 is not None:
-                body["phone_2"] = phone_2
-            if company_name is not None:
-                body["company_name"] = company_name
-
-            response = sdk._make_request("POST", endpoint, data=body)
-            guest = response.get("data", response) if isinstance(response, dict) else response
-            return ToolResult(
-                content=serialize_dataclass(guest) if guest else {},
-                structured_content=None
+            # SDK 4.0's create_guest sends exactly the keys
+            # CreateGuestRequest::rules() names (tallyfy/sdk#168): phone_1 and
+            # phone_2, not the singular "phone" api-v2 drops at 201. A blank
+            # name is left out rather than posted as "", because names are
+            # nullable at the API (#622 item 8) and "" would store an empty
+            # name where the customer expects none.
+            guest = sdk.users.create_guest(
+                org_id, email,
+                first_name=first_name,
+                last_name=last_name,
+                phone_1=phone_1,
+                phone_2=phone_2,
+                company_name=company_name,
             )
+            return ToolResult(content=_guest_content(guest), structured_content=None)
 
     @mcp.tool(
         name="update_guest",
@@ -552,18 +491,12 @@ Use get_guest(email=...) to read a guest's current profile.""",
 
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
-            # The SDK's update_guest() only knows how to send profile fields, all of
-            # which the API discards. Send the one field that is actually validated.
-            endpoint = f"organizations/{org_id}/guests/{email}"
-            response = sdk._make_request(
-                "PUT", endpoint,
-                data={"email": email, "associated_members": associated_members},
+            # The one field the route stores (tallyfy/sdk#169), and the only
+            # one this tool sends.
+            guest = sdk.users.update_guest(
+                org_id, email, associated_members=associated_members
             )
-            guest = response.get("data", response) if isinstance(response, dict) else response
-            return ToolResult(
-                content=serialize_dataclass(guest) if guest else {},
-                structured_content=None
-            )
+            return ToolResult(content=_guest_content(guest), structured_content=None)
 
     @mcp.tool(
         name="disable_guest",
@@ -694,7 +627,7 @@ CORRECT usage:
         api_key, org_id = get_authenticated_credentials()
         with TallyfySDK(api_key=api_key, base_url=TALLYFY_API_BASE_URL) as sdk:
             return ToolResult(
-                content=_get_guest_raw(sdk, org_id, email),
+                content=_get_guest(sdk, org_id, email),
                 structured_content=None
             )
 

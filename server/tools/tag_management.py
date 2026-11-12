@@ -5,7 +5,6 @@ Tools for discovering and managing organization tags
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
-from tallyfy import TallyfySDK
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
@@ -24,6 +23,7 @@ from utils.fastmcp_types import (
     TagType,
     TemplateId,
 )
+from utils.sdk_client import TallyfySDK
 from utils.sdk_serializer import compact_result, serialize_dataclass
 
 # api-v2 resolves `status` by NAME, not against a list:

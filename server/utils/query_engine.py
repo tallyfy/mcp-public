@@ -14,15 +14,26 @@ onto the keys the tool returned before, with the same values, so a caller sees
 the same keys with the bulky ones left out. Every key it writes, and the
 api-v2 source each value comes from, is listed beside the mapper below.
 
+The engine is read through the SDK's ``query_templates`` and ``query_runs``
+(SDK 4.0, tallyfy/mcp#1545), which build the body, check the answer is a page
+and return typed rows (``TemplateQueryRow``, ``RunQueryRow``).
+
 When the engine is not usable the tool answers from the classic endpoint
 instead. ``QueryEngineUnavailable`` carries the reason, and the caller logs it
 once as a warning. That happens on:
 
 * a 404, a 422 or any 5xx from the query route (the owner decision on #1660),
   so a column the production catalog lacks never breaks the tool;
-* a 200 whose body is not the documented ``{data: [...], meta: {...}}`` shape;
+* a success whose body is not a page, which the SDK raises as
+  ``TallyfyUnexpectedResponseError``;
 * a count that is not exact. api-v2 answers an estimate or a lower bound when
   counting takes too long, and ``meta.total`` has always been the real count.
+
+The fallback is immediate. The SDK sends a query as an idempotent request and
+would retry a 5xx on it like a GET; here the classic endpoint is the retry, so
+each query is sent with ``retry_server_errors=False``: a 5xx is raised after
+one request. A 429 (after its ``Retry-After``) and a connection that never
+opened are still retried by the SDK, as on every other call.
 
 Any other error, 401 and 403 included, propagates, because the classic
 endpoint would refuse the same caller for the same reason.
@@ -37,21 +48,26 @@ warning, because nothing failed.
 import logging
 import math
 import re
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from tallyfy import TallyfyError
+from tallyfy.models import (
+    QueryRef,
+    RunQueryRow,
+    TallyfyUnexpectedResponseError,
+    TemplateQueryRow,
+)
+from tallyfy.query_engine import QUERY_LIST_VALUES_MAX, QUERY_PAGE_SIZE_MAX
 
 from utils.pagination import shape_page
 from utils.sdk_serializer import serialize_dataclass
 
 logger = logging.getLogger(__name__)
 
-#: api-v2 ``App\Query\Limits::PAGE_SIZE_MAX``.
-ENGINE_PAGE_SIZE_MAX = 100
+QueryRow = Union[TemplateQueryRow, RunQueryRow]
 
-#: api-v2 ``App\Query\Limits::LIST_VALUES_MAX``: the most values an ``in``
-#: condition takes.
-ENGINE_LIST_VALUES_MAX = 100
+#: The SDK method that reads each dataset.
+_QUERY_METHODS = {"checklists": "query_templates", "runs": "query_runs"}
 
 #: The engine pages with a cursor, not a page number, so page N is reached by
 #: reading the ids of the rows before it first, 100 at a time. Past this many
@@ -76,41 +92,33 @@ class QueryEngineUnavailable(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _post(sdk: Any, org_id: str, dataset: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    endpoint = f"organizations/{org_id}/{dataset}/query"
+def _query(sdk: Any, org_id: str, dataset: str, **arguments: Any) -> Any:
+    """One page from the SDK, or ``QueryEngineUnavailable`` when the classic
+    endpoint should answer instead."""
+    method = getattr(sdk, _QUERY_METHODS[dataset])
     try:
-        response = sdk._make_request("POST", endpoint, data=body)
+        return method(org_id, retry_server_errors=False, **arguments)
+    except TallyfyUnexpectedResponseError as exc:
+        raise QueryEngineUnavailable(f"POST {dataset}/query answered a success that is not a page: {exc}") from exc
     except TallyfyError as exc:
         status = getattr(exc, "status_code", None)
         if status in _FALLBACK_STATUSES or (isinstance(status, int) and status >= 500):
             raise QueryEngineUnavailable(f"POST {dataset}/query answered {status}") from exc
         raise
-    if not isinstance(response, dict):
-        raise QueryEngineUnavailable(
-            f"POST {dataset}/query returned {type(response).__name__}, not an object"
-        )
-    data = response.get("data")
-    meta = response.get("meta")
-    if not isinstance(data, list) or not isinstance(meta, dict):
-        raise QueryEngineUnavailable(f"POST {dataset}/query returned no data list or no meta")
-    for row in data:
-        if not isinstance(row, dict) or not isinstance(row.get("id"), str):
-            raise QueryEngineUnavailable(f"POST {dataset}/query returned a row with no id")
-    return response
 
 
-def _exact_count(meta: Dict[str, Any], dataset: str) -> int:
-    count = meta.get("count")
+def _exact_count(meta: Any, dataset: str) -> int:
+    count = meta.count
     if (
         not isinstance(count, int)
         or isinstance(count, bool)
-        or meta.get("countIsEstimate") is not False
-        or meta.get("countIsAtLeast") is not False
+        or meta.count_is_estimate is not False
+        or meta.count_is_at_least is not False
     ):
         raise QueryEngineUnavailable(
             f"POST {dataset}/query gave no exact count (count={count!r}, "
-            f"countIsEstimate={meta.get('countIsEstimate')!r}, "
-            f"countIsAtLeast={meta.get('countIsAtLeast')!r})"
+            f"countIsEstimate={meta.count_is_estimate!r}, "
+            f"countIsAtLeast={meta.count_is_at_least!r})"
         )
     return count
 
@@ -125,7 +133,7 @@ def query_page(
     page: int,
     per_page: int,
     filter_tree: Optional[Dict[str, Any]] = None,
-) -> Tuple[List[Dict[str, Any]], int]:
+) -> Tuple[List[QueryRow], int]:
     """Read page ``page`` of ``per_page`` rows and the exact row count.
 
     The engine pages with a keyset cursor, so for page N the ids of the
@@ -134,35 +142,36 @@ def query_page(
     The cursor is valid for the same sort and filter only (api-v2
     ``TasksQueryController`` swagger, ``cursor``), and both stay fixed here.
 
-    Returns the rows exactly as the engine sent them, and the count.
+    Returns the SDK's typed rows, and the count.
     """
-    base: Dict[str, Any] = {"v": 1, "sort": sort}
-    if filter_tree:
-        base["filter"] = filter_tree
+    if dataset not in _QUERY_METHODS:
+        raise ValueError(f"no query engine read for dataset {dataset!r}")
 
     total: Optional[int] = None
     cursor: Optional[str] = None
     skip = (page - 1) * per_page
 
-    def call(cols: List[str], size: int) -> Dict[str, Any]:
+    def call(cols: List[str], size: int) -> List[QueryRow]:
         nonlocal total, cursor
-        body = dict(base, columns=cols, page_size=size)
-        if cursor:
-            body["cursor"] = cursor
-        if total is None:
-            body["count"] = "exact"
-        response = _post(sdk, org_id, dataset, body)
-        meta = response["meta"]
+        result = _query(
+            sdk, org_id, dataset,
+            columns=cols,
+            sort=sort,
+            filter_=filter_tree or None,
+            page_size=size,
+            cursor=cursor,
+            count="exact" if total is None else None,
+        )
+        meta = result.meta
         if total is None:
             total = _exact_count(meta, dataset)
-        next_cursor = meta.get("nextCursor")
-        cursor = next_cursor if meta.get("hasMore") and isinstance(next_cursor, str) else None
-        return response
+        # The SDK refuses a page that says hasMore without a text nextCursor.
+        cursor = meta.next_cursor if meta.has_more else None
+        return list(result.data)
 
     while skip > 0:
-        size = min(skip, ENGINE_PAGE_SIZE_MAX)
-        response = call([], size)
-        read = len(response["data"])
+        size = min(skip, QUERY_PAGE_SIZE_MAX)
+        read = len(call([], size))
         if read > size or (read == 0 and cursor):
             # Either would put the next page at the wrong row.
             raise QueryEngineUnavailable(
@@ -175,13 +184,13 @@ def query_page(
             assert total is not None
             return [], total
 
-    response = call(columns, per_page)
+    rows = call(columns, per_page)
     assert total is not None
-    if len(response["data"]) > per_page:
+    if len(rows) > per_page:
         raise QueryEngineUnavailable(
-            f"POST {dataset}/query returned {len(response['data'])} rows for a page of {per_page}"
+            f"POST {dataset}/query returned {len(rows)} rows for a page of {per_page}"
         )
-    return list(response["data"]), total
+    return rows, total
 
 
 def engine_or_classic(
@@ -216,7 +225,7 @@ def engine_listing(
     columns: List[str],
     sort: List[Dict[str, str]],
     filter_tree: Optional[Dict[str, Any]],
-    row_mapper: Callable[[Dict[str, Any]], Dict[str, Any]],
+    row_mapper: Callable[[Any], Dict[str, Any]],
     page: int,
     per_page: int,
     page_offset: int,
@@ -261,7 +270,7 @@ def _ids(value: Optional[str]) -> Optional[List[str]]:
     if value is None:
         return []
     parts = str(value).split(",")
-    if not parts or len(parts) > ENGINE_LIST_VALUES_MAX:
+    if not parts or len(parts) > QUERY_LIST_VALUES_MAX:
         return None
     if not all(_ENGINE_ID.fullmatch(part) for part in parts):
         return None
@@ -353,21 +362,27 @@ def templates_query(folder: Optional[str], page: Optional[int], per_page: int) -
     }
 
 
-def _member_id(value: Any) -> Any:
-    """``{id: "12", label: ...}`` -> 12, the integer the classic row carries."""
-    if not isinstance(value, dict):
+def _member_id(value: Optional[QueryRef]) -> Any:
+    """``{id: "12", label: ...}`` -> 12, the integer the classic row carries.
+
+    api-v2 sends a member id as text (``ChecklistsDataset::member``,
+    ``(string) $id``), and the SDK keeps it as sent.
+    """
+    if value is None:
         return None
-    raw = value.get("id")
+    raw = value.id
     if isinstance(raw, str) and raw.isdigit():
         return int(raw)
     return raw
 
 
-def template_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def template_row(row: TemplateQueryRow) -> Dict[str, Any]:
     """One engine row as the old get_all_templates row.
 
     Each key is the one the classic row put there, through the SDK's
-    ``Template`` (and, for keys that model does not type, its ``extra``):
+    ``Template``. SDK 4.0 types ``steps_count``, ``status`` and ``folder_id``,
+    and ``serialize_dataclass`` never emits ``extra`` (tallyfy/mcp#1545), so
+    they are flat here as on the classic path; they were ``extra.*`` before:
 
     ========================  ==============================================
     key                       engine column (ChecklistsDataset::rows)
@@ -384,9 +399,9 @@ def template_row(row: Dict[str, Any]) -> Dict[str, Any]:
     type                      type
     last_updated_by           last_updated_by.id as an integer
     is_pinned                 is_pinned
-    extra.steps_count         steps_count ("GET /checklists steps_count")
-    extra.status              status
-    extra.folder_id           folder.id
+    steps_count               steps_count ("GET /checklists steps_count")
+    status                    status
+    folder_id                 folder.id
     ========================  ==============================================
 
     Left out, because the engine does not return them: summary (the engine
@@ -394,24 +409,21 @@ def template_row(row: Dict[str, Any]) -> Dict[str, Any]:
     icon, owner_id, kickoff_title, kickoff_description and the template's
     settings flags. get_template and get_kickoff_fields return those.
     """
-    folder = row.get("folder")
     return {
-        "id": row["id"],
-        "title": row.get("title"),
-        "starred": row.get("starred"),
-        "explanation_video": row.get("explanation_video"),
-        "created_by": _member_id(row.get("created_by")),
-        "started_processes": row.get("processes_count"),
-        "created_at": row.get("created_at"),
-        "last_updated": row.get("last_updated"),
-        "type": row.get("type"),
-        "last_updated_by": _member_id(row.get("last_updated_by")),
-        "is_pinned": row.get("is_pinned"),
-        "extra": {
-            "steps_count": row.get("steps_count"),
-            "status": row.get("status"),
-            "folder_id": folder.get("id") if isinstance(folder, dict) else None,
-        },
+        "id": row.id,
+        "title": row.title,
+        "starred": row.starred,
+        "explanation_video": row.explanation_video,
+        "created_by": _member_id(row.created_by),
+        "started_processes": row.processes_count,
+        "created_at": row.created_at,
+        "last_updated": row.last_updated,
+        "type": row.type,
+        "last_updated_by": _member_id(row.last_updated_by),
+        "is_pinned": row.is_pinned,
+        "steps_count": row.steps_count,
+        "status": row.status,
+        "folder_id": row.folder.id if row.folder is not None else None,
     }
 
 
@@ -542,11 +554,12 @@ def _percent(complete: Any, total: Any) -> Any:
     return int(value) if value.is_integer() else value
 
 
-def run_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def run_row(row: RunQueryRow) -> Dict[str, Any]:
     """One engine row as the old get_organization_runs row.
 
-    Each key is the one RunTransformer wrote and the SDK's ``Run`` carried
-    (``type`` rides in ``extra`` because ``Run`` does not type it):
+    Each key is the one RunTransformer wrote and the SDK's ``Run`` carried.
+    ``type`` is typed from SDK 4.0 and flat, as on the classic path; it was
+    ``extra.type`` before (tallyfy/mcp#1545):
 
     ==================  ===================================================
     key                 engine column (RunsDataset::rows)
@@ -566,7 +579,7 @@ def run_row(row: Dict[str, Any]) -> Dict[str, Any]:
     owner_id            owner.id as an integer
     started_at          started_at
     last_updated        last_updated (runs.updated_at)
-    extra.type          type
+    type                type
     ==================  ===================================================
 
     Left out, because the engine does not return them: increment_id,
@@ -575,25 +588,25 @@ def run_row(row: Dict[str, Any]) -> Dict[str, Any]:
     due_soon, due_date_passed, max_task_deadline and collaborators.
     get_process returns those.
     """
-    template = row.get("template")
-    complete = row.get("progress_complete")
-    total = row.get("progress_total")
+    template = row.template
+    complete = row.progress_complete
+    total = row.progress_total
     return {
-        "id": row["id"],
-        "checklist_id": template.get("id") if isinstance(template, dict) else None,
-        "checklist_title": template.get("label") if isinstance(template, dict) else None,
-        "name": row.get("name"),
-        "status": row.get("status"),
+        "id": row.id,
+        "checklist_id": template.id if template is not None else None,
+        "checklist_title": template.label if template is not None else None,
+        "name": row.name,
+        "status": row.status,
         "progress": {
             "complete": complete,
             "total": total,
             "percent": _percent(complete, total),
         },
-        "started_by": _member_id(row.get("started_by")),
-        "starred": row.get("starred"),
-        "due_date": row.get("due"),
-        "owner_id": _member_id(row.get("owner")),
-        "started_at": row.get("started_at"),
-        "last_updated": row.get("last_updated"),
-        "extra": {"type": row.get("type")},
+        "started_by": _member_id(row.started_by),
+        "starred": row.starred,
+        "due_date": row.due,
+        "owner_id": _member_id(row.owner),
+        "started_at": row.started_at,
+        "last_updated": row.last_updated,
+        "type": row.type,
     }

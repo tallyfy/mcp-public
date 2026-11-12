@@ -3,7 +3,8 @@
 The scheduled launch tools in ``tools/process_management.py`` (tallyfy/mcp#1603) take
 a day and a time in the organization's LOCAL time and turn them into the body
 api-v2 stores. Everything here is pure, so the decisions can be tested without a
-network.
+network. The tools call api-v2 through SDK 4.0's ``sdk.recurring_jobs``
+(tallyfy/sdk#199), and the jobs read here are its typed ``RecurringJob`` objects.
 
 Two api-v2 contracts are live at once, and they read the same body differently:
 
@@ -19,10 +20,11 @@ Read from ``RecurringJobService::build()``, ``CreateRecurringJobRequest``,
 ``RecurringSchedule::$fields`` and ``RecurringJobTransformer`` on both branches on
 2026-10-14. The tools never decide which one they are talking to from
 configuration, because the MCP server and api-v2 promote separately. They read
-it off the API itself: ``reading_from_job`` from any job, and
-``reading_from_probe_errors`` from a create that can never be saved, for an
-organization with no job to read. Both arms were measured on 2026-10-14, on
-staging and on the production test org, and the probe created nothing on either.
+it off the API itself: ``reading_from_job`` from any job (the SDK's
+``RecurringJob.next_occurrence_sent``), and the SDK's ``supports_days_of_week``
+from a create that can never be saved, for an organization with no job to read.
+Both arms were measured on 2026-10-14, on staging and on the production test org,
+and the probe created nothing on either.
 
 A job is CREATED only on the organization reading (owner decision 2026-10-15 on
 tallyfy/mcp#1604). Two reviews found that a schedule converted to UTC cannot keep
@@ -30,8 +32,9 @@ its local day on production's roll in several cases, and that every job saved
 that way would move when api-v2#8974 reaches production. So on the UTC reading
 ``schedule_process_launch`` refuses with ``UTC_CREATE_REFUSAL`` and nothing here
 converts a time. Listing, reading, pausing, resuming and deleting work on both
-readings, and pause and resume send the stored times back unchanged. Creation on
-production comes back once #8974 is promoted there (tallyfy/work-queue#4020).
+readings, and pause and resume send the stored times back unchanged (the SDK's
+``set_recurring_job_status`` re-sends the job as read). Creation on production
+comes back once #8974 is promoted there (tallyfy/work-queue#4020).
 
 A job runs as its owner, kept in ``data.created_by``. api-v2#11639 adds
 ``PUT recurring-jobs/{id}/owner`` (admins only) and a top-level ``owner`` object,
@@ -47,6 +50,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone as _dt_timezone, tzinfo
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from tallyfy.models import RecurringJob, RecurringJobHistory, RecurringSchedule
+from tallyfy.recurring_job_management import (
+    RESOURCE_NOT_FOUND_CODE,
+    ROUTE_NOT_FOUND_CODE,
+)
 
 from utils.date_utils import resolve_zone
 
@@ -66,14 +75,7 @@ JOB_NAME_MAX = 50
 DESCRIPTION_MAX = 500
 PROCESS_NAME_MAX = 300
 
-# A create body that can never be saved. `name` is required on both readings, so
-# both answer 422 from BaseRequest::validate() before postValidate() or the
-# controller runs, and nothing is written. Only master has a rule for
-# schedule.days_of_week ('array'), so only master names it among the errors.
-READING_PROBE_BODY: Dict[str, Any] = {"schedule": {"days_of_week": "not-a-list"}}
-READING_PROBE_FIELD = "schedule.days_of_week"
-
-# RecurringSchedule::$fields on either branch, so a job read back can be sent back.
+# RecurringSchedule::$fields on either branch: the schedule keys a job is shown with.
 SCHEDULE_FIELDS = (
     "recurring_type",
     "interval",
@@ -85,22 +87,6 @@ SCHEDULE_FIELDS = (
     "day_of_month",
     "month_of_year",
 )
-
-# The top-level keys UpdateRecurringJobRequest validates. `status` is added by the caller.
-JOB_FIELDS = (
-    "name",
-    "description",
-    "start_date",
-    "end_date",
-    "max_occurrences",
-    "recurring_job_type_id",
-    "schedule",
-    "data",
-)
-
-# Written by the server into data on create and kept on update; a sent value is ignored
-# (ScheduledTaskData::enforceOnCreate / enforceOnUpdate).
-SERVER_STAMPED_DATA_KEYS = ("created_by",)
 
 FINISHED_MESSAGE = (
     "This job has finished, so it cannot be paused or resumed. Schedule it again "
@@ -125,14 +111,13 @@ OWNER_ROUTE_MISSING = (
 )
 OWNER_KEYS = ("id", "full_name", "email")
 
-# What api-v2's Handler::render puts in a 404 body (app/Exceptions/Handler.php on
-# production and master, read 2026-11-03). A route that does not exist throws
-# NotFoundHttpException; a job that does not exist, or that the caller may not
-# see (RecurringJobPolicy::authorizeRead), throws ModelNotFoundException. Measured
-# on staging the same day: PUT recurring-jobs/999999999/owner answered
-# ENDPOINT_NOT_FOUND, and GET recurring-jobs/999999999 answered RESOURCE_NOT_FOUND.
-ROUTE_NOT_FOUND_CODE = "ENDPOINT_NOT_FOUND"
-JOB_NOT_FOUND_CODE = "RESOURCE_NOT_FOUND"
+# The `code` api-v2's Handler::render puts in a 404 body (app/Exceptions/Handler.php
+# on production and master, read 2026-11-03) is the SDK's ROUTE_NOT_FOUND_CODE for a
+# route that does not exist (NotFoundHttpException) and RESOURCE_NOT_FOUND_CODE for a
+# job that does not exist or that the caller may not see (ModelNotFoundException,
+# RecurringJobPolicy::authorizeRead). Measured on staging the same day: PUT
+# recurring-jobs/999999999/owner answered the first, GET recurring-jobs/999999999
+# the second.
 OWNER_404_ROUTE = "route"
 OWNER_404_JOB = "job"
 
@@ -196,24 +181,14 @@ def api_clock(value: Any) -> Optional[str]:
     return f"{int(match.group(1)):02d}:{match.group(2)}"
 
 
-def reading_from_job(job: Dict[str, Any]) -> str:
+def reading_from_job(job: RecurringJob) -> str:
     """Which clock the API that returned ``job`` reads schedules on.
 
-    Only master's RecurringJobTransformer writes ``next_occurrence``, and it writes
-    the key on every job, null unless the job is active (api-v2#8974).
+    Only an api-v2 with #8974 writes ``next_occurrence``, and it writes the key on
+    every job, null unless the job is active. The SDK keeps whether the key was
+    sent, whatever its value, as ``next_occurrence_sent``.
     """
-    return READING_ORGANIZATION if "next_occurrence" in job else READING_UTC
-
-
-def reading_from_probe_errors(errors: Any) -> Optional[str]:
-    """Which clock the API reads schedules on, from the 422 the probe body gets.
-
-    None when the answer does not look like the probe's refusal at all, so a
-    caller can refuse rather than guess.
-    """
-    if not isinstance(errors, dict) or "name" not in errors:
-        return None
-    return READING_ORGANIZATION if READING_PROBE_FIELD in errors else READING_UTC
+    return READING_ORGANIZATION if job.next_occurrence_sent else READING_UTC
 
 
 def _normalize_days(days_of_week: Optional[Iterable[Any]]) -> Optional[List[int]]:
@@ -370,43 +345,13 @@ def plan_schedule(
     )
 
 
-def update_body_from_job(job: Dict[str, Any], status: str) -> Dict[str, Any]:
-    """The PUT body that re-sends ``job`` exactly as stored, with a new status.
-
-    PUT takes the whole job. A job read back cannot go back as it is: start_time
-    carries seconds and every null field is refused (measured on staging
-    2026-10-14, 422 on eight fields), so nulls are dropped, the time is cut to
-    HH:MM and the dates to the day. The server's own data stamp is not sent.
-    """
-    body: Dict[str, Any] = {}
-    for key in JOB_FIELDS:
-        value = job.get(key)
-        if value is None:
-            continue
-        if key in ("start_date", "end_date") and isinstance(value, str):
-            value = value[:10]
-        elif key == "schedule" and isinstance(value, dict):
-            value = clean_schedule(value)
-        elif key == "data" and isinstance(value, dict):
-            value = {k: v for k, v in value.items() if k not in SERVER_STAMPED_DATA_KEYS}
-        body[key] = value
-    missing = [k for k in ("name", "start_date", "recurring_job_type_id", "schedule", "data") if k not in body]
-    if missing:
-        raise ScheduleInputError(
-            f"The job did not come back with {', '.join(missing)}, so it was not changed: "
-            "sending it without them would be refused or would lose them."
-        )
-    if "start_time" not in body["schedule"] or "recurring_type" not in body["schedule"]:
-        raise ScheduleInputError("The job's schedule did not come back whole, so it was not changed.")
-    body["status"] = status
-    return body
-
-
-def clean_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
-    """A stored schedule as api-v2 takes it back: known keys, no nulls, HH:MM."""
+def clean_schedule(schedule: Optional[RecurringSchedule]) -> Dict[str, Any]:
+    """A stored schedule as the tools show it: known keys, no nulls, HH:MM."""
     cleaned: Dict[str, Any] = {}
+    if schedule is None:
+        return cleaned
     for key in SCHEDULE_FIELDS:
-        value = schedule.get(key)
+        value = getattr(schedule, key)
         if value is None:
             continue
         if key == "start_time":
@@ -484,16 +429,16 @@ def _user_id(value: Any) -> Optional[int]:
     return None
 
 
-def job_owner(job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def job_owner(job: RecurringJob) -> Optional[Dict[str, Any]]:
     """Who a job runs as: api-v2#11639's ``owner`` object, else ``data.created_by``.
 
-    The object is cut to ``id``, ``full_name`` and ``email``. Without it only the
+    The object is shown as ``id``, ``full_name`` and ``email``. Without it only the
     id is known, so only the id is returned. None when the job names neither.
     """
-    owner = job.get("owner")
-    if isinstance(owner, dict) and owner.get("id") is not None:
-        return {key: owner.get(key) for key in OWNER_KEYS}
-    data = job.get("data")
+    owner = job.owner
+    if owner is not None and owner.id is not None:
+        return {key: getattr(owner, key) for key in OWNER_KEYS}
+    data = job.data
     created_by = data.get("created_by") if isinstance(data, dict) else None
     if created_by is not None:
         return {"id": created_by}
@@ -548,13 +493,20 @@ def owner_route_answer(response_data: Any) -> Optional[str]:
     code = response_data.get("code") if isinstance(response_data, dict) else None
     if code == ROUTE_NOT_FOUND_CODE:
         return OWNER_404_ROUTE
-    if code == JOB_NOT_FOUND_CODE:
+    if code == RESOURCE_NOT_FOUND_CODE:
         return OWNER_404_JOB
     return None
 
 
+def history_row(run: Optional[RecurringJobHistory]) -> Optional[Dict[str, Any]]:
+    """One run as RecurringJobHistoryTransformer writes it: success, message, created_at."""
+    if run is None:
+        return None
+    return {"success": run.success, "message": run.message, "created_at": run.created_at}
+
+
 def describe_job(
-    job: Dict[str, Any],
+    job: RecurringJob,
     *,
     tz_name: Optional[str],
     job_keys: Optional[Dict[int, str]] = None,
@@ -565,9 +517,8 @@ def describe_job(
     absent key would read as "this tool cannot see it" (root CLAUDE.md, rule 34).
     """
     reading = reading_from_job(job)
-    data = job.get("data") if isinstance(job.get("data"), dict) else {}
-    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
-    type_id = job.get("recurring_job_type_id")
+    data = job.data if isinstance(job.data, dict) else {}
+    type_id = job.recurring_job_type_id
     job_type = None
     if job_keys is not None:
         try:
@@ -576,26 +527,26 @@ def describe_job(
             job_type = None
 
     described: Dict[str, Any] = {
-        "id": job.get("id"),
-        "name": job.get("name"),
-        "status": job.get("status"),
+        "id": job.id,
+        "name": job.name,
+        "status": job.status,
         "job_type": job_type or type_id,
         "owner": job_owner(job),
         "data": data,
-        "start_date": job["start_date"][:10] if isinstance(job.get("start_date"), str) else job.get("start_date"),
-        "end_date": job["end_date"][:10] if isinstance(job.get("end_date"), str) else job.get("end_date"),
-        "max_occurrences": job.get("max_occurrences"),
-        "schedule": clean_schedule(schedule),
+        "start_date": job.start_date[:10] if isinstance(job.start_date, str) else job.start_date,
+        "end_date": job.end_date[:10] if isinstance(job.end_date, str) else job.end_date,
+        "max_occurrences": job.max_occurrences,
+        "schedule": clean_schedule(job.schedule),
         "times_are_read_in": zone_label(reading, tz_name),
-        "last_run": job.get("last_run"),
+        "last_run": history_row(job.last_run),
     }
-    if job.get("description"):
-        described["description"] = job["description"]
+    if job.description:
+        described["description"] = job.description
     if reading == READING_ORGANIZATION:
-        described["next_run"] = job.get("next_occurrence")
-        described["next_run_local"] = local_string(job.get("next_occurrence"), tz_name)
-        described["completed_runs"] = job.get("completed_occurrences")
-        described["last_ran_at"] = job.get("last_occurred_on")
+        described["next_run"] = job.next_occurrence
+        described["next_run_local"] = local_string(job.next_occurrence, tz_name)
+        described["completed_runs"] = job.completed_occurrences
+        described["last_ran_at"] = job.last_occurred_on
     else:
         described["next_run"] = None
         described["next_run_note"] = "This Tallyfy server does not report a job's next run."

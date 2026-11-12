@@ -619,9 +619,9 @@ def outline_kickoff_suggestion(
     was), each as id, position, title and summary, the summary cut at the
     server's 500-character cap with its marker. The first part also holds
     ``template_summary`` and the existing kickoff fields as
-    ``outline_kickoff_field`` outlines; the SDK model keeps a kickoff field's
-    ``label`` under ``extra``, so it is read from there when it is not at the
-    top level.
+    ``outline_kickoff_field`` outlines. ``PrerunField.label`` is typed (SDK
+    3.2.0, tallyfy/sdk#181), and the serializer never emits ``extra``
+    (tallyfy/mcp#1545), so each field is read as it is.
     """
     positions = positions or {}
     raw_steps = []
@@ -638,7 +638,7 @@ def outline_kickoff_suggestion(
         serialize_dataclass(s, _sanitize=False) for s in steps_in_position_order(raw_steps)
     ]
     fields = [
-        outline_kickoff_field({**(f.get("extra") or {}), **f})
+        outline_kickoff_field(f)
         for f in _as_list(result.get(KICKOFF_FIELDS_KEY))
         if isinstance(f, dict)
     ]

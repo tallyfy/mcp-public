@@ -14,7 +14,6 @@ from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
 from mcp.types import ToolAnnotations
 from pydantic import Field
-from tallyfy import TallyfySDK
 
 from metrics import track_tool_execution
 from utils.auth_context import TALLYFY_API_BASE_URL, get_authenticated_credentials
@@ -27,6 +26,7 @@ from utils.fastmcp_types import (
     SearchQuery,
 )
 from utils.pagination import fetch_single_page
+from utils.sdk_client import TallyfySDK
 from utils.sdk_serializer import compact_search_all_buckets, serialize_dataclass
 
 logger = logging.getLogger(__name__)

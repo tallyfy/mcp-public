@@ -32,6 +32,7 @@ from constants import (
 )
 from middleware import (
     AuthErrorMiddleware,
+    ConnectMembershipCheck,
     DiscoverWithoutAuth,
     DownstreamAuthChallengeMiddleware,
     RateLimitMiddleware,
@@ -76,11 +77,11 @@ from utils.otel_init import init_tracing as _init_otel  # noqa: E402
 
 _init_otel(service_name="mcp-server")
 
-# Instrument TallyfySDK._make_request so every Tallyfy API call is tracked
-# by the tallyfy_api_* Prometheus metrics (Phase 5b — closes dead-metric gap).
-from utils.sdk_metrics_patch import patch_tallyfy_sdk  # noqa: E402
+# Record every Tallyfy API call in the tallyfy_api_* Prometheus metrics, through
+# the request hook every client from utils/sdk_client.py carries (#1545).
+from utils.sdk_metrics_patch import enable_api_metrics  # noqa: E402
 
-patch_tallyfy_sdk()
+enable_api_metrics()
 
 # Stop exporting the `*_created` series (#1353). prometheus_client adds one per
 # labelled child of every Counter and Histogram: a Unix timestamp that never
@@ -296,6 +297,13 @@ _fastmcp_transport_route = next(
 _protected_transport = _fastmcp_transport_route.endpoint
 _unwrapped_transport = getattr(_protected_transport, "app", None)
 if _unwrapped_transport is not None:
+    # Confirm, once per access token, that the token's user is still an active
+    # member of the token's workspace, and answer 401 if not (#1135). Installed
+    # INSIDE RequireAuthMiddleware, on its .app, so it only sees a request whose
+    # token FastMCP has already verified. DiscoverWithoutAuth below still hands a
+    # no-token server/discover the unwrapped app, so that request skips this
+    # check exactly as it skips auth. Detail: middleware/connect_membership.py.
+    _protected_transport.app = ConnectMembershipCheck(_unwrapped_transport)
     _mcp_transport_route = Route(
         '/',
         endpoint=DiscoverWithoutAuth(_protected_transport, _unwrapped_transport),
@@ -304,7 +312,8 @@ if _unwrapped_transport is not None:
     app.routes[app.routes.index(_fastmcp_transport_route)] = _mcp_transport_route
 else:
     logging.error(
-        "Transport endpoint exposes no .app, so server/discover still requires a token (#1317)"
+        "Transport endpoint exposes no .app, so server/discover still requires a token (#1317) "
+        "and the connect-time membership check is not installed (#1135)"
     )
     _mcp_transport_route = _fastmcp_transport_route
 

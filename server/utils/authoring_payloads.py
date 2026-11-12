@@ -464,7 +464,9 @@ class KickoffFieldUpdateData(_CaptureCommon):
 # Automation rules
 # ---------------------------------------------------------------------------
 
-_ACTION_TYPES = ["visibility", "deadline", "status", "assignment", "webhook"]
+_ACTION_TYPES = [
+    "visibility", "deadline", "status", "assignment", "webhook", "escalation",
+]
 _ACTION_VERBS = [
     "show",
     "hide",
@@ -475,6 +477,7 @@ _ACTION_VERBS = [
     "unassign",
     "clear_assignees",
     "emit_webhook",
+    "raise_escalation",
 ]
 
 
@@ -539,13 +542,18 @@ class AutomationAction(_Payload):
         description=(
             "visibility takes show or hide; deadline takes deadline; status "
             "takes reopen; assignment takes assign, assign_only, unassign or "
-            "clear_assignees; webhook takes emit_webhook"
+            "clear_assignees; webhook takes emit_webhook; escalation takes "
+            "raise_escalation"
         ),
     )
     target_step_id: str = Field(default=None, description="Every action needs one")
     deadline: AutomationActionDeadline = Field(default=None)
     assignees: AutomationAssignees = Field(
-        default=None, description="assignment actions, unless assigning from a field"
+        default=None,
+        description=(
+            "assignment actions, unless assigning from a field. An escalation's "
+            "recipients: users and groups, at least one, never guests"
+        ),
     )
     actionable_id: str = Field(
         default=None,
@@ -556,6 +564,14 @@ class AutomationAction(_Payload):
     )
     webhook_url: str = Field(default=None, description="emit_webhook needs this")
     alias_name: str = Field(default=None, description="emit_webhook needs this too")
+    comment_content: str = Field(
+        default=None,
+        description=(
+            "escalation needs this: the text of the comment it posts on the "
+            "target step's task, labeled escalation, mentioning and emailing "
+            "every recipient. At most 30000 characters"
+        ),
+    )
     id: str = Field(default=None, description="Resend it verbatim to keep a stored action")
 
 
@@ -686,6 +702,11 @@ class MappingKickoffField(_Payload):
     label: str = Field(default=None)
     field_type: str = Field(default=None, json_schema_extra={"enum": _FIELD_TYPES})
     required: bool = Field(default=None)
+    # Read by `validate_mapping` since tallyfy/work-queue#3655: an assignment
+    # may read its people from a text field only when this holds "email".
+    field_validation: List[str] = Field(
+        default=None, description='e.g. ["email"], which lets a text field name a person'
+    )
 
 
 class MappingStep(_Payload):
@@ -712,15 +733,16 @@ class MappingStep(_Payload):
         default=None,
         description=(
             "True gives the step to whoever launches the process. A step built "
-            "with no assignee, group or guest gets that anyway"
+            "with no assignee, group or guest gets that anyway. It does nothing "
+            "once the step names a member, group or guest: they get it alone"
         ),
     )
     deadline: Dict[str, Any] = Field(
         default=None,
         description=(
-            "STEP vocabulary: unit minutes to months, singular such as 'day' "
-            "also accepted; option from or prior_to. A step built without one "
-            "is due 1 day after launch"
+            "STEP vocabulary: value, unit, option and step all required; unit "
+            "minutes to months, singular such as 'day' also accepted; option "
+            "from or prior_to. A step built without one is due 1 day after launch"
         ),
     )
     form_fields: List[MappingKickoffField] = Field(default=None)
@@ -736,7 +758,8 @@ class MappingAutomation(_Payload):
         default=None,
         description=(
             "Each carries action_type, action_verb, target, and whichever of "
-            "deadline, assignees, webhook_url and alias_name that pair needs. "
+            "deadline, assignees, webhook_url, alias_name and comment_content "
+            "that pair needs. "
             "An assignment can take its people from a form field instead of "
             "assignees: actionable_id (the field's alias) with actionable_type "
             "'kickoff' or 'field'. "

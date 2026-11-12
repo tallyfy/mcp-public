@@ -1,4 +1,4 @@
-tallyfy==3.0.4
+tallyfy==4.0.0
 dateparser==1.2.1
 # 4.1.2, not 4.0.3, for GHSA-7xgj-8392-5q4r and GHSA-vqqp-x5qm-5qp4 (both published 2026-10-23).
 fastmcp==4.1.2

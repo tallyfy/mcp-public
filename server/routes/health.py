@@ -90,6 +90,7 @@ not on a public liveness probe.
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, Tuple
 
 from starlette.responses import JSONResponse
@@ -132,17 +133,78 @@ _SHA_RE = re.compile(r"\A[0-9a-f]{7,64}\Z")
 ENVIRONMENTS = ("production", "staging", "development")
 
 
+def _resolve_ref(git_dir: Path, ref: str) -> str:
+    """The commit a ref points at, loose first because git prefers it.
+
+    A linked worktree keeps its refs in the main repository, which its
+    ``commondir`` file names. A ref that is in neither place resolves to nothing.
+    """
+    commondir = git_dir / "commondir"
+    common = git_dir / commondir.read_text().strip() if commondir.is_file() else git_dir
+    loose = common / ref
+    if loose.is_file():
+        return loose.read_text().strip()
+    for line in (common / "packed-refs").read_text().splitlines():
+        sha, _, name = line.partition(" ")
+        if name == ref:
+            return sha
+    return ""
+
+
+def _read_checkout_sha(root: Path | None = None) -> str:
+    """The commit of the git checkout this code runs from, or an explicit unknown.
+
+    This reads the files under ``.git`` rather than running ``git``, so it needs
+    no binary on PATH, starts no process and has nothing to time out. It goes
+    through the same shape gate as ``MCP_GIT_SHA``.
+
+    It must never raise, because it runs while the module imports and a failure
+    here would stop the server. Anything it cannot read is ``unknown``. A container
+    has no ``.git``, so the answer there is ``unknown``.
+    """
+    try:
+        root = root or Path(__file__).resolve().parents[2]
+        git_dir = root / ".git"
+        if git_dir.is_file():
+            # A linked worktree: `.git` is a file naming its own git directory.
+            git_dir = root / git_dir.read_text().removeprefix("gitdir:").strip()
+        head = (git_dir / "HEAD").read_text().strip()
+        if head.startswith("ref:"):
+            head = _resolve_ref(git_dir, head.removeprefix("ref:").strip())
+        sha = head.lower()
+        return sha if _SHA_RE.match(sha) else BUILD_SHA_UNKNOWN
+    except Exception:
+        return BUILD_SHA_UNKNOWN
+
+
+# Read once, as the server starts, and never per request. This is the commit the
+# running code came from: a later `git pull` changes the checkout but not what
+# this process loaded, so reading it again would name the wrong build.
+_CHECKOUT_SHA = _read_checkout_sha()
+
+
 def _build_sha() -> str:
     """The running build's commit, or an explicit unknown.
 
-    Sourced from ``MCP_GIT_SHA`` ONLY. It deliberately does not fall back to
-    ``SENTRY_RELEASE`` the way ``constants._resolve_sentry_release`` does:
-    that value lives in the droplet's env file, nobody edits it, and both MCP
-    Sentry projects carried a stale ``*@1.2.0`` across dozens of deploys. A
-    fallback that cannot move per deploy would make this field answer "yes I
-    know the build" while naming the wrong one, which is worse than unknown.
+    ``MCP_GIT_SHA`` wins whenever it is set, because the deploy shell sets it to
+    the commit being deployed. A set value of the wrong shape is ``unknown`` and
+    never the fallback: the deploy said something that is not a commit, and
+    covering that with another answer would hide it.
+
+    Only an unset or blank variable reports ``_CHECKOUT_SHA``, the commit of the
+    checkout this process started from (#1148). A server run from a checkout has
+    no deploy shell, and this names its commit. It does not see uncommitted edits.
+
+    It deliberately does not fall back to ``SENTRY_RELEASE`` the way
+    ``constants._resolve_sentry_release`` does: that value lives in the droplet's
+    env file, nobody edits it, and both MCP Sentry projects carried a stale
+    ``*@1.2.0`` across dozens of deploys. A fallback that cannot move per deploy
+    would make this field answer "yes I know the build" while naming the wrong
+    one, which is worse than unknown.
     """
     sha = (os.getenv("MCP_GIT_SHA") or "").strip().lower()
+    if not sha:
+        return _CHECKOUT_SHA
     return sha if _SHA_RE.match(sha) else BUILD_SHA_UNKNOWN
 
 

@@ -396,9 +396,10 @@ def simulate(
                     completed.pop(target, None)
                     visible.add(target)
                     changed = True
-            elif action.is_webhook:
-                # An emit_webhook has an external side effect this engine cannot
-                # see, so it is never `no_effect` (spec check 2).
+            elif action.acts_outside_the_steps:
+                # An emit_webhook, or an escalation comment that emails people
+                # (tallyfy/mcp#1740), has a side effect this engine cannot see,
+                # so it is never `no_effect` (spec check 2).
                 changed = True
             result.applications.append(
                 Application(

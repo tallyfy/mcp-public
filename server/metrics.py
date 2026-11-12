@@ -308,6 +308,33 @@ auth_challenge_total = Counter(
     ['decision']  # see middleware.downstream_auth_challenge.CHALLENGE_DECISIONS
 )
 
+# What the connect-time membership check (#1135) did with each MCP request it
+# saw, one increment per request. The vocabulary is closed and lives in
+# middleware.connect_membership.OUTCOMES; every value is pre-created at zero at
+# import, so an absent series means the recording is broken (#1015).
+#
+#   challenged               - api-v2 says the token's user is not an active
+#                              member of the token's workspace; answered 401.
+#   suppressed_circuit_open  - the same answer again for the same person and
+#                              workspace within the hour; let through, because
+#                              a second challenge is a loop.
+#   active                   - api-v2 answered 2xx; let through and remembered.
+#   cache_hit                - answered from that memory, no api-v2 call.
+#   refused_other            - a 403 that is not about membership, from api-v2
+#                              or the edge; let through and remembered.
+#   failed_open              - no usable answer (outage, timeout, 5xx, 429...);
+#                              let through with a WARNING and retried in 60s.
+#   skipped                  - not an MCP OAuth token with an org_id claim.
+#   disabled                 - MCP_CONNECT_MEMBERSHIP_CHECK=off.
+#
+# The api-v2 calls themselves are in tallyfy_api_calls_total under
+# operation="GET organizations/{id}/me", shared with the get_me tool.
+connect_membership_check_total = Counter(
+    'mcp_server_connect_membership_check_total',
+    'Connect-time membership check outcomes, one per MCP request it saw',
+    ['outcome']  # see middleware.connect_membership.OUTCOMES
+)
+
 # Failed requests the durable failure record deliberately does NOT file
 # (tallyfy/mcp#1597), so the volume stays visible after it left the record.
 #   reason       no_credential: a 401 on the MCP transport to a request with
@@ -564,8 +591,9 @@ def track_tool_execution(tool_name: str):
 
 
 # The tallyfy_api_* series above are written in exactly ONE place:
-# utils/sdk_metrics_patch.py, which wraps BaseSDK._make_request and labels
-# every call through operation_label(), the normaliser that keeps ids out of
+# utils/sdk_metrics_patch.py, whose record_request is the SDK request hook
+# every server client carries (utils/sdk_client.py). It labels every call with
+# the SDK's path_template, the normaliser (operation_label) that keeps ids out of
 # the `operation` label (#1353). A decorator named track_tallyfy_api_call used
 # to sit here. It had no caller, and it took `operation` as a free string, so
 # the first person to use it would have brought back an id-bearing label the
@@ -721,3 +749,23 @@ def initialize_auth_challenge_series(decisions: Iterable[str]) -> None:
     """
     for decision in decisions:
         auth_challenge_total.labels(decision=decision)
+
+
+def record_connect_membership_check(outcome: str) -> None:
+    """Count one connect-time membership outcome (#1135).
+
+    Args:
+        outcome: one of middleware.connect_membership.OUTCOMES
+    """
+    connect_membership_check_total.labels(outcome=outcome).inc()
+
+
+def initialize_connect_membership_series(outcomes: Iterable[str]) -> None:
+    """Create every child of ``connect_membership_check_total`` at zero.
+
+    Same reason as ``initialize_auth_challenge_series`` above, and the
+    vocabulary is passed in for the same reason: importing it from the
+    middleware would be an import cycle.
+    """
+    for outcome in outcomes:
+        connect_membership_check_total.labels(outcome=outcome)
