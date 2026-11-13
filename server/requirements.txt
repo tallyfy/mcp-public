@@ -50,10 +50,13 @@ tzdata==2026.4
 # 1.41.0 to 1.45.1 on 2026-10-22 for GHSA-xcq7-p3pf-p88h in opentelemetry-api,
 # fixed in 1.45.1. The four move together: sdk 1.45.1 pins api 1.45.1 and
 # semantic-conventions 0.66b1 exactly.
-opentelemetry-api==1.45.1
-opentelemetry-sdk==1.45.1
-opentelemetry-exporter-otlp-proto-grpc==1.45.1
-opentelemetry-semantic-conventions==0.66b1
+# 1.45.1 to 1.45.2 on 2026-11-13 for GHSA-mf5v-w3w3-f6cg in opentelemetry-api,
+# fixed in 1.45.2 (#1784). sdk 1.45.2 pins api 1.45.2 and semantic-conventions
+# 0.66b2 exactly, so the four still move together.
+opentelemetry-api==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-exporter-otlp-proto-grpc==1.45.2
+opentelemetry-semantic-conventions==0.66b2
 
 # Org memory store on Cloudflare R2 via the S3-compatible API (#1036).
 # Lazily imported; the server runs fine without R2 configured.

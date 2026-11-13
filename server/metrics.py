@@ -50,6 +50,29 @@ def _read_stamped_error_class(error: BaseException):
     return value if value in TOOL_ERROR_CLASSES else None
 
 
+def _upstream_status(error: BaseException):
+    """The HTTP status the Tallyfy API answered with, or None (#1566).
+
+    A tool without `@handle_tallyfy_errors` lets the SDK's `TallyfyError` through,
+    and that carries `status_code`. A tool with it raises a `ToolError` while
+    handling the `TallyfyError`, so Python keeps the `TallyfyError` as the
+    `ToolError`'s `__context__`, and the status is read there.
+
+    The error's text is never read. The decorator's text carries no status code
+    on purpose, so `'401' in text` matched an id or a name holding those digits
+    and never a real 401. Guarded like `_read_stamped_error_class`, for the same
+    reason.
+    """
+    try:
+        for candidate in (error, error.__cause__, error.__context__):
+            status = getattr(candidate, "status_code", None)
+            if isinstance(status, int) and not isinstance(status, bool):
+                return status
+    except Exception:
+        return None
+    return None
+
+
 # ============================================================================
 # MCP Server Metrics
 # ============================================================================
@@ -568,8 +591,9 @@ def track_tool_execution(tool_name: str):
                 error_msg = str(e)[:200]  # First 200 chars
                 logger.warning(f"✗ TOOL ERROR │ {tool_name:30} │ {duration_ms:6.1f}ms │ {error_type}={error_msg} │ user={user_id} │ org={org_id}")
 
-                # Log token fingerprint on 401 errors (debug level — diagnostic detail)
-                if '401' in error_msg and api_key:
+                # Log token fingerprint on 401 errors (debug level, diagnostic detail).
+                # Keyed on the upstream status, never on the text (#1566).
+                if _upstream_status(e) == 401 and api_key:
                     token_hint = api_key[-8:] if len(api_key) > 8 else "***"
                     logger.debug(f"✗ AUTH 401   │ token=...{token_hint} │ org={org_id}")
 

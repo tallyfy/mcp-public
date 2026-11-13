@@ -30,7 +30,7 @@ for free, and fails closed when it cannot get an answer.
 
 import logging
 import re
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
@@ -45,6 +45,7 @@ from utils.auth_context import (
     get_authenticated_credentials,
     get_verified_org_claim,
 )
+from utils.fastmcp_errors import handle_tallyfy_errors, is_credential_401
 from utils.sdk_client import TallyfySDK
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,9 @@ def _authenticated_org_id() -> str:
     These tools are deliberately exempt from ``@handle_tallyfy_errors``, so
     every failure below is translated here. Without that, FastMCP masks a
     non-ToolError into a generic "error calling tool" the model can only guess
-    about, which is exactly what the honest-error rule exists to prevent.
+    about, which is exactly what the honest-error rule exists to prevent. A
+    refused login in the membership call is the one exception (#1572), see
+    ``_answer_a_refused_login``.
     """
     try:
         api_key, org_id = get_authenticated_credentials()
@@ -169,6 +172,50 @@ _MEMBERSHIP_UNAVAILABLE = (
 )
 
 
+# A refused login in the membership call is answered by the handler every
+# other tool uses (#1572). That call is the only request these two tools make to
+# the Tallyfy API. For a 401 about the login, handle_tallyfy_errors flags the
+# request, the server answers with the 401 challenge (rule 30), and an MCP
+# client signs in again. When the challenge cannot be sent, its text is the one
+# the chat host reads as a refused login, and the operation name says nothing
+# was read or saved. Until #1572 the catch-all in _require_membership answered
+# this 401 with only the error's type name, so no client was asked to sign in
+# again and the chat host did not refresh the login.
+#
+# The tools themselves stay exempt from the decorator, and decorating them
+# would not have fixed this. The membership check catches every failure so that
+# it fails closed, so the 401 is already a ToolError when a decorator on the
+# tool sees it, and the decorator passes a ToolError through as it is. The
+# decorator sits on this helper instead, and the regression test that matches
+# the server's texts to the chat host's reader finds its operation name there.
+@handle_tallyfy_errors(
+    "check which organizations you belong to before reading or saving org memory"
+)
+def _answer_a_refused_login(error: TallyfyError) -> NoReturn:
+    """Raise the ToolError ``handle_tallyfy_errors`` writes for this 401."""
+    raise error
+
+
+def _is_a_refused_login(error: Exception) -> bool:
+    """Whether the membership call failed because the login was refused.
+
+    The status decides first. Then ``is_credential_401``, the reading the
+    handler itself uses, so a 401 about something other than the login keeps
+    the fail-closed text like every other failure. A body that reading cannot
+    parse keeps it too, because only a ToolError may leave the membership check.
+    api-v2 serves ``GET me/organizations`` behind ``auth:api`` alone
+    (``routes/api.php:326`` on ``origin/production`` at ``e00612b82``), so its
+    401 is Laravel's "Unauthenticated." or the edge's ``apsh213``, and both are
+    about the login.
+    """
+    if not isinstance(error, TallyfyError) or getattr(error, "status_code", None) != 401:
+        return False
+    try:
+        return is_credential_401(error)
+    except Exception:
+        return False
+
+
 def _require_membership(api_key: str, org_id: str) -> None:
     """Refuse unless the caller actually belongs to ``org_id``.
 
@@ -206,6 +253,8 @@ def _require_membership(api_key: str, org_id: str) -> None:
             )
         )
     except Exception as exc:
+        if _is_a_refused_login(exc):
+            _answer_a_refused_login(exc)
         raise ToolError(
             _MEMBERSHIP_UNAVAILABLE.format(reason=type(exc).__name__)
         )

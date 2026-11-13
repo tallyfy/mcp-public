@@ -628,38 +628,49 @@ def _format_field_errors(errors: Any) -> str:
     return rendered
 
 
-# Markers that mean a 403 really is an authentication or authorization failure
-# rather than a domain rule. Kept deliberately narrow: anything not matched here
-# keeps its own specific message with no re-authentication hint bolted on.
-_AUTH_STYLE_MARKERS = (
-    "unauthenticated",
-    "unauthorized",
-    "token",
-    "expired",
-    "invalid credentials",
-    "access denied",
-    "permission denied",
-    "forbidden",
-    "audience",
-)
+# 403 messages that mean the LOGIN is the problem, so the re-authentication
+# hint can help (#1566). The test for an entry: a new sign-in gives a token that
+# the SAME request accepts. A role, an object, a setting or a policy refusal
+# fails that test, because a new login as the same person gets the same answer.
+#
+# This is an exact match on the whole message, never a word inside it. Until
+# #1566 a 403 got the hint when its message held "token", "expired",
+# "forbidden", "access denied" and five other words anywhere, so a business
+# rule naming a tag, a field or a deadline by one of them told people to log
+# in again over a correct refusal (#592). The api-v2 403s that held those words
+# are listed with their emitters in REFERENCE/claude-md/tool-contract-rules.md,
+# rule 37. None of them is a login problem.
+#
+# Read from api-v2 origin/production at c849f0065 on 2026-11-13. Name the
+# emitter beside any entry you add (rule 32 says why).
+_LOGIN_PROBLEM_403_MESSAGES = frozenset({
+    # api-v2 app/Http/Middleware/Tenant.php:110
+    #   abort(Response::HTTP_FORBIDDEN, 'You are not allowed to access this organization!');
+    # The token's Passport `scopes` claim is an organization allowlist
+    # (app/Passport/Token.php:18) that leaves this organization out. A token
+    # minted with a non-empty claim gets this on every org-scoped request
+    # (app/Console/Commands/MintMcpAccessToken.php:306-311), and a token for
+    # this organization is the fix.
+    "you are not allowed to access this organization!",
+})
 
 
 def _extract_primary_message(error: TallyfyError) -> str:
     """
-    Extract only the primary API message for auth-style classification.
+    Extract only the primary API message for the 401 and 403 classifiers.
 
     Unlike _extract_api_message, this does NOT append field errors — preventing
-    unrelated field text (containing substrings like 'token' or 'expired') from
-    influencing the auth classification. It also correctly treats an empty body
-    after the SDK prefix as empty (not as the full SDK string).
+    unrelated field text from influencing the auth classification. It also
+    correctly treats an empty body after the SDK prefix as empty (not as the
+    full SDK string).
     """
     response_data = getattr(error, "response_data", None)
 
     # Same envelope unwrap as _extract_api_message. This is a no-op on every
     # live 403 shape today (only the 409 seat gate nests its message), and is
     # here so the two readers of response_data cannot drift apart: if api-v2
-    # ever nests a 403, a reader that saw no message would classify it as
-    # auth-style and re-append the misleading "re-authenticate" hint that #592
+    # ever nests a 403, a reader that saw no message would take it for the
+    # opaque case and re-append the misleading "re-authenticate" hint that #592
     # removed.
     envelope = _structured_error_envelope(response_data)
     if envelope is not None and envelope.get("message"):
@@ -676,12 +687,15 @@ def _extract_primary_message(error: TallyfyError) -> str:
     return _sanitize_api_error(raw)
 
 
-def _is_auth_style_message(error: TallyfyError) -> bool:
+def _is_login_problem_403(error: TallyfyError) -> bool:
     """
-    Decide whether a 403 is an auth failure (hint helps) or a business rule
-    (hint actively misleads, see #592).
+    Decide whether a 403 is a login problem (hint helps) or a refusal a new
+    login cannot change (hint actively misleads, see #592 and #1566).
 
-    A 403 with no message at all AND no field errors is treated as auth-style,
+    The message must equal one in ``_LOGIN_PROBLEM_403_MESSAGES``, compared
+    with case folded and surrounding space stripped, as the 401 sets are.
+
+    A 403 with no message at all AND no field errors keeps the hint,
     preserving the old behaviour for the opaque case where the caller has
     nothing else to go on.  When ``response_data`` carries an ``errors`` block
     the 403 is a business-rule rejection even if ``message`` is blank.
@@ -692,8 +706,7 @@ def _is_auth_style_message(error: TallyfyError) -> bool:
         if isinstance(response_data, dict) and response_data.get("errors"):
             return False
         return True
-    lowered = message.lower()
-    return any(marker in lowered for marker in _AUTH_STYLE_MARKERS)
+    return message.strip().lower() in _LOGIN_PROBLEM_403_MESSAGES
 
 
 # ---------------------------------------------------------------------------
@@ -1039,14 +1052,15 @@ def handle_tallyfy_errors(operation_name: str):
                     else:
                         logger.error(f"Tallyfy API error in {operation_name}: {e}")
 
-                # 401, and 403s that actually look like auth failures, mean the OAuth
-                # token is expired or carries an audience the Tallyfy API rejects, so a
-                # re-authentication hint helps. A 403 is ALSO how api-v2 refuses a
-                # business rule ("Cannot disable guest with incomplete tasks"), and
-                # appending the hint there told users to re-authenticate over a correct,
-                # specific rejection they could do nothing about (#592). Trust a specific
-                # domain message; only add the hint when the message reads like auth.
-                if status == 401 or (status == 403 and _is_auth_style_message(e)):
+                # A 401, and the few 403s whose emitter says the token is the
+                # problem, mean a new login can help, so a re-authentication hint
+                # helps. A 403 is ALSO how api-v2 refuses a business rule ("Cannot
+                # disable guest with incomplete tasks"), and appending the hint
+                # there told users to re-authenticate over a correct, specific
+                # rejection they could do nothing about (#592). Trust a specific
+                # domain message; only add the hint for a message listed in
+                # _LOGIN_PROBLEM_403_MESSAGES, never for a word inside one (#1566).
+                if status == 401 or (status == 403 and _is_login_problem_403(e)):
                     api_msg = _extract_api_message(e)
 
                     # A 401 means the credential this request carried is no
